@@ -171,6 +171,13 @@ class TabICL(nn.Module):
         row_rope_interleaved: bool = False,
         icl_num_blocks: int = 12,
         icl_nhead: int = 8,
+        icl_backend: Literal["encoder", "graph"] = "graph",
+        graph_min_train_neighbors: int = 8,
+        graph_max_train_neighbors: int = 15,
+        graph_same_label_ratio: float = 0.9,
+        graph_cross_label_ratio: float = 0.1,
+        graph_test_k_per_class: int = 3,
+        graph_seed: Optional[int] = None,
         icl_ssmax: Union[
             bool,
             Literal[
@@ -219,6 +226,13 @@ class TabICL(nn.Module):
         self.row_rope_interleaved = row_rope_interleaved
         self.icl_num_blocks = icl_num_blocks
         self.icl_nhead = icl_nhead
+        self.icl_backend = icl_backend
+        self.graph_min_train_neighbors = graph_min_train_neighbors
+        self.graph_max_train_neighbors = graph_max_train_neighbors
+        self.graph_same_label_ratio = graph_same_label_ratio
+        self.graph_cross_label_ratio = graph_cross_label_ratio
+        self.graph_test_k_per_class = graph_test_k_per_class
+        self.graph_seed = graph_seed
         self.icl_ssmax = icl_ssmax
         self.ff_factor = ff_factor
         self.dropout = dropout
@@ -274,6 +288,13 @@ class TabICL(nn.Module):
             bias_free_ln=bias_free_ln,
             ssmax=icl_ssmax,
             recompute=recompute,
+            icl_backend=icl_backend,
+            graph_min_train_neighbors=graph_min_train_neighbors,
+            graph_max_train_neighbors=graph_max_train_neighbors,
+            graph_same_label_ratio=graph_same_label_ratio,
+            graph_cross_label_ratio=graph_cross_label_ratio,
+            graph_test_k_per_class=graph_test_k_per_class,
+            graph_seed=graph_seed,
         )
 
         # KV cache for efficient inference
@@ -328,6 +349,11 @@ class TabICL(nn.Module):
 
         # Check if d is provided and has the same length as the number of features
         if d is not None and len(d.unique()) == 1 and d[0] == H:
+            d = None
+
+        # Feature-grouped column embedding does not support per-table feature counts.
+        # In this mode grouping defines the effective feature layout.
+        if self.col_embedder.feature_group:
             d = None
 
         # Column-wise embedding -> Row-wise interaction

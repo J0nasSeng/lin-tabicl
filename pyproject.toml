@@ -34,6 +34,8 @@ dependencies = [
     "psutil",  # used for memory calculation at inference
     "tqdm>=4.64.0",
     "huggingface-hub",
+    "xgboost",
+    "transformers"
 ]
 
 [project.optional-dependencies]

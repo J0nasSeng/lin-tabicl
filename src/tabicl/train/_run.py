@@ -19,7 +19,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from tqdm import tqdm
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 from tabicl._model.tabicl import TabICL
 from tabicl.prior._dataset import PriorDataset
@@ -144,6 +147,11 @@ class Trainer:
         """Set up Weights & Biases logging."""
 
         if self.config.wandb_log and self.master_process:
+            if wandb is None:
+                raise ModuleNotFoundError(
+                    "wandb is not installed but --wandb_log=True. Install with `uv sync --extra pretrain` "
+                    "or run with --wandb_log False."
+                )
             id_path = os.path.join(self.config.checkpoint_dir, "wand_id.txt")
             if self.config.wandb_id is None:
                 if os.path.exists(id_path):
@@ -180,6 +188,13 @@ class Trainer:
             "row_rope_base": self.config.row_rope_base,
             "icl_num_blocks": self.config.icl_num_blocks,
             "icl_nhead": self.config.icl_nhead,
+            "icl_backend": self.config.icl_backend,
+            "graph_min_train_neighbors": self.config.graph_min_train_neighbors,
+            "graph_max_train_neighbors": self.config.graph_max_train_neighbors,
+            "graph_same_label_ratio": self.config.graph_same_label_ratio,
+            "graph_cross_label_ratio": self.config.graph_cross_label_ratio,
+            "graph_test_k_per_class": self.config.graph_test_k_per_class,
+            "graph_seed": self.config.graph_seed,
             "ff_factor": self.config.ff_factor,
             "dropout": self.config.dropout,
             "activation": self.config.activation,

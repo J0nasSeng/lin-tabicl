@@ -1,15 +1,21 @@
 # This script is used to train TabICL for the third stage of the curriculum learning
 
+# Choose ICL backbone: graph or encoder
+ICL_BACKEND=${ICL_BACKEND:-graph}
+# Enable wandb logging by setting WAND_LOG=True (and optionally WAND_MODE=online)
+WAND_LOG=${WAND_LOG:-False}
+WAND_MODE=${WAND_MODE:-disabled}
+
 # ----------------------------------
 # Generate prior datasets on the fly
 # ----------------------------------
 
 torchrun --standalone --nproc_per_node=1 /path/to/tabicl/train/run.py \
-            --wandb_log True \
+            --wandb_log ${WAND_LOG} \
             --wandb_project TabICL \
             --wandb_name Stage3 \
             --wandb_dir /my/wandb/dir \
-            --wandb_mode online \
+            --wandb_mode ${WAND_MODE} \
             --device cuda \
             --dtype float32 \
             --np_seed 42 \
@@ -45,6 +51,7 @@ torchrun --standalone --nproc_per_node=1 /path/to/tabicl/train/run.py \
             --freeze_row True \
             --icl_num_blocks 12 \
             --icl_nhead 4 \
+            --icl_backend ${ICL_BACKEND} \
             --ff_factor 2 \
             --norm_first True \
             --checkpoint_dir /my/stage3/checkpoint/dir \
@@ -84,11 +91,11 @@ python /path/to/tabicl/prior/genload.py \
 
 # Loading from disk and training
 torchrun --standalone --nproc_per_node=1 /path/to/tabicl/train/run.py \
-            --wandb_log True \
+            --wandb_log ${WAND_LOG} \
             --wandb_project TabICL \
             --wandb_name Stage3 \
             --wandb_dir /my/wandb/dir \
-            --wandb_mode online \
+            --wandb_mode ${WAND_MODE} \
             --device cuda \
             --dtype float32 \
             --np_seed 42 \
@@ -115,6 +122,7 @@ torchrun --standalone --nproc_per_node=1 /path/to/tabicl/train/run.py \
             --freeze_row True \
             --icl_num_blocks 12 \
             --icl_nhead 4 \
+            --icl_backend ${ICL_BACKEND} \
             --ff_factor 2 \
             --norm_first True \
             --checkpoint_dir /my/stage3/checkpoint/dir \

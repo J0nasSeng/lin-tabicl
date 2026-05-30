@@ -192,6 +192,49 @@ def build_parser():
     # ICL Config
     parser.add_argument("--icl_num_blocks", type=int, default=12, help="Number of transformer blocks in ICL predictor")
     parser.add_argument("--icl_nhead", type=int, default=4, help="Number of attention heads in ICL predictor")
+    parser.add_argument(
+        "--icl_backend",
+        type=str,
+        default="graph",
+        choices=["encoder", "graph"],
+        help="ICL backbone type: encoder or graph",
+    )
+    parser.add_argument(
+        "--graph_min_train_neighbors",
+        type=int,
+        default=8,
+        help="Minimum train-train incoming neighbors per train node for graph ICL backend",
+    )
+    parser.add_argument(
+        "--graph_max_train_neighbors",
+        type=int,
+        default=15,
+        help="Maximum train-train incoming neighbors per train node for graph ICL backend",
+    )
+    parser.add_argument(
+        "--graph_same_label_ratio",
+        type=float,
+        default=0.9,
+        help="Sampling ratio for same-label neighbors when building graph edges",
+    )
+    parser.add_argument(
+        "--graph_cross_label_ratio",
+        type=float,
+        default=0.1,
+        help="Sampling ratio for cross-label neighbors when building graph edges",
+    )
+    parser.add_argument(
+        "--graph_test_k_per_class",
+        type=int,
+        default=3,
+        help="Minimum number of train neighbors per class for each test node",
+    )
+    parser.add_argument(
+        "--graph_seed",
+        type=int,
+        default=None,
+        help="Optional random seed for deterministic graph sampling",
+    )
     parser.add_argument("--freeze_icl", default=False, type=str2bool, help="Whether to freeze the ICL predictor")
 
     # Shared Architecture Config

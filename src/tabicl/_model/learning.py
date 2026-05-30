@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional, Union
+from typing import Literal, Optional, Union
 from collections import OrderedDict
 import math
 import torch
@@ -8,6 +8,8 @@ from torch import nn, Tensor
 
 from .layers import ClassNode, OneHotAndLinear
 from .encoders import Encoder
+from .gat import GraphAttentionTransformer
+from .graph import build_class_conditioned_graph
 from .kv_cache import KVCache
 from .inference import InferenceManager
 from .inference_config import MgrConfig, InferenceConfig
@@ -84,24 +86,57 @@ class ICLearning(nn.Module):
         bias_free_ln: bool = False,
         ssmax: Union[bool, str] = False,
         recompute: bool = False,
+        icl_backend: Literal["encoder", "graph"] = "graph",
+        graph_min_train_neighbors: int = 8,
+        graph_max_train_neighbors: int = 15,
+        graph_same_label_ratio: float = 0.9,
+        graph_cross_label_ratio: float = 0.1,
+        graph_test_k_per_class: int = 3,
+        graph_seed: Optional[int] = None,
     ):
         super().__init__()
 
         self.max_classes = max_classes
         self.norm_first = norm_first
+        self.icl_backend = icl_backend
+        self.graph_min_train_neighbors = graph_min_train_neighbors
+        self.graph_max_train_neighbors = graph_max_train_neighbors
+        self.graph_same_label_ratio = graph_same_label_ratio
+        self.graph_cross_label_ratio = graph_cross_label_ratio
+        self.graph_test_k_per_class = graph_test_k_per_class
+        self.graph_seed = graph_seed
 
-        self.tf_icl = Encoder(
-            num_blocks=num_blocks,
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            activation=activation,
-            norm_first=norm_first,
-            bias_free_ln=bias_free_ln,
-            ssmax=ssmax,
-            recompute=recompute,
-        )
+        if self.icl_backend not in ("encoder", "graph"):
+            raise ValueError(f"Unknown icl_backend={self.icl_backend}. Expected 'encoder' or 'graph'.")
+
+        if self.icl_backend == "graph" and max_classes <= 0:
+            raise ValueError("Graph ICL backend is currently supported for classification only (max_classes > 0).")
+
+        if self.icl_backend == "encoder":
+            self.tf_icl = Encoder(
+                num_blocks=num_blocks,
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                activation=activation,
+                norm_first=norm_first,
+                bias_free_ln=bias_free_ln,
+                ssmax=ssmax,
+                recompute=recompute,
+            )
+        else:
+            self.gat_icl = GraphAttentionTransformer(
+                num_blocks=num_blocks,
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                activation=activation,
+                norm_first=norm_first,
+                bias_free_ln=bias_free_ln,
+                recompute=recompute,
+            )
         if self.norm_first:
             self.ln = nn.LayerNorm(d_model, bias=not bias_free_ln)
 
@@ -111,7 +146,27 @@ class ICLearning(nn.Module):
             self.y_encoder = nn.Linear(1, d_model)
 
         self.decoder = nn.Sequential(nn.Linear(d_model, d_model * 2), nn.GELU(), nn.Linear(d_model * 2, out_dim))
-        self.inference_mgr = InferenceManager(enc_name="tf_icl", out_dim=out_dim)
+        enc_name = "tf_icl" if self.icl_backend == "encoder" else "gat_icl"
+        self.inference_mgr = InferenceManager(enc_name=enc_name, out_dim=out_dim)
+
+    def _apply_icl_backbone(self, R: Tensor, train_size: int, y_train: Optional[Tensor] = None) -> Tensor:
+        """Apply selected ICL backbone (encoder or graph attention)."""
+
+        if self.icl_backend == "encoder":
+            return self.tf_icl(R, train_size=train_size)
+
+        assert y_train is not None, "y_train is required for graph backend"
+        graph = build_class_conditioned_graph(
+            y_train=y_train,
+            total_nodes=R.shape[1],
+            min_train_neighbors=self.graph_min_train_neighbors,
+            max_train_neighbors=self.graph_max_train_neighbors,
+            same_label_ratio=self.graph_same_label_ratio,
+            cross_label_ratio=self.graph_cross_label_ratio,
+            test_k_per_class=self.graph_test_k_per_class,
+            seed=self.graph_seed,
+        )
+        return self.gat_icl(R, edge_index_batch=graph.edge_index)
 
     def _grouping(self, num_classes: int) -> tuple[Tensor, int]:
         """Divide classes into balanced groups for hierarchical classification.
@@ -267,7 +322,7 @@ class ICLearning(nn.Module):
             Ry_train = self.y_encoder(y_train.unsqueeze(-1))
         R[:, :train_size] = R[:, :train_size] + Ry_train
 
-        src = self.tf_icl(R, train_size=train_size)
+        src = self._apply_icl_backbone(R, train_size=train_size, y_train=y_train)
         if self.norm_first:
             src = self.ln(src)
         out = self.decoder(src)
@@ -593,7 +648,10 @@ class ICLearning(nn.Module):
             Predictions of shape (B, T, out_dim).
         """
 
-        src = self.tf_icl(R, train_size=train_size)
+        if self.icl_backend == "graph":
+            raise ValueError("Representation-cache path is not supported for graph ICL backend.")
+
+        src = self._apply_icl_backbone(R, train_size=train_size)
         if self.norm_first:
             src = self.ln(src)
         out = self.decoder(src)
@@ -701,6 +759,9 @@ class ICLearning(nn.Module):
             - For regression (max_classes=0): out_dim = num_quantiles
             - For classification (max_classes>0): out_dim = max_classes
         """
+        if self.icl_backend == "graph":
+            raise ValueError("KV cache path is not supported for graph ICL backend.")
+
         # When using cache, skip y_train embedding — it's already baked
         # into the cached K/V projections from the store_cache pass.
         if store_cache:
