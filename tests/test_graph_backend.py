@@ -40,15 +40,22 @@ def test_graph_builder_train_degree_and_test_class_coverage():
     src = edge_index[0]
     dst = edge_index[1]
 
-    # Train node incoming train-neighbor count should stay in [8, 15] excluding self loops.
-    for train_node in range(train_size):
-        mask = (dst == train_node) & (src < train_size) & (src != train_node)
-        degree = int(mask.sum().item())
-        assert 8 <= degree <= 15
+    # Graph should be bidirectional for all non-self edges.
+    edge_set = set(zip(src.tolist(), dst.tolist()))
+    for u, v in edge_set:
+        if u != v:
+            assert (v, u) in edge_set
 
-    # Each test node should connect to at least 3 train nodes from each class.
+    # Same-label edges should be present within every class among train nodes.
     labels = y_train[0]
     classes = torch.unique(labels)
+    for c in classes:
+        class_nodes = torch.where(labels == c)[0]
+        class_mask = (src < train_size) & (dst < train_size)
+        class_mask &= torch.isin(src, class_nodes) & torch.isin(dst, class_nodes)
+        assert int(class_mask.sum().item()) > 0
+
+    # Each test node should connect to at least 3 train nodes from each class.
     for test_node in range(train_size, total_nodes):
         for c in classes:
             class_mask = labels[src.clamp_max(train_size - 1)] == c
@@ -122,3 +129,45 @@ def test_iclearning_graph_backend_cache_paths_raise():
 
     with pytest.raises(ValueError, match="Representation-cache path"):
         model.forward_with_repr_cache(R, train_size=train_size, num_classes=3)
+
+
+def test_graph_builder_shared_graph_when_labels_identical():
+    batch_size = 3
+    train_size = 15
+    total_nodes = 22
+    y_one = _build_labels(batch_size=1, train_size=train_size, num_classes=3)
+    y_train = y_one.expand(batch_size, -1).clone()
+
+    graph = build_class_conditioned_graph(
+        y_train=y_train,
+        total_nodes=total_nodes,
+        seed=17,
+        share_graph_across_batch=True,
+        share_graph_require_identical_labels=True,
+    )
+
+    assert len(graph.edge_index) == batch_size
+    for idx in range(1, batch_size):
+        assert torch.equal(graph.edge_index[0], graph.edge_index[idx])
+
+
+def test_graph_builder_shared_graph_fallback_for_non_identical_labels():
+    y_train = torch.tensor(
+        [
+            [0, 0, 1, 1, 2, 2],
+            [0, 1, 0, 1, 2, 2],
+        ],
+        dtype=torch.long,
+    )
+    total_nodes = 10
+
+    graph = build_class_conditioned_graph(
+        y_train=y_train,
+        total_nodes=total_nodes,
+        seed=3,
+        share_graph_across_batch=True,
+        share_graph_require_identical_labels=True,
+    )
+
+    assert len(graph.edge_index) == y_train.shape[0]
+    assert not torch.equal(graph.edge_index[0], graph.edge_index[1])

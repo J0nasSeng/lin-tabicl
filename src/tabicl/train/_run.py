@@ -195,6 +195,8 @@ class Trainer:
             "graph_cross_label_ratio": self.config.graph_cross_label_ratio,
             "graph_test_k_per_class": self.config.graph_test_k_per_class,
             "graph_seed": self.config.graph_seed,
+            "graph_share_across_batch": self.config.graph_share_across_batch,
+            "graph_share_require_identical_labels": self.config.graph_share_require_identical_labels,
             "ff_factor": self.config.ff_factor,
             "dropout": self.config.dropout,
             "activation": self.config.activation,

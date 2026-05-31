@@ -20,7 +20,7 @@ torchrun --standalone --nproc_per_node=1 /workspace/src/tabicl/train/_run.py \
             --dtype float32 \
             --np_seed 42 \
             --torch_seed 42 \
-            --max_steps 100000 \
+            --max_steps 1000 \
             --batch_size 64 \
             --micro_batch_size 4 \
             --lr 1e-4 \

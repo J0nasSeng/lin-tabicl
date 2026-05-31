@@ -235,6 +235,18 @@ def build_parser():
         default=None,
         help="Optional random seed for deterministic graph sampling",
     )
+    parser.add_argument(
+        "--graph_share_across_batch",
+        default=False,
+        type=str2bool,
+        help="If True, reuse one graph for all items in a batch",
+    )
+    parser.add_argument(
+        "--graph_share_require_identical_labels",
+        default=True,
+        type=str2bool,
+        help="If True, only share graph when all y_train rows are identical",
+    )
     parser.add_argument("--freeze_icl", default=False, type=str2bool, help="Whether to freeze the ICL predictor")
 
     # Shared Architecture Config

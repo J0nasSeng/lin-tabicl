@@ -178,6 +178,8 @@ class TabICL(nn.Module):
         graph_cross_label_ratio: float = 0.1,
         graph_test_k_per_class: int = 3,
         graph_seed: Optional[int] = None,
+        graph_share_across_batch: bool = False,
+        graph_share_require_identical_labels: bool = True,
         icl_ssmax: Union[
             bool,
             Literal[
@@ -233,6 +235,8 @@ class TabICL(nn.Module):
         self.graph_cross_label_ratio = graph_cross_label_ratio
         self.graph_test_k_per_class = graph_test_k_per_class
         self.graph_seed = graph_seed
+        self.graph_share_across_batch = graph_share_across_batch
+        self.graph_share_require_identical_labels = graph_share_require_identical_labels
         self.icl_ssmax = icl_ssmax
         self.ff_factor = ff_factor
         self.dropout = dropout
@@ -295,6 +299,8 @@ class TabICL(nn.Module):
             graph_cross_label_ratio=graph_cross_label_ratio,
             graph_test_k_per_class=graph_test_k_per_class,
             graph_seed=graph_seed,
+            graph_share_across_batch=graph_share_across_batch,
+            graph_share_require_identical_labels=graph_share_require_identical_labels,
         )
 
         # KV cache for efficient inference

@@ -93,6 +93,8 @@ class ICLearning(nn.Module):
         graph_cross_label_ratio: float = 0.1,
         graph_test_k_per_class: int = 3,
         graph_seed: Optional[int] = None,
+        graph_share_across_batch: bool = False,
+        graph_share_require_identical_labels: bool = True,
     ):
         super().__init__()
 
@@ -105,6 +107,8 @@ class ICLearning(nn.Module):
         self.graph_cross_label_ratio = graph_cross_label_ratio
         self.graph_test_k_per_class = graph_test_k_per_class
         self.graph_seed = graph_seed
+        self.graph_share_across_batch = graph_share_across_batch
+        self.graph_share_require_identical_labels = graph_share_require_identical_labels
 
         if self.icl_backend not in ("encoder", "graph"):
             raise ValueError(f"Unknown icl_backend={self.icl_backend}. Expected 'encoder' or 'graph'.")
@@ -165,6 +169,8 @@ class ICLearning(nn.Module):
             cross_label_ratio=self.graph_cross_label_ratio,
             test_k_per_class=self.graph_test_k_per_class,
             seed=self.graph_seed,
+            share_graph_across_batch=self.graph_share_across_batch,
+            share_graph_require_identical_labels=self.graph_share_require_identical_labels,
         )
         return self.gat_icl(R, edge_index_batch=graph.edge_index)
 
