@@ -316,8 +316,13 @@ class TabICL(nn.Module):
         self._cache = None
 
     def _train_forward(
-        self, X: Tensor, y_train: Tensor, d: Optional[Tensor] = None, embed_with_test: bool = False
-    ) -> Tensor:
+        self,
+        X: Tensor,
+        y_train: Tensor,
+        d: Optional[Tensor] = None,
+        embed_with_test: bool = False,
+        return_pre_decoder_repr: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor]:
         """Column-wise embedding -> row-wise interaction -> dataset-wise in-context learning for training.
 
         Parameters
@@ -374,7 +379,11 @@ class TabICL(nn.Module):
         )
 
         # Dataset-wise in-context learning
-        return self.icl_predictor(representations, y_train=y_train)
+        return self.icl_predictor(
+            representations,
+            y_train=y_train,
+            return_pre_decoder_repr=return_pre_decoder_repr,
+        )
 
     def _inference_forward(
         self,
@@ -469,7 +478,8 @@ class TabICL(nn.Module):
         return_logits: bool = True,
         softmax_temperature: float = 0.9,
         inference_config: Optional[InferenceConfig] = None,
-    ) -> Tensor:
+        return_pre_decoder_repr: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor]:
         """Column-wise embedding -> row-wise interaction -> dataset-wise in-context learning.
 
         Parameters
@@ -525,7 +535,13 @@ class TabICL(nn.Module):
         """
 
         if self.training:
-            out = self._train_forward(X, y_train, d=d, embed_with_test=embed_with_test)
+            out = self._train_forward(
+                X,
+                y_train,
+                d=d,
+                embed_with_test=embed_with_test,
+                return_pre_decoder_repr=return_pre_decoder_repr,
+            )
         else:
             out = self._inference_forward(
                 X,

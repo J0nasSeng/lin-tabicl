@@ -58,6 +58,12 @@ def build_parser():
     parser.add_argument(
         "--micro_batch_size", type=int, default=8, help="Size of micro-batches for gradient accumulation"
     )
+    parser.add_argument(
+        "--log_conf_mat_every",
+        type=int,
+        default=100,
+        help="Log confusion matrix sample every N training steps (set <= 0 to disable)",
+    )
 
     # Optimization Config
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")

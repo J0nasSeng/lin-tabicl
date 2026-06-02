@@ -5,24 +5,33 @@ ICL_BACKEND=${ICL_BACKEND:-graph}
 # Enable wandb logging by setting WAND_LOG=True (and optionally WAND_MODE=online)
 WAND_LOG=${WAND_LOG:-False}
 WAND_MODE=${WAND_MODE:-disabled}
+# GPU selection controls
+DEVICE=${DEVICE:-cuda}
+NUM_GPUS=${NUM_GPUS:-1}
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+# Confusion matrix logging interval
+LOG_CONF_MAT_EVERY=${LOG_CONF_MAT_EVERY:-100}
+
+export CUDA_VISIBLE_DEVICES
 
 # ----------------------------------
 # Generate prior datasets on the fly
 # ----------------------------------
 
-torchrun --standalone --nproc_per_node=1 /path/to/tabicl/train/run.py \
+torchrun --standalone --nproc_per_node=${NUM_GPUS} /path/to/tabicl/train/run.py \
             --wandb_log ${WAND_LOG} \
             --wandb_project TabICL \
             --wandb_name Stage3 \
             --wandb_dir /my/wandb/dir \
             --wandb_mode ${WAND_MODE} \
-            --device cuda \
+            --device ${DEVICE} \
             --dtype float32 \
             --np_seed 42 \
             --torch_seed 42 \
             --max_steps 50 \
             --batch_size 512 \
             --micro_batch_size 1 \
+                --log_conf_mat_every ${LOG_CONF_MAT_EVERY} \
             --lr 2e-6 \
             --scheduler constant \
             --gradient_clipping 1.0 \
@@ -90,19 +99,20 @@ python /path/to/tabicl/prior/genload.py \
     --device cpu
 
 # Loading from disk and training
-torchrun --standalone --nproc_per_node=1 /path/to/tabicl/train/run.py \
+torchrun --standalone --nproc_per_node=${NUM_GPUS} /path/to/tabicl/train/run.py \
             --wandb_log ${WAND_LOG} \
             --wandb_project TabICL \
             --wandb_name Stage3 \
             --wandb_dir /my/wandb/dir \
             --wandb_mode ${WAND_MODE} \
-            --device cuda \
+            --device ${DEVICE} \
             --dtype float32 \
             --np_seed 42 \
             --torch_seed 42 \
             --max_steps 50 \
             --batch_size 512 \
             --micro_batch_size 1 \
+                --log_conf_mat_every ${LOG_CONF_MAT_EVERY} \
             --lr 2e-6 \
             --scheduler constant \
             --gradient_clipping 1.0 \

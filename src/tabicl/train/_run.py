@@ -24,11 +24,17 @@ try:
 except ImportError:
     wandb = None
 
+try:
+    from sklearn.metrics import confusion_matrix
+except ImportError:
+    confusion_matrix = None
+
 from tabicl._model.tabicl import TabICL
 from tabicl.prior._dataset import PriorDataset
 from tabicl.prior._genload import LoadPriorDataset
 from tabicl.train._optim import get_scheduler
 from tabicl.train._train_config import build_parser
+from tabicl.train._umap_logging import build_test_umap_wandb_images
 
 warnings.filterwarnings(
     "ignore", message=".*The PyTorch API of nested tensors is in prototype stage.*", category=UserWarning
@@ -133,6 +139,13 @@ class Trainer:
             self.ddp_world_size = 1
             self.ddp_local_rank = 0
             print("No DDP training")
+
+        if self.master_process:
+            print(
+                "Runtime device setup: "
+                f"device={self.config.device}, "
+                f"ddp={self.ddp}, rank={self.ddp_rank}, local_rank={self.ddp_local_rank}, world_size={self.ddp_world_size}"
+            )
 
         self.curr_step = 0  # Initialize current step for training
 
@@ -454,7 +467,12 @@ class Trainer:
                 results.update({"prior_time": prior_time, "train_time": train_time})
 
                 # Update progress bar with rounded values for cleaner display
-                step_progress.set_postfix(**{k: round(v, 3) if isinstance(v, float) else v for k, v in results.items()})
+                display_results = {}
+                for k, v in results.items():
+                    if isinstance(v, (int, float, np.floating)):
+                        display_results[k] = round(float(v), 3)
+                if display_results:
+                    step_progress.set_postfix(**display_results)
 
                 # Save checkpoints
                 is_temp_save = self.curr_step % self.config.save_temp_every == 0
@@ -473,6 +491,10 @@ class Trainer:
                 # Add learning rate to results
                 results["lr"] = self.scheduler.get_last_lr()[0]
                 wandb.log(results, step=self.curr_step)
+
+    def _should_log_conf_mat_now(self) -> bool:
+        log_every = int(getattr(self.config, "log_conf_mat_every", 100))
+        return log_every > 0 and ((self.curr_step + 1) % log_every == 0)
 
     def validate_micro_batch(self, micro_seq_len, micro_train_size):
         """Validate consistent sequence length and train size within a micro batch.
@@ -557,7 +579,15 @@ class Trainer:
 
         return micro_X, micro_y
 
-    def run_micro_batch(self, micro_batch, micro_batch_idx, num_micro_batches):
+    def run_micro_batch(
+        self,
+        micro_batch,
+        micro_batch_idx,
+        num_micro_batches,
+        should_log_conf_mat: bool = False,
+        umap_datasets_to_log: int = 0,
+        umap_start_index: int = 0,
+    ):
         """Process a micro batch for gradient accumulation.
 
         Parameters
@@ -594,7 +624,18 @@ class Trainer:
             self.model.require_backward_grad_sync = micro_batch_idx == num_micro_batches - 1
 
         with self.amp_ctx:
-            pred = self.model(micro_X, y_train, micro_d)  # (B, test_size, max_classes)
+            capture_pre_decoder_repr = umap_datasets_to_log > 0
+            model_out = self.model(
+                micro_X,
+                y_train,
+                micro_d,
+                return_pre_decoder_repr=capture_pre_decoder_repr,
+            )
+            if capture_pre_decoder_repr:
+                pred, pre_decoder_repr_test = model_out
+            else:
+                pred = model_out
+
             pred = pred.flatten(end_dim=-2)
             true = y_test.long().flatten()
             loss = F.cross_entropy(pred, true)
@@ -608,6 +649,31 @@ class Trainer:
             micro_results["ce"] = scaled_loss.item()
             accuracy = (pred.argmax(dim=1) == true).sum() / len(true)
             micro_results["accuracy"] = accuracy.item() / num_micro_batches
+
+            if should_log_conf_mat and confusion_matrix is not None and true.numel() > 0:
+                sample_size = min(4, true.numel())
+                y_true_sample = true[:sample_size].detach().cpu().numpy()
+                y_pred_sample = pred[:sample_size].argmax(dim=1).detach().cpu().numpy()
+                labels = np.arange(self.config.max_classes)
+                cm = confusion_matrix(y_true_sample, y_pred_sample, labels=labels)
+                micro_results["confusion_matrix_sample"] = cm.tolist()
+
+            if (
+                should_log_conf_mat
+                and umap_datasets_to_log > 0
+                and self.master_process
+                and self.wandb_run is not None
+            ):
+                umap_images = build_test_umap_wandb_images(
+                    repr_test=pre_decoder_repr_test,
+                    y_test=y_test,
+                    wandb_module=wandb,
+                    max_datasets=umap_datasets_to_log,
+                    start_index=umap_start_index,
+                    seed=self.config.np_seed + self.curr_step,
+                )
+                if umap_images:
+                    micro_results["umap_images"] = umap_images
 
         return micro_results
 
@@ -648,11 +714,32 @@ class Trainer:
 
         results = {"ce": 0.0, "accuracy": 0.0}
         failed_batches = 0
+        should_log_conf_mat = self._should_log_conf_mat_now()
+        confusion_matrix_payload = None
+        umap_payload = {}
+        umap_next_index = 0
+        umap_remaining = 4 if (should_log_conf_mat and self.master_process and self.wandb_run is not None) else 0
 
         for idx, micro_batch in enumerate(micro_batches):
             try:
-                micro_results = self.run_micro_batch(micro_batch, idx, num_micro_batches)
+                micro_results = self.run_micro_batch(
+                    micro_batch,
+                    idx,
+                    num_micro_batches,
+                    should_log_conf_mat=should_log_conf_mat,
+                    umap_datasets_to_log=umap_remaining,
+                    umap_start_index=umap_next_index,
+                )
                 for k, v in micro_results.items():
+                    if k == "confusion_matrix_sample":
+                        if confusion_matrix_payload is None:
+                            confusion_matrix_payload = v
+                        continue
+                    if k == "umap_images":
+                        umap_payload.update(v)
+                        umap_next_index = len(umap_payload)
+                        umap_remaining = max(0, 4 - umap_next_index)
+                        continue
                     results[k] += v
             except torch.cuda.OutOfMemoryError:
                 print(
@@ -681,6 +768,11 @@ class Trainer:
         # Update the learning rate
         self.optimizer.zero_grad(set_to_none=True)
         self.scheduler.step()
+
+        if confusion_matrix_payload is not None and should_log_conf_mat:
+            results["confusion_matrix_sample"] = confusion_matrix_payload
+        if should_log_conf_mat and umap_payload:
+            results.update(umap_payload)
 
         return results
 

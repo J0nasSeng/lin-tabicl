@@ -54,46 +54,59 @@ class GraphMultiheadAttention(nn.Module):
             raise ValueError("edge_index_batch length must equal batch size")
 
         B, T, _ = src.shape
-        out_batch = []
+        all_edge_src: list[Tensor] = []
+        all_edge_dst: list[Tensor] = []
+        empty_graph = torch.zeros(B, dtype=torch.bool, device=src.device)
 
-        for b in range(B):
-            x = src[b]
-            edge_index = edge_index_batch[b].to(device=x.device, dtype=torch.long)
+        for b, edge_index in enumerate(edge_index_batch):
+            edge_index = edge_index.to(device=src.device, dtype=torch.long)
             if edge_index.ndim != 2 or edge_index.shape[0] != 2:
                 raise ValueError("Each edge_index must have shape (2, E)")
 
             edge_src = edge_index[0]
             edge_dst = edge_index[1]
-
             if edge_src.numel() == 0:
-                out_batch.append(self.out_proj(x))
+                empty_graph[b] = True
                 continue
 
-            q = self.q_proj(x).view(T, self.nhead, self.head_dim)
-            k = self.k_proj(x).view(T, self.nhead, self.head_dim)
-            v = self.v_proj(x).view(T, self.nhead, self.head_dim)
+            offset = b * T
+            all_edge_src.append(edge_src + offset)
+            all_edge_dst.append(edge_dst + offset)
 
-            q_dst = q[edge_dst]
-            k_src = k[edge_src]
-            v_src = v[edge_src]
+        # Keep historical semantics: if all graphs are empty, apply out_proj to src directly.
+        if not all_edge_src:
+            return self.out_proj(src)
 
-            attn_logits = (q_dst * k_src).sum(dim=-1) * self.scale
-            edge_weight = torch.sigmoid(attn_logits)
-            edge_weight = self.dropout(edge_weight)
+        global_edge_src = torch.cat(all_edge_src, dim=0)
+        global_edge_dst = torch.cat(all_edge_dst, dim=0)
 
-            messages = v_src * edge_weight.unsqueeze(-1)
+        q = self.q_proj(src).view(B * T, self.nhead, self.head_dim)
+        k = self.k_proj(src).view(B * T, self.nhead, self.head_dim)
+        v = self.v_proj(src).view(B * T, self.nhead, self.head_dim)
 
-            agg = torch.zeros((T, self.nhead, self.head_dim), dtype=src.dtype, device=src.device)
-            denom = torch.zeros((T, self.nhead), dtype=src.dtype, device=src.device)
-            for h in range(self.nhead):
-                agg[:, h, :].index_add_(0, edge_dst, messages[:, h, :])
-                denom[:, h].index_add_(0, edge_dst, edge_weight[:, h])
+        q_dst = q[global_edge_dst]
+        k_src = k[global_edge_src]
+        v_src = v[global_edge_src]
 
-            agg = agg / denom.clamp_min(1e-6).unsqueeze(-1)
-            out = self.out_proj(agg.reshape(T, self.d_model))
-            out_batch.append(out)
+        attn_logits = (q_dst * k_src).sum(dim=-1) * self.scale
+        edge_weight = torch.sigmoid(attn_logits)
+        edge_weight = self.dropout(edge_weight)
 
-        return torch.stack(out_batch, dim=0)
+        messages = v_src * edge_weight.unsqueeze(-1)
+
+        agg = torch.zeros((B * T, self.nhead, self.head_dim), dtype=src.dtype, device=src.device)
+        denom = torch.zeros((B * T, self.nhead), dtype=src.dtype, device=src.device)
+        agg.index_add_(0, global_edge_dst, messages)
+        denom.index_add_(0, global_edge_dst, edge_weight)
+
+        agg = agg / denom.clamp_min(1e-6).unsqueeze(-1)
+        out = self.out_proj(agg.view(B, T, self.d_model))
+
+        # Keep historical semantics for empty graphs when other graphs in the batch are non-empty.
+        if empty_graph.any():
+            out[empty_graph] = self.out_proj(src[empty_graph])
+
+        return out
 
 
 class GraphAttentionBlock(nn.Module):

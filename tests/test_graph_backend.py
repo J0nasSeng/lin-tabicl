@@ -2,6 +2,7 @@ import torch
 import pytest
 
 from src.tabicl._model.graph import build_class_conditioned_graph
+from src.tabicl._model.gat import GraphMultiheadAttention
 from src.tabicl._model.learning import ICLearning
 
 
@@ -171,3 +172,57 @@ def test_graph_builder_shared_graph_fallback_for_non_identical_labels():
 
     assert len(graph.edge_index) == y_train.shape[0]
     assert not torch.equal(graph.edge_index[0], graph.edge_index[1])
+
+
+def test_graph_multihead_attention_vectorized_matches_legacy_loop():
+    torch.manual_seed(0)
+    B, T, D, H = 3, 7, 16, 4
+
+    model = GraphMultiheadAttention(d_model=D, nhead=H, dropout=0.0)
+    model.eval()
+
+    src = torch.randn(B, T, D)
+    edge_index_batch = [
+        torch.tensor([[0, 1, 2, 2], [1, 2, 0, 3]], dtype=torch.long),
+        torch.empty((2, 0), dtype=torch.long),
+        torch.tensor([[1, 3, 4, 5, 6], [0, 2, 2, 6, 1]], dtype=torch.long),
+    ]
+
+    with torch.no_grad():
+        out_new = model(src, edge_index_batch)
+
+        out_old = []
+        for b in range(B):
+            x = src[b]
+            edge_index = edge_index_batch[b].to(device=x.device, dtype=torch.long)
+            edge_src = edge_index[0]
+            edge_dst = edge_index[1]
+
+            if edge_src.numel() == 0:
+                out_old.append(model.out_proj(x))
+                continue
+
+            q = model.q_proj(x).view(T, model.nhead, model.head_dim)
+            k = model.k_proj(x).view(T, model.nhead, model.head_dim)
+            v = model.v_proj(x).view(T, model.nhead, model.head_dim)
+
+            q_dst = q[edge_dst]
+            k_src = k[edge_src]
+            v_src = v[edge_src]
+
+            attn_logits = (q_dst * k_src).sum(dim=-1) * model.scale
+            edge_weight = torch.sigmoid(attn_logits)
+            messages = v_src * edge_weight.unsqueeze(-1)
+
+            agg = torch.zeros((T, model.nhead, model.head_dim), dtype=src.dtype, device=src.device)
+            denom = torch.zeros((T, model.nhead), dtype=src.dtype, device=src.device)
+            for h in range(model.nhead):
+                agg[:, h, :].index_add_(0, edge_dst, messages[:, h, :])
+                denom[:, h].index_add_(0, edge_dst, edge_weight[:, h])
+
+            agg = agg / denom.clamp_min(1e-6).unsqueeze(-1)
+            out_old.append(model.out_proj(agg.reshape(T, model.d_model)))
+
+        out_old = torch.stack(out_old, dim=0)
+
+    assert torch.allclose(out_new, out_old, atol=1e-6, rtol=1e-6)

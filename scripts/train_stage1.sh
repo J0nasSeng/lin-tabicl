@@ -5,24 +5,33 @@ ICL_BACKEND=${ICL_BACKEND:-graph}
 # Enable wandb logging by setting WAND_LOG=True (and optionally WAND_MODE=online)
 WAND_LOG=${WAND_LOG:-False}
 WAND_MODE=${WAND_MODE:-disabled}
+# GPU selection controls
+DEVICE=${DEVICE:-cuda}
+NUM_GPUS=${NUM_GPUS:-1}
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+# Confusion matrix logging interval
+LOG_CONF_MAT_EVERY=${LOG_CONF_MAT_EVERY:-100}
+
+export CUDA_VISIBLE_DEVICES
 
 # ----------------------------------
 # Generate prior datasets on the fly
 # ----------------------------------
 
-torchrun --standalone --nproc_per_node=1 /workspace/src/tabicl/train/_run.py \
+torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_run.py \
             --wandb_log ${WAND_LOG} \
             --wandb_project TabICL \
             --wandb_name Stage1 \
-            --wandb_dir /my/wandb/dir \
+            --wandb_dir /workspace/wandb/ \
             --wandb_mode ${WAND_MODE} \
-            --device cuda \
-            --dtype float32 \
+            --device ${DEVICE} \
+            --dtype float16 \
             --np_seed 42 \
             --torch_seed 42 \
             --max_steps 1000 \
             --batch_size 64 \
-            --micro_batch_size 4 \
+            --micro_batch_size 16 \
+            --log_conf_mat_every ${LOG_CONF_MAT_EVERY} \
             --lr 1e-4 \
             --scheduler cosine_warmup \
             --warmup_proportion 0.02 \
@@ -49,7 +58,7 @@ torchrun --standalone --nproc_per_node=1 /workspace/src/tabicl/train/_run.py \
             --icl_backend ${ICL_BACKEND} \
             --ff_factor 2 \
             --norm_first True \
-            --checkpoint_dir /my/stage1/checkpoint/dir \
+            --checkpoint_dir /workspace/checkpoints/stage1/ \
             --save_temp_every 50 \
             --save_perm_every 5000
 
@@ -59,8 +68,8 @@ torchrun --standalone --nproc_per_node=1 /workspace/src/tabicl/train/_run.py \
 # ------------------------------------------------------
 
 # Saving to disk
-python /path/to/tabicl/prior/genload.py \
-    --save_dir /my/stage1/prior/dir \
+python /workspace/src/tabicl/prior/genload.py \
+    --save_dir /workspace/prior/stage1/ \
     --np_seed 42 \
     --torch_seed 42 \
     --num_batches 100000 \
@@ -79,24 +88,25 @@ python /path/to/tabicl/prior/genload.py \
     --device cpu
 
 # Loading from disk and training
-torchrun --standalone --nproc_per_node=1 /path/to/tabicl/train/run.py \
+torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/run.py \
             --wandb_log ${WAND_LOG} \
             --wandb_project TabICL \
             --wandb_name Stage1 \
-            --wandb_dir /my/wandb/dir \
+            --wandb_dir /workspace/wandb/ \
             --wandb_mode ${WAND_MODE} \
-            --device cuda \
+            --device ${DEVICE} \
             --dtype float32 \
             --np_seed 42 \
             --torch_seed 42 \
             --max_steps 100000 \
             --batch_size 512 \
             --micro_batch_size 4 \
+            --log_conf_mat_every ${LOG_CONF_MAT_EVERY} \
             --lr 1e-4 \
             --scheduler cosine_warmup \
             --warmup_proportion 0.02 \
             --gradient_clipping 1.0 \
-            --prior_dir /my/stage1/prior/dir \
+            --prior_dir /workspace/prior/stage1/ \
             --load_prior_start 0 \
             --delete_after_load False \
             --prior_device cpu \
@@ -113,6 +123,6 @@ torchrun --standalone --nproc_per_node=1 /path/to/tabicl/train/run.py \
             --icl_backend ${ICL_BACKEND} \
             --ff_factor 2 \
             --norm_first True \
-            --checkpoint_dir /my/stage1/checkpoint/dir \
+            --checkpoint_dir /workspace/checkpoints/stage1/ \
             --save_temp_every 50 \
             --save_perm_every 5000

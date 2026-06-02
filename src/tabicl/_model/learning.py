@@ -297,7 +297,7 @@ class ICLearning(nn.Module):
         indices = unique_vals.argsort()
         return indices[torch.searchsorted(unique_vals, y)]
 
-    def _icl_predictions(self, R: Tensor, y_train: Tensor) -> Tensor:
+    def _icl_predictions(self, R: Tensor, y_train: Tensor, return_pre_decoder_repr: bool = False) -> Tensor | tuple[Tensor, Tensor]:
         """In-context learning predictions.
 
         Parameters
@@ -332,6 +332,9 @@ class ICLearning(nn.Module):
         if self.norm_first:
             src = self.ln(src)
         out = self.decoder(src)
+
+        if return_pre_decoder_repr:
+            return out, src
 
         return out
 
@@ -551,7 +554,8 @@ class ICLearning(nn.Module):
         return_logits: bool = True,
         softmax_temperature: float = 0.9,
         mgr_config: MgrConfig = None,
-    ) -> Tensor:
+        return_pre_decoder_repr: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor]:
         """In-context learning based on learned row representations.
 
         Parameters
@@ -595,6 +599,12 @@ class ICLearning(nn.Module):
 
         if self.training:
             train_size = y_train.shape[1]
+            if return_pre_decoder_repr:
+                out, pre_decoder_repr = self._icl_predictions(R, y_train, return_pre_decoder_repr=True)
+                out = out[:, train_size:]
+                pre_decoder_repr = pre_decoder_repr[:, train_size:]
+                return out, pre_decoder_repr
+
             out = self._icl_predictions(R, y_train)
             out = out[:, train_size:]
         else:
