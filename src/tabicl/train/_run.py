@@ -33,12 +33,55 @@ from tabicl._model.tabicl import TabICL
 from tabicl.prior._dataset import PriorDataset
 from tabicl.prior._genload import LoadPriorDataset
 from tabicl.train._optim import get_scheduler
+from tabicl.train._supcon import supervised_contrastive_loss
 from tabicl.train._train_config import build_parser
 from tabicl.train._umap_logging import build_test_umap_wandb_images
+from rtpt import RTPT
 
 warnings.filterwarnings(
     "ignore", message=".*The PyTorch API of nested tensors is in prototype stage.*", category=UserWarning
 )
+
+
+def build_confusion_matrix_plot_image(cm: list[list[int]], class_names: list[str], wandb_module):
+    """Render confusion matrix heatmap and wrap it as a W&B image artifact."""
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return None
+
+    cm_arr = np.asarray(cm)
+    fig, ax = plt.subplots(figsize=(6, 5), dpi=150)
+    im = ax.imshow(cm_arr, interpolation="nearest", cmap="Blues")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    ax.set_title("Confusion Matrix (Sample)")
+    ax.set_xlabel("Predicted label")
+    ax.set_ylabel("True label")
+    ticks = np.arange(len(class_names))
+    ax.set_xticks(ticks)
+    ax.set_yticks(ticks)
+    ax.set_xticklabels(class_names, rotation=45, ha="right", fontsize=8)
+    ax.set_yticklabels(class_names, fontsize=8)
+
+    threshold = cm_arr.max() / 2.0 if cm_arr.size > 0 else 0
+    for i in range(cm_arr.shape[0]):
+        for j in range(cm_arr.shape[1]):
+            val = int(cm_arr[i, j])
+            ax.text(
+                j,
+                i,
+                str(val),
+                ha="center",
+                va="center",
+                color="white" if val > threshold else "black",
+                fontsize=7,
+            )
+
+    fig.tight_layout()
+    image = wandb_module.Image(fig)
+    plt.close(fig)
+    return image
 
 
 class Timer:
@@ -97,6 +140,8 @@ class Trainer:
         self.configure_optimizer()
         self.configure_amp()
         self.load_checkpoint()
+        self.rtpt = RTPT(name_initials="JS", experiment_name="TabICL_Stage1", max_iterations=self.config.max_steps)
+        self.rtpt.start()
 
     def configure_ddp(self):
         """Set up distributed training and system configuration.
@@ -165,6 +210,11 @@ class Trainer:
                     "wandb is not installed but --wandb_log=True. Install with `uv sync --extra pretrain` "
                     "or run with --wandb_log False."
                 )
+            if self.config.checkpoint_dir:
+                os.makedirs(self.config.checkpoint_dir, exist_ok=True)
+            if self.config.wandb_dir:
+                os.makedirs(self.config.wandb_dir, exist_ok=True)
+
             id_path = os.path.join(self.config.checkpoint_dir, "wand_id.txt")
             if self.config.wandb_id is None:
                 if os.path.exists(id_path):
@@ -491,6 +541,8 @@ class Trainer:
                 # Add learning rate to results
                 results["lr"] = self.scheduler.get_last_lr()[0]
                 wandb.log(results, step=self.curr_step)
+            
+            self.rtpt.step()
 
     def _should_log_conf_mat_now(self) -> bool:
         log_every = int(getattr(self.config, "log_conf_mat_every", 100))
@@ -585,8 +637,8 @@ class Trainer:
         micro_batch_idx,
         num_micro_batches,
         should_log_conf_mat: bool = False,
-        umap_datasets_to_log: int = 0,
-        umap_start_index: int = 0,
+        dataset_results_to_log: int = 2,
+        dataset_results_start_index: int = 0,
     ):
         """Process a micro batch for gradient accumulation.
 
@@ -624,7 +676,8 @@ class Trainer:
             self.model.require_backward_grad_sync = micro_batch_idx == num_micro_batches - 1
 
         with self.amp_ctx:
-            capture_pre_decoder_repr = umap_datasets_to_log > 0
+            supcon_weight = float(getattr(self.config, "supcon_weight", 0.0))
+            capture_pre_decoder_repr = (dataset_results_to_log > 0) or (supcon_weight > 0)
             model_out = self.model(
                 micro_X,
                 y_train,
@@ -632,13 +685,22 @@ class Trainer:
                 return_pre_decoder_repr=capture_pre_decoder_repr,
             )
             if capture_pre_decoder_repr:
-                pred, pre_decoder_repr_test = model_out
+                pred_3d, pre_decoder_repr_test = model_out
             else:
-                pred = model_out
+                pred_3d = model_out
 
-            pred = pred.flatten(end_dim=-2)
+            pred = pred_3d.flatten(end_dim=-2)
             true = y_test.long().flatten()
-            loss = F.cross_entropy(pred, true)
+            ce_loss = F.cross_entropy(pred, true)
+
+            supcon_raw_loss = pred.new_zeros(())
+            if supcon_weight > 0:
+                repr_flat = pre_decoder_repr_test.reshape(-1, pre_decoder_repr_test.shape[-1])
+                labels_flat = y_test.long().reshape(-1)
+                supcon_raw_loss = supervised_contrastive_loss(repr_flat, labels_flat)
+
+            # Always keep CE as the primary objective; SupCon is an additive regularizer.
+            loss = 0.01 * ce_loss + supcon_weight * supcon_raw_loss
 
         # Scale loss for gradient accumulation and backpropagate
         scaled_loss = loss / num_micro_batches
@@ -646,21 +708,51 @@ class Trainer:
 
         with torch.no_grad():
             micro_results = {}
-            micro_results["ce"] = scaled_loss.item()
+            micro_results["ce"] = (ce_loss / num_micro_batches).item()
+            micro_results["loss"] = loss.item() / num_micro_batches
             accuracy = (pred.argmax(dim=1) == true).sum() / len(true)
             micro_results["accuracy"] = accuracy.item() / num_micro_batches
+            if supcon_weight > 0:
+                micro_results["supcon"] = (supcon_weight * supcon_raw_loss / num_micro_batches).item()
+                micro_results["supcon_raw"] = (supcon_raw_loss / num_micro_batches).item()
 
             if should_log_conf_mat and confusion_matrix is not None and true.numel() > 0:
-                sample_size = min(4, true.numel())
-                y_true_sample = true[:sample_size].detach().cpu().numpy()
-                y_pred_sample = pred[:sample_size].argmax(dim=1).detach().cpu().numpy()
-                labels = np.arange(self.config.max_classes)
-                cm = confusion_matrix(y_true_sample, y_pred_sample, labels=labels)
-                micro_results["confusion_matrix_sample"] = cm.tolist()
+                y_true_all = true.detach().cpu().tolist()
+                y_pred_all = pred.argmax(dim=1).detach().cpu().tolist()
+                micro_results["confusion_matrix_sample_y_true"] = y_true_all
+                micro_results["confusion_matrix_sample_y_pred"] = y_pred_all
+
+                if (
+                    dataset_results_to_log > 0
+                    and self.master_process
+                    and self.wandb_run is not None
+                    and wandb is not None
+                ):
+                    class_names = [str(i) for i in range(self.config.max_classes)]
+                    confusion_images = {}
+                    n_ds = min(dataset_results_to_log, y_test.shape[0], pred_3d.shape[0])
+                    y_pred_per_ds = pred_3d.argmax(dim=-1)
+                    labels = np.arange(self.config.max_classes)
+
+                    for local_idx in range(n_ds):
+                        y_true_ds = y_test[local_idx].long().detach().cpu().numpy()
+                        y_pred_ds = y_pred_per_ds[local_idx].long().detach().cpu().numpy()
+                        cm_ds = confusion_matrix(y_true_ds, y_pred_ds, labels=labels)
+                        cm_image = build_confusion_matrix_plot_image(
+                            cm=cm_ds.tolist(),
+                            class_names=class_names,
+                            wandb_module=wandb,
+                        )
+                        if cm_image is not None:
+                            key = f"confusion_matrix_ds_{dataset_results_start_index + local_idx}"
+                            confusion_images[key] = cm_image
+
+                    if confusion_images:
+                        micro_results["confusion_images"] = confusion_images
 
             if (
                 should_log_conf_mat
-                and umap_datasets_to_log > 0
+                and dataset_results_to_log > 0
                 and self.master_process
                 and self.wandb_run is not None
             ):
@@ -668,8 +760,8 @@ class Trainer:
                     repr_test=pre_decoder_repr_test,
                     y_test=y_test,
                     wandb_module=wandb,
-                    max_datasets=umap_datasets_to_log,
-                    start_index=umap_start_index,
+                    max_datasets=dataset_results_to_log,
+                    start_index=dataset_results_start_index,
                     seed=self.config.np_seed + self.curr_step,
                 )
                 if umap_images:
@@ -715,10 +807,12 @@ class Trainer:
         results = {"ce": 0.0, "accuracy": 0.0}
         failed_batches = 0
         should_log_conf_mat = self._should_log_conf_mat_now()
-        confusion_matrix_payload = None
+        confusion_y_true_payload: list[int] = []
+        confusion_y_pred_payload: list[int] = []
+        confusion_plot_payload = {}
         umap_payload = {}
-        umap_next_index = 0
-        umap_remaining = 4 if (should_log_conf_mat and self.master_process and self.wandb_run is not None) else 0
+        dataset_results_next_index = 0
+        dataset_results_remaining = 4 if (should_log_conf_mat and self.master_process and self.wandb_run is not None) else 0
 
         for idx, micro_batch in enumerate(micro_batches):
             try:
@@ -727,19 +821,34 @@ class Trainer:
                     idx,
                     num_micro_batches,
                     should_log_conf_mat=should_log_conf_mat,
-                    umap_datasets_to_log=umap_remaining,
-                    umap_start_index=umap_next_index,
+                    dataset_results_to_log=dataset_results_remaining,
+                    dataset_results_start_index=dataset_results_next_index,
                 )
                 for k, v in micro_results.items():
-                    if k == "confusion_matrix_sample":
-                        if confusion_matrix_payload is None:
-                            confusion_matrix_payload = v
+                    if k == "confusion_matrix_sample_y_true":
+                        confusion_y_true_payload.extend(v)
+                        continue
+                    if k == "confusion_matrix_sample_y_pred":
+                        confusion_y_pred_payload.extend(v)
+                        continue
+                    if k == "confusion_images":
+                        confusion_plot_payload.update(v)
+                        dataset_results_next_index = max(
+                            len(confusion_plot_payload),
+                            len(umap_payload),
+                        )
+                        dataset_results_remaining = max(0, 4 - dataset_results_next_index)
                         continue
                     if k == "umap_images":
                         umap_payload.update(v)
-                        umap_next_index = len(umap_payload)
-                        umap_remaining = max(0, 4 - umap_next_index)
+                        dataset_results_next_index = max(
+                            len(confusion_plot_payload),
+                            len(umap_payload),
+                        )
+                        dataset_results_remaining = max(0, 4 - dataset_results_next_index)
                         continue
+                    if k not in results:
+                        results[k] = 0.0
                     results[k] += v
             except torch.cuda.OutOfMemoryError:
                 print(
@@ -769,8 +878,30 @@ class Trainer:
         self.optimizer.zero_grad(set_to_none=True)
         self.scheduler.step()
 
-        if confusion_matrix_payload is not None and should_log_conf_mat:
+        if (
+            should_log_conf_mat
+            and confusion_matrix is not None
+            and len(confusion_y_true_payload) > 0
+            and len(confusion_y_pred_payload) > 0
+        ):
+            labels = np.arange(self.config.max_classes)
+            cm = confusion_matrix(confusion_y_true_payload, confusion_y_pred_payload, labels=labels)
+            confusion_matrix_payload = cm.tolist()
             results["confusion_matrix_sample"] = confusion_matrix_payload
+            if (
+                self.wandb_run is not None
+                and wandb is not None
+            ):
+                class_names = [str(i) for i in range(self.config.max_classes)]
+                cm_image = build_confusion_matrix_plot_image(
+                    cm=confusion_matrix_payload,
+                    class_names=class_names,
+                    wandb_module=wandb,
+                )
+                if cm_image is not None:
+                    results["confusion_matrix_sample_plot"] = cm_image
+        if should_log_conf_mat and confusion_plot_payload:
+            results.update(confusion_plot_payload)
         if should_log_conf_mat and umap_payload:
             results.update(umap_payload)
 

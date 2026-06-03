@@ -3,6 +3,7 @@ import pytest
 
 from src.tabicl._model.graph import build_class_conditioned_graph
 from src.tabicl._model.gat import GraphMultiheadAttention
+from src.tabicl._model.gat import GraphAttentionBlock
 from src.tabicl._model.learning import ICLearning
 
 
@@ -41,11 +42,15 @@ def test_graph_builder_train_degree_and_test_class_coverage():
     src = edge_index[0]
     dst = edge_index[1]
 
-    # Graph should be bidirectional for all non-self edges.
+    # Train/train non-self edges should remain bidirectional.
     edge_set = set(zip(src.tolist(), dst.tolist()))
     for u, v in edge_set:
-        if u != v:
+        if u != v and u < train_size and v < train_size:
             assert (v, u) in edge_set
+
+    # Test nodes are consumers only: no test->train edges.
+    test_to_train = (src >= train_size) & (dst < train_size)
+    assert int(test_to_train.sum().item()) == 0
 
     # Same-label edges should be present within every class among train nodes.
     labels = y_train[0]
@@ -226,3 +231,26 @@ def test_graph_multihead_attention_vectorized_matches_legacy_loop():
         out_old = torch.stack(out_old, dim=0)
 
     assert torch.allclose(out_new, out_old, atol=1e-6, rtol=1e-6)
+
+
+def test_graph_attention_block_alpha_initialization_and_forward_shape():
+    torch.manual_seed(0)
+    block = GraphAttentionBlock(
+        d_model=16,
+        nhead=4,
+        dim_feedforward=32,
+        dropout=0.0,
+        norm_first=True,
+    )
+
+    assert torch.isclose(block.alpha.detach().cpu(), torch.tensor(0.05), atol=1e-8)
+
+    src = torch.randn(2, 6, 16)
+    edge_index_batch = [
+        torch.tensor([[0, 1, 2, 3], [1, 2, 3, 4]], dtype=torch.long),
+        torch.tensor([[0, 2, 4], [2, 4, 5]], dtype=torch.long),
+    ]
+
+    out = block(src, edge_index_batch)
+    assert out.shape == src.shape
+    assert torch.isfinite(out).all()

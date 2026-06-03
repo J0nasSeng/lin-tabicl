@@ -89,7 +89,7 @@ class GraphMultiheadAttention(nn.Module):
         v_src = v[global_edge_src]
 
         attn_logits = (q_dst * k_src).sum(dim=-1) * self.scale
-        edge_weight = torch.sigmoid(attn_logits)
+        edge_weight = torch.sigmoid(attn_logits / 0.1)
         edge_weight = self.dropout(edge_weight)
 
         messages = v_src * edge_weight.unsqueeze(-1)
@@ -135,6 +135,7 @@ class GraphAttentionBlock(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
+        self.alpha = nn.Parameter(torch.tensor(-3, dtype=torch.float32))
 
         if isinstance(activation, str):
             if activation == "relu":
@@ -153,15 +154,17 @@ class GraphAttentionBlock(nn.Module):
         return self.dropout2(self.linear2(self.dropout(self.activation(self.linear1(x)))))
 
     def forward(self, src: Tensor, edge_index_batch: list[Tensor]) -> Tensor:
+        alpha = torch.sigmoid(self.alpha)
         if self.norm_first:
-            x = src + self.dropout1(self.attn(self.norm1(src), edge_index_batch=edge_index_batch))
+            attn_out = self.dropout1(self.attn(self.norm1(src), edge_index_batch=edge_index_batch))
+            x = (1.0 - alpha) * src + alpha * attn_out
             x = x + self._ff_block(self.norm2(x))
             return x
 
-        x = self.norm1(src + self.dropout1(self.attn(src, edge_index_batch=edge_index_batch)))
+        attn_out = self.dropout1(self.attn(src, edge_index_batch=edge_index_batch))
+        x = self.norm1((1.0 - alpha) * src + alpha * attn_out)
         x = self.norm2(x + self._ff_block(x))
         return x
-
 
 class GraphAttentionTransformer(nn.Module):
     """Stack of sparse graph attention blocks."""

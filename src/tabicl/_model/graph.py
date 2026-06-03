@@ -224,7 +224,7 @@ def build_class_conditioned_graph(
                         src_edges.extend([src_cross, dst_cross])
                         dst_edges.extend([dst_cross, src_cross])
 
-        # 3) Test/train edges: vectorized destination layout, class-wise source sampling, then mirror.
+        # 3) Train->test edges only: test nodes are consumers and do not send to train nodes.
         if num_test > 0 and num_classes > 0:
             per_class_count = test_k_per_class * num_test
             dst_template = torch.arange(train_size, total_nodes, device=labels.device, dtype=torch.long).repeat_interleave(
@@ -240,8 +240,8 @@ def build_class_conditioned_graph(
 
             src_test = torch.cat(src_test_parts, dim=0)
             dst_test = torch.cat(dst_test_parts, dim=0)
-            src_edges.extend([src_test, dst_test])
-            dst_edges.extend([dst_test, src_test])
+            src_edges.append(src_test)
+            dst_edges.append(dst_test)
 
         # Self loops for all nodes keep isolated-path behavior stable.
         all_nodes = torch.arange(total_nodes, device=labels.device, dtype=torch.long)

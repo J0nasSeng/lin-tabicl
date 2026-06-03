@@ -176,7 +176,7 @@ class TabICL(nn.Module):
         graph_max_train_neighbors: int = 15,
         graph_same_label_ratio: float = 0.9,
         graph_cross_label_ratio: float = 0.1,
-        graph_test_k_per_class: int = 3,
+        graph_test_k_per_class: int = 8,
         graph_seed: Optional[int] = None,
         graph_share_across_batch: bool = False,
         graph_share_require_identical_labels: bool = True,

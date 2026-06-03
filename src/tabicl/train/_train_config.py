@@ -64,6 +64,12 @@ def build_parser():
         default=100,
         help="Log confusion matrix sample every N training steps (set <= 0 to disable)",
     )
+    parser.add_argument(
+        "--supcon_weight",
+        type=float,
+        default=1.0,
+        help="Weight for supervised contrastive regularization computed on test-sample representations",
+    )
 
     # Optimization Config
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
@@ -232,7 +238,7 @@ def build_parser():
     parser.add_argument(
         "--graph_test_k_per_class",
         type=int,
-        default=3,
+        default=8,
         help="Minimum number of train neighbors per class for each test node",
     )
     parser.add_argument(

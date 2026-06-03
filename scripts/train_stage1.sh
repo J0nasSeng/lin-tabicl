@@ -3,12 +3,12 @@
 # Choose ICL backbone: graph or encoder
 ICL_BACKEND=${ICL_BACKEND:-graph}
 # Enable wandb logging by setting WAND_LOG=True (and optionally WAND_MODE=online)
-WAND_LOG=${WAND_LOG:-False}
-WAND_MODE=${WAND_MODE:-disabled}
+WAND_LOG=${WAND_LOG:-True}
+WAND_MODE=${WAND_MODE:-offline}
 # GPU selection controls
 DEVICE=${DEVICE:-cuda}
-NUM_GPUS=${NUM_GPUS:-1}
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+NUM_GPUS=${NUM_GPUS:-3}
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2}
 # Confusion matrix logging interval
 LOG_CONF_MAT_EVERY=${LOG_CONF_MAT_EVERY:-100}
 
@@ -28,16 +28,17 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --dtype float16 \
             --np_seed 42 \
             --torch_seed 42 \
-            --max_steps 1000 \
+            --max_steps 10000 \
             --batch_size 64 \
-            --micro_batch_size 16 \
+            --micro_batch_size 8 \
             --log_conf_mat_every ${LOG_CONF_MAT_EVERY} \
             --lr 1e-4 \
+            --supcon_weight 1.0 \
             --scheduler cosine_warmup \
             --warmup_proportion 0.02 \
             --gradient_clipping 1.0 \
             --prior_type mix_scm \
-            --prior_device cpu \
+            --prior_device cuda \
             --batch_size_per_gp 4 \
             --min_features 2 \
             --max_features 100 \
@@ -47,14 +48,14 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --max_train_size 0.9 \
             --embed_dim 128 \
             --col_num_blocks 3 \
-            --col_nhead 4 \
+            --col_nhead 8 \
             --col_num_inds 128 \
             --row_num_blocks 3 \
             --row_nhead 8 \
             --row_num_cls 4 \
             --row_rope_base 100000 \
-            --icl_num_blocks 12 \
-            --icl_nhead 4 \
+            --icl_num_blocks 4 \
+            --icl_nhead 8 \
             --icl_backend ${ICL_BACKEND} \
             --ff_factor 2 \
             --norm_first True \
@@ -112,14 +113,14 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/r
             --prior_device cpu \
             --embed_dim 128 \
             --col_num_blocks 3 \
-            --col_nhead 4 \
+            --col_nhead 8 \
             --col_num_inds 128 \
             --row_num_blocks 3 \
             --row_nhead 8 \
             --row_num_cls 4 \
             --row_rope_base 100000 \
             --icl_num_blocks 12 \
-            --icl_nhead 4 \
+            --icl_nhead 8 \
             --icl_backend ${ICL_BACKEND} \
             --ff_factor 2 \
             --norm_first True \

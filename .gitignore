@@ -138,3 +138,7 @@ docs/tutorials/
 
 # resources
 *.png
+
+# logs
+wandb/
+checkpoints/

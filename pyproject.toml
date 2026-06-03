@@ -35,7 +35,10 @@ dependencies = [
     "tqdm>=4.64.0",
     "huggingface-hub",
     "xgboost",
-    "transformers"
+    "transformers",
+    "wandb",
+    "rtpt",
+    "umap-learn"
 ]
 
 [project.optional-dependencies]
