@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import torch
-from torch import Tensor
 import torch.nn.functional as F
+from torch import Tensor
 
 
 def supervised_contrastive_loss(
@@ -60,3 +60,20 @@ def supervised_contrastive_loss(
 
     loss = -mean_log_prob_pos[valid_anchor_mask].mean()
     return loss.to(dtype=embeddings.dtype)
+
+
+def entropy_regularizer(logits: Tensor) -> Tensor:
+    """Compute mean predictive entropy over a logits tensor.
+
+    The input is flattened to shape (N, C) and entropy is computed as
+    ``-sum(p * log(p))`` with softmax probabilities ``p``.
+    """
+
+    if logits.ndim < 2:
+        raise ValueError("logits must have at least 2 dimensions")
+
+    flat_logits = logits.reshape(-1, logits.shape[-1]).float()
+    log_probs = F.log_softmax(flat_logits, dim=-1)
+    probs = torch.exp(log_probs)
+    entropy = -(probs * log_probs).sum(dim=-1).mean()
+    return entropy.to(dtype=logits.dtype)

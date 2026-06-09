@@ -194,6 +194,7 @@ class RowInteraction(nn.Module):
         embeddings[:, :, : self.num_cls] = cls_tokens.to(embeddings.device)
 
         # Create mask to prevent from attending to empty features
+        # TODO: Check why d is None, we should have a mask here
         if d is None:
             key_mask = None
         else:

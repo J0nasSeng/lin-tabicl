@@ -129,6 +129,11 @@ def build_class_conditioned_graph(
             empty = pool.new_empty((0,), dtype=torch.long)
             return empty, empty
 
+        # Prevent self-connections in random graph generation.
+        if pool.numel() == 1:
+            empty = pool.new_empty((0,), dtype=torch.long)
+            return empty, empty
+
         src_pos = torch.randint(0, pool.numel(), (num_pairs,), generator=gen, device=pool.device)
         if pool.numel() == 1:
             dst_pos = src_pos.clone()
@@ -242,11 +247,6 @@ def build_class_conditioned_graph(
             dst_test = torch.cat(dst_test_parts, dim=0)
             src_edges.append(src_test)
             dst_edges.append(dst_test)
-
-        # Self loops for all nodes keep isolated-path behavior stable.
-        all_nodes = torch.arange(total_nodes, device=labels.device, dtype=torch.long)
-        src_edges.append(all_nodes)
-        dst_edges.append(all_nodes)
 
         edge_src = torch.cat(src_edges, dim=0)
         edge_dst = torch.cat(dst_edges, dim=0)

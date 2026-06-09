@@ -70,6 +70,12 @@ def build_parser():
         default=1.0,
         help="Weight for supervised contrastive regularization computed on test-sample representations",
     )
+    parser.add_argument(
+        "--entropy_weight",
+        type=float,
+        default=0.0,
+        help="Weight for entropy-maximization regularization on test-sample logits",
+    )
 
     # Optimization Config
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
@@ -210,6 +216,19 @@ def build_parser():
         default="graph",
         choices=["encoder", "graph"],
         help="ICL backbone type: encoder or graph",
+    )
+    parser.add_argument(
+        "--icl_decoder_type",
+        type=str,
+        default="mlp",
+        choices=["mlp", "soft_kmeans"],
+        help="ICL decoder type: standard MLP decoder or soft_kmeans matching decoder",
+    )
+    parser.add_argument(
+        "--icl_soft_kmeans_temperature",
+        type=float,
+        default=1.0,
+        help="Temperature for soft_kmeans decoder similarity softmax",
     )
     parser.add_argument(
         "--graph_min_train_neighbors",

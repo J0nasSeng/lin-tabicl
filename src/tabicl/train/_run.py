@@ -33,7 +33,7 @@ from tabicl._model.tabicl import TabICL
 from tabicl.prior._dataset import PriorDataset
 from tabicl.prior._genload import LoadPriorDataset
 from tabicl.train._optim import get_scheduler
-from tabicl.train._supcon import supervised_contrastive_loss
+from tabicl.train._losses import entropy_regularizer, supervised_contrastive_loss
 from tabicl.train._train_config import build_parser
 from tabicl.train._umap_logging import build_test_umap_wandb_images
 from rtpt import RTPT
@@ -252,6 +252,8 @@ class Trainer:
             "icl_num_blocks": self.config.icl_num_blocks,
             "icl_nhead": self.config.icl_nhead,
             "icl_backend": self.config.icl_backend,
+            "icl_decoder_type": self.config.icl_decoder_type,
+            "icl_soft_kmeans_temperature": self.config.icl_soft_kmeans_temperature,
             "graph_min_train_neighbors": self.config.graph_min_train_neighbors,
             "graph_max_train_neighbors": self.config.graph_max_train_neighbors,
             "graph_same_label_ratio": self.config.graph_same_label_ratio,
@@ -677,6 +679,7 @@ class Trainer:
 
         with self.amp_ctx:
             supcon_weight = float(getattr(self.config, "supcon_weight", 0.0))
+            entropy_weight = float(getattr(self.config, "entropy_weight", 0.0))
             capture_pre_decoder_repr = (dataset_results_to_log > 0) or (supcon_weight > 0)
             model_out = self.model(
                 micro_X,
@@ -699,8 +702,12 @@ class Trainer:
                 labels_flat = y_test.long().reshape(-1)
                 supcon_raw_loss = supervised_contrastive_loss(repr_flat, labels_flat)
 
-            # Always keep CE as the primary objective; SupCon is an additive regularizer.
-            loss = 0.01 * ce_loss + supcon_weight * supcon_raw_loss
+            entropy_raw_loss = pred.new_zeros(())
+            if entropy_weight > 0:
+                entropy_raw_loss = entropy_regularizer(pred_3d)
+
+            # Keep CE as primary objective; maximize predictive entropy via a negative entropy term.
+            loss = ce_loss + supcon_weight * supcon_raw_loss - entropy_weight * entropy_raw_loss
 
         # Scale loss for gradient accumulation and backpropagate
         scaled_loss = loss / num_micro_batches
@@ -715,6 +722,9 @@ class Trainer:
             if supcon_weight > 0:
                 micro_results["supcon"] = (supcon_weight * supcon_raw_loss / num_micro_batches).item()
                 micro_results["supcon_raw"] = (supcon_raw_loss / num_micro_batches).item()
+            if entropy_weight > 0:
+                micro_results["entropy"] = (-entropy_weight * entropy_raw_loss / num_micro_batches).item()
+                micro_results["entropy_raw"] = (entropy_raw_loss / num_micro_batches).item()
 
             if should_log_conf_mat and confusion_matrix is not None and true.numel() > 0:
                 y_true_all = true.detach().cpu().tolist()

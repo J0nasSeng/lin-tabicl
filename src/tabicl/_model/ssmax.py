@@ -90,6 +90,11 @@ class SSMaxMLP(nn.Module):
         self.mlp = nn.Sequential(nn.Linear(1, n_hidden), nn.GELU(), nn.Linear(n_hidden, out_dim))
         self.num_heads = num_heads
 
+        for m in self.mlp.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
+
     def forward(self, q: torch.Tensor, n: int) -> torch.Tensor:
         """Apply SSMax scaling to queries.
 
@@ -161,6 +166,12 @@ class QASSMaxMLP(nn.Module):
 
         self.base_mlp = nn.Sequential(nn.Linear(1, n_hidden), nn.GELU(), nn.Linear(n_hidden, base_out_dim))
         self.query_mlp = nn.Sequential(nn.Linear(head_dim, n_hidden), nn.GELU(), nn.Linear(n_hidden, query_out_dim))
+
+        # set all biases 0 and weights xavier_uniform
+        for m in list(self.base_mlp.modules()) + list(self.query_mlp.modules()):
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
 
         # ensures initial modulation is zero
         nn.init.zeros_(self.query_mlp[-1].weight)

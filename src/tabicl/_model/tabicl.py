@@ -172,6 +172,8 @@ class TabICL(nn.Module):
         icl_num_blocks: int = 12,
         icl_nhead: int = 8,
         icl_backend: Literal["encoder", "graph"] = "graph",
+        icl_decoder_type: Literal["mlp", "soft_kmeans"] = "mlp",
+        icl_soft_kmeans_temperature: float = 0.1,
         graph_min_train_neighbors: int = 8,
         graph_max_train_neighbors: int = 15,
         graph_same_label_ratio: float = 0.9,
@@ -229,6 +231,8 @@ class TabICL(nn.Module):
         self.icl_num_blocks = icl_num_blocks
         self.icl_nhead = icl_nhead
         self.icl_backend = icl_backend
+        self.icl_decoder_type = icl_decoder_type
+        self.icl_soft_kmeans_temperature = icl_soft_kmeans_temperature
         self.graph_min_train_neighbors = graph_min_train_neighbors
         self.graph_max_train_neighbors = graph_max_train_neighbors
         self.graph_same_label_ratio = graph_same_label_ratio
@@ -293,6 +297,8 @@ class TabICL(nn.Module):
             ssmax=icl_ssmax,
             recompute=recompute,
             icl_backend=icl_backend,
+            decoder_type=icl_decoder_type,
+            soft_kmeans_temperature=icl_soft_kmeans_temperature,
             graph_min_train_neighbors=graph_min_train_neighbors,
             graph_max_train_neighbors=graph_max_train_neighbors,
             graph_same_label_ratio=graph_same_label_ratio,

@@ -65,8 +65,8 @@ class OneHotAndLinear(nn.Linear):
         Output embedding dimension.
     """
 
-    def __init__(self, num_classes: int, embed_dim: int):
-        super().__init__(num_classes, embed_dim)
+    def __init__(self, num_classes: int, embed_dim: int, bias: bool = True):
+        super().__init__(num_classes, embed_dim, bias=bias)
         self.num_classes = num_classes
         self.embed_dim = embed_dim
 
@@ -354,10 +354,14 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
 
     def init_weights(self):
         """Initialize projection layers to zero for stable training."""
-        nn.init.zeros_(self.attn.out_proj.weight)
+        nn.init.xavier_uniform_(self.attn.out_proj.weight)
         nn.init.zeros_(self.attn.out_proj.bias)
-        nn.init.zeros_(self.linear2.weight)
+        nn.init.xavier_uniform_(self.linear2.weight)
         nn.init.zeros_(self.linear2.bias)
+        nn.init.xavier_uniform_(self.attn.in_proj_weight)
+        nn.init.zeros_(self.attn.in_proj_bias)
+        nn.init.xavier_uniform_(self.linear1.weight)
+        nn.init.zeros_(self.linear1.bias)
 
     def forward(
         self,

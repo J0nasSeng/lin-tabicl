@@ -5,6 +5,7 @@ from src.tabicl._model.graph import build_class_conditioned_graph
 from src.tabicl._model.gat import GraphMultiheadAttention
 from src.tabicl._model.gat import GraphAttentionBlock
 from src.tabicl._model.learning import ICLearning
+from src.tabicl.train._losses import entropy_regularizer
 
 
 def _build_labels(batch_size: int, train_size: int, num_classes: int) -> torch.Tensor:
@@ -41,6 +42,9 @@ def test_graph_builder_train_degree_and_test_class_coverage():
     edge_index = graph.edge_index[0]
     src = edge_index[0]
     dst = edge_index[1]
+
+    # Graph generation should not include self-connections.
+    assert int((src == dst).sum().item()) == 0
 
     # Train/train non-self edges should remain bidirectional.
     edge_set = set(zip(src.tolist(), dst.tolist()))
@@ -137,6 +141,48 @@ def test_iclearning_graph_backend_cache_paths_raise():
         model.forward_with_repr_cache(R, train_size=train_size, num_classes=3)
 
 
+def test_entropy_regularizer_prefers_uniform_predictions():
+    uniform_logits = torch.zeros(8, 5)
+    peaked_logits = torch.full((8, 5), -6.0)
+    peaked_logits[:, 0] = 6.0
+
+    h_uniform = entropy_regularizer(uniform_logits)
+    h_peaked = entropy_regularizer(peaked_logits)
+
+    assert h_uniform > h_peaked
+    assert torch.isfinite(h_uniform)
+    assert torch.isfinite(h_peaked)
+
+
+def test_iclearning_soft_kmeans_decoder_forward_shape():
+    batch_size = 2
+    train_size = 12
+    total_nodes = 20
+    d_model = 16
+
+    y_train = _build_labels(batch_size=batch_size, train_size=train_size, num_classes=3).long()
+    R = torch.randn(batch_size, total_nodes, d_model)
+
+    model = ICLearning(
+        max_classes=5,
+        out_dim=5,
+        d_model=d_model,
+        num_blocks=2,
+        nhead=4,
+        dim_feedforward=32,
+        icl_backend="encoder",
+        decoder_type="soft_kmeans",
+        soft_kmeans_temperature=0.2,
+    )
+    model.train()
+
+    out, pre = model(R, y_train, return_pre_decoder_repr=True)
+    assert out.shape == (batch_size, total_nodes - train_size, 5)
+    assert pre.shape == (batch_size, total_nodes - train_size, d_model)
+    assert torch.isfinite(out).all()
+    assert torch.isfinite(pre).all()
+
+
 def test_graph_builder_shared_graph_when_labels_identical():
     batch_size = 3
     train_size = 15
@@ -195,6 +241,7 @@ def test_graph_multihead_attention_vectorized_matches_legacy_loop():
 
     with torch.no_grad():
         out_new = model(src, edge_index_batch)
+        alpha = torch.sigmoid(model.alpha)
 
         out_old = []
         for b in range(B):
@@ -204,7 +251,7 @@ def test_graph_multihead_attention_vectorized_matches_legacy_loop():
             edge_dst = edge_index[1]
 
             if edge_src.numel() == 0:
-                out_old.append(model.out_proj(x))
+                out_old.append((1.0 - alpha) * x)
                 continue
 
             q = model.q_proj(x).view(T, model.nhead, model.head_dim)
@@ -216,17 +263,24 @@ def test_graph_multihead_attention_vectorized_matches_legacy_loop():
             v_src = v[edge_src]
 
             attn_logits = (q_dst * k_src).sum(dim=-1) * model.scale
-            edge_weight = torch.sigmoid(attn_logits)
+
+            edge_weight = torch.zeros_like(attn_logits)
+            unique_dst = torch.unique(edge_dst)
+            for h in range(model.nhead):
+                logits_h = attn_logits[:, h]
+                for dst_idx in unique_dst.tolist():
+                    mask = edge_dst == dst_idx
+                    if mask.any():
+                        edge_weight[mask, h] = torch.softmax(logits_h[mask], dim=0)
+
             messages = v_src * edge_weight.unsqueeze(-1)
 
             agg = torch.zeros((T, model.nhead, model.head_dim), dtype=src.dtype, device=src.device)
-            denom = torch.zeros((T, model.nhead), dtype=src.dtype, device=src.device)
             for h in range(model.nhead):
                 agg[:, h, :].index_add_(0, edge_dst, messages[:, h, :])
-                denom[:, h].index_add_(0, edge_dst, edge_weight[:, h])
 
-            agg = agg / denom.clamp_min(1e-6).unsqueeze(-1)
-            out_old.append(model.out_proj(agg.reshape(T, model.d_model)))
+            attn_out = model.out_proj(agg.reshape(T, model.d_model))
+            out_old.append((1.0 - alpha) * x + alpha * attn_out)
 
         out_old = torch.stack(out_old, dim=0)
 
@@ -243,7 +297,8 @@ def test_graph_attention_block_alpha_initialization_and_forward_shape():
         norm_first=True,
     )
 
-    assert torch.isclose(block.alpha.detach().cpu(), torch.tensor(0.05), atol=1e-8)
+    alpha = torch.sigmoid(block.attn.alpha.detach().cpu())
+    assert torch.isclose(alpha, torch.tensor(0.05), atol=1e-8)
 
     src = torch.randn(2, 6, 16)
     edge_index_batch = [

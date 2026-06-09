@@ -5,6 +5,7 @@ from collections import OrderedDict
 import math
 import torch
 from torch import nn, Tensor
+import torch.nn.functional as F
 
 from .layers import ClassNode, OneHotAndLinear
 from .encoders import Encoder
@@ -92,6 +93,8 @@ class ICLearning(nn.Module):
         graph_same_label_ratio: float = 0.9,
         graph_cross_label_ratio: float = 0.1,
         graph_test_k_per_class: int = 8,
+        decoder_type: Literal["mlp", "soft_kmeans"] = "mlp",
+        soft_kmeans_temperature: float = 0.1,
         graph_seed: Optional[int] = None,
         graph_share_across_batch: bool = False,
         graph_share_require_identical_labels: bool = True,
@@ -106,12 +109,20 @@ class ICLearning(nn.Module):
         self.graph_same_label_ratio = graph_same_label_ratio
         self.graph_cross_label_ratio = graph_cross_label_ratio
         self.graph_test_k_per_class = graph_test_k_per_class
+        self.decoder_type = decoder_type
+        self.soft_kmeans_temperature = float(soft_kmeans_temperature)
         self.graph_seed = graph_seed
         self.graph_share_across_batch = graph_share_across_batch
         self.graph_share_require_identical_labels = graph_share_require_identical_labels
 
         if self.icl_backend not in ("encoder", "graph"):
             raise ValueError(f"Unknown icl_backend={self.icl_backend}. Expected 'encoder' or 'graph'.")
+
+        if self.decoder_type not in ("mlp", "soft_kmeans"):
+            raise ValueError(f"Unknown decoder_type={self.decoder_type}. Expected 'mlp' or 'soft_kmeans'.")
+
+        if self.soft_kmeans_temperature <= 0:
+            raise ValueError("soft_kmeans_temperature must be > 0")
 
         if self.icl_backend == "graph" and max_classes <= 0:
             raise ValueError("Graph ICL backend is currently supported for classification only (max_classes > 0).")
@@ -149,9 +160,37 @@ class ICLearning(nn.Module):
         else:  # Regression
             self.y_encoder = nn.Linear(1, d_model)
 
-        self.decoder = nn.Sequential(nn.Linear(d_model, d_model * 2), nn.GELU(), nn.Linear(d_model * 2, out_dim))
+        if self.decoder_type == "mlp":
+            self.decoder = nn.Sequential(nn.Linear(d_model, d_model * 2), nn.GELU(), nn.Linear(d_model * 2, out_dim))
+        else:
+            self.decoder = None
+
         enc_name = "tf_icl" if self.icl_backend == "encoder" else "gat_icl"
         self.inference_mgr = InferenceManager(enc_name=enc_name, out_dim=out_dim)
+
+    def _soft_kmeans_decoder(self, src: Tensor, y_train: Tensor, train_size: int) -> Tensor:
+        """Decode via train-to-all matching and label-mass accumulation.
+
+        Computes similarity from all positions to train positions, then projects
+        soft assignment mass into class logits via one-hot train labels.
+        """
+
+        if self.max_classes <= 0:
+            raise ValueError("soft_kmeans decoder is only supported for classification (max_classes > 0).")
+        if train_size <= 0:
+            raise ValueError("soft_kmeans decoder requires train_size > 0")
+
+        train_repr = src[:, :train_size, :]
+        sim = torch.matmul(src, train_repr.transpose(1, 2))
+        sim = sim / math.sqrt(src.shape[-1])
+        sim = sim / self.soft_kmeans_temperature
+
+        assign = torch.softmax(sim, dim=-1)
+        y_one_hot = F.one_hot(y_train.long(), num_classes=self.max_classes).to(dtype=src.dtype)
+        class_mass = torch.matmul(assign, y_one_hot)
+
+        # Return logits compatible with CE and downstream slicing behavior.
+        return class_mass
 
     def _apply_icl_backbone(self, R: Tensor, train_size: int, y_train: Optional[Tensor] = None) -> Tensor:
         """Apply selected ICL backbone (encoder or graph attention)."""
@@ -331,7 +370,10 @@ class ICLearning(nn.Module):
         src = self._apply_icl_backbone(R, train_size=train_size, y_train=y_train)
         if self.norm_first:
             src = self.ln(src)
-        out = self.decoder(src)
+        if self.decoder_type == "mlp":
+            out = self.decoder(src)
+        else:
+            out = self._soft_kmeans_decoder(src, y_train=y_train, train_size=train_size)
 
         if return_pre_decoder_repr:
             return out, src
@@ -666,6 +708,8 @@ class ICLearning(nn.Module):
 
         if self.icl_backend == "graph":
             raise ValueError("Representation-cache path is not supported for graph ICL backend.")
+        if self.decoder_type != "mlp":
+            raise ValueError("Representation-cache path currently supports decoder_type='mlp' only.")
 
         src = self._apply_icl_backbone(R, train_size=train_size)
         if self.norm_first:
@@ -777,6 +821,8 @@ class ICLearning(nn.Module):
         """
         if self.icl_backend == "graph":
             raise ValueError("KV cache path is not supported for graph ICL backend.")
+        if self.decoder_type != "mlp":
+            raise ValueError("KV cache path currently supports decoder_type='mlp' only.")
 
         # When using cache, skip y_train embedding — it's already baked
         # into the cached K/V projections from the store_cache pass.

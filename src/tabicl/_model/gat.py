@@ -9,7 +9,7 @@ from torch.utils.checkpoint import checkpoint
 
 
 class GraphMultiheadAttention(nn.Module):
-    """Sparse graph multi-head attention with sigmoid edge gating."""
+    """Sparse graph multi-head attention with per-destination softmax weights."""
 
     def __init__(self, d_model: int, nhead: int, dropout: float = 0.0):
         super().__init__()
@@ -26,11 +26,12 @@ class GraphMultiheadAttention(nn.Module):
         self.v_proj = nn.Linear(d_model, d_model)
         self.out_proj = nn.Linear(d_model, d_model)
         self.dropout = nn.Dropout(dropout)
+        self.alpha = nn.Parameter(torch.logit(torch.tensor(0.05, dtype=torch.float32)))
 
-        nn.init.zeros_(self.out_proj.weight)
+        nn.init.xavier_uniform_(self.out_proj.weight)
         nn.init.zeros_(self.out_proj.bias)
 
-    def forward(self, src: Tensor, edge_index_batch: list[Tensor]) -> Tensor:
+    def forward(self, src: Tensor, edge_index_batch: list[Tensor], residual_src: Tensor | None = None) -> Tensor:
         """Apply sparse graph attention.
 
         Parameters
@@ -53,10 +54,14 @@ class GraphMultiheadAttention(nn.Module):
         if len(edge_index_batch) != src.shape[0]:
             raise ValueError("edge_index_batch length must equal batch size")
 
+        if residual_src is None:
+            residual_src = src
+        if residual_src.shape != src.shape:
+            raise ValueError("residual_src must have shape (B, T, D)")
+
         B, T, _ = src.shape
         all_edge_src: list[Tensor] = []
         all_edge_dst: list[Tensor] = []
-        empty_graph = torch.zeros(B, dtype=torch.bool, device=src.device)
 
         for b, edge_index in enumerate(edge_index_batch):
             edge_index = edge_index.to(device=src.device, dtype=torch.long)
@@ -66,16 +71,17 @@ class GraphMultiheadAttention(nn.Module):
             edge_src = edge_index[0]
             edge_dst = edge_index[1]
             if edge_src.numel() == 0:
-                empty_graph[b] = True
                 continue
 
             offset = b * T
             all_edge_src.append(edge_src + offset)
             all_edge_dst.append(edge_dst + offset)
 
-        # Keep historical semantics: if all graphs are empty, apply out_proj to src directly.
+        alpha = torch.sigmoid(self.alpha).to(dtype=src.dtype)
+
+        # No incoming edges anywhere: keep only the self-connection part.
         if not all_edge_src:
-            return self.out_proj(src)
+            return (1.0 - alpha) * residual_src
 
         global_edge_src = torch.cat(all_edge_src, dim=0)
         global_edge_dst = torch.cat(all_edge_dst, dim=0)
@@ -89,24 +95,29 @@ class GraphMultiheadAttention(nn.Module):
         v_src = v[global_edge_src]
 
         attn_logits = (q_dst * k_src).sum(dim=-1) * self.scale
-        edge_weight = torch.sigmoid(attn_logits / 0.1)
+
+        E = global_edge_dst.numel()
+        head_ids = torch.arange(self.nhead, device=src.device, dtype=torch.long).repeat(E)
+        dst_rep = global_edge_dst.repeat_interleave(self.nhead)
+        group_index = dst_rep * self.nhead + head_ids
+        num_groups = B * T * self.nhead
+
+        logits_flat = attn_logits.reshape(-1)
+        max_per_group = torch.full((num_groups,), float("-inf"), dtype=src.dtype, device=src.device)
+        max_per_group.scatter_reduce_(0, group_index, logits_flat, reduce="amax", include_self=True)
+
+        exp_logits = torch.exp(logits_flat - max_per_group[group_index])
+        sum_per_group = torch.zeros((num_groups,), dtype=src.dtype, device=src.device)
+        sum_per_group.index_add_(0, group_index, exp_logits)
+        edge_weight = (exp_logits / sum_per_group[group_index].clamp_min(1e-12)).view(E, self.nhead)
         edge_weight = self.dropout(edge_weight)
 
         messages = v_src * edge_weight.unsqueeze(-1)
 
         agg = torch.zeros((B * T, self.nhead, self.head_dim), dtype=src.dtype, device=src.device)
-        denom = torch.zeros((B * T, self.nhead), dtype=src.dtype, device=src.device)
         agg.index_add_(0, global_edge_dst, messages)
-        denom.index_add_(0, global_edge_dst, edge_weight)
-
-        agg = agg / denom.clamp_min(1e-6).unsqueeze(-1)
-        out = self.out_proj(agg.view(B, T, self.d_model))
-
-        # Keep historical semantics for empty graphs when other graphs in the batch are non-empty.
-        if empty_graph.any():
-            out[empty_graph] = self.out_proj(src[empty_graph])
-
-        return out
+        attn_out = self.out_proj(agg.view(B, T, self.d_model))
+        return (1.0 - alpha) * residual_src + alpha * attn_out
 
 
 class GraphAttentionBlock(nn.Module):
@@ -135,7 +146,6 @@ class GraphAttentionBlock(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
-        self.alpha = nn.Parameter(torch.tensor(-3, dtype=torch.float32))
 
         if isinstance(activation, str):
             if activation == "relu":
@@ -147,22 +157,19 @@ class GraphAttentionBlock(nn.Module):
         else:
             self.activation = activation
 
-        nn.init.zeros_(self.linear2.weight)
+        nn.init.xavier_uniform_(self.linear2.weight)
         nn.init.zeros_(self.linear2.bias)
 
     def _ff_block(self, x: Tensor) -> Tensor:
         return self.dropout2(self.linear2(self.dropout(self.activation(self.linear1(x)))))
 
     def forward(self, src: Tensor, edge_index_batch: list[Tensor]) -> Tensor:
-        alpha = torch.sigmoid(self.alpha)
         if self.norm_first:
-            attn_out = self.dropout1(self.attn(self.norm1(src), edge_index_batch=edge_index_batch))
-            x = (1.0 - alpha) * src + alpha * attn_out
+            x = self.dropout1(self.attn(self.norm1(src), edge_index_batch=edge_index_batch, residual_src=src))
             x = x + self._ff_block(self.norm2(x))
             return x
 
-        attn_out = self.dropout1(self.attn(src, edge_index_batch=edge_index_batch))
-        x = self.norm1((1.0 - alpha) * src + alpha * attn_out)
+        x = self.norm1(self.dropout1(self.attn(src, edge_index_batch=edge_index_batch)))
         x = self.norm2(x + self._ff_block(x))
         return x
 

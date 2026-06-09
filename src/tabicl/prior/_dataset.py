@@ -648,10 +648,11 @@ class SCMPrior(Prior):
                 # Generate parameters for each dataset in this subgroup
                 for ds_idx in range(actual_subgp_size):
                     # Each dataset has its own number of classes
-                    if np.random.random() > 0.5:
-                        ds_num_classes = np.random.randint(2, self.max_classes + 1)
-                    else:
-                        ds_num_classes = 2
+                    ds_num_classes = np.random.randint(2, self.max_classes + 1)
+                    #if np.random.random() > 0.5:
+                    #    ds_num_classes = np.random.randint(2, self.max_classes + 1)
+                    #else:
+                    #    ds_num_classes = 2
 
                     # Create parameters dictionary for this dataset
                     params = {

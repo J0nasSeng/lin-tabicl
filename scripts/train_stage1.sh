@@ -8,7 +8,7 @@ WAND_MODE=${WAND_MODE:-offline}
 # GPU selection controls
 DEVICE=${DEVICE:-cuda}
 NUM_GPUS=${NUM_GPUS:-3}
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2}
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,5,6}
 # Confusion matrix logging interval
 LOG_CONF_MAT_EVERY=${LOG_CONF_MAT_EVERY:-100}
 
@@ -33,13 +33,14 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --micro_batch_size 8 \
             --log_conf_mat_every ${LOG_CONF_MAT_EVERY} \
             --lr 1e-4 \
-            --supcon_weight 1.0 \
+            --supcon_weight 0.0 \
+            --icl_decoder_type mlp \
             --scheduler cosine_warmup \
             --warmup_proportion 0.02 \
             --gradient_clipping 1.0 \
             --prior_type mix_scm \
             --prior_device cuda \
-            --batch_size_per_gp 4 \
+            --batch_size_per_gp 8 \
             --min_features 2 \
             --max_features 100 \
             --max_classes 10 \
