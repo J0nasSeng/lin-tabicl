@@ -7,10 +7,10 @@ WAND_LOG=${WAND_LOG:-True}
 WAND_MODE=${WAND_MODE:-offline}
 # GPU selection controls
 DEVICE=${DEVICE:-cuda}
-NUM_GPUS=${NUM_GPUS:-3}
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,5,6}
+NUM_GPUS=${NUM_GPUS:-1}
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 # Confusion matrix logging interval
-LOG_CONF_MAT_EVERY=${LOG_CONF_MAT_EVERY:-100}
+LOG_CONF_MAT_EVERY=${LOG_CONF_MAT_EVERY:-200}
 
 export CUDA_VISIBLE_DEVICES
 
@@ -34,13 +34,14 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --log_conf_mat_every ${LOG_CONF_MAT_EVERY} \
             --lr 1e-4 \
             --supcon_weight 0.0 \
+            --entropy_weight 0.0 \
             --icl_decoder_type mlp \
             --scheduler cosine_warmup \
             --warmup_proportion 0.02 \
             --gradient_clipping 1.0 \
             --prior_type mix_scm \
             --prior_device cuda \
-            --batch_size_per_gp 8 \
+            --batch_size_per_gp 64 \
             --min_features 2 \
             --max_features 100 \
             --max_classes 10 \
@@ -61,7 +62,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --ff_factor 2 \
             --norm_first True \
             --checkpoint_dir /workspace/checkpoints/stage1/ \
-            --save_temp_every 50 \
+            --save_temp_every 100 \
             --save_perm_every 5000
 
 

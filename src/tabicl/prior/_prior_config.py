@@ -9,7 +9,7 @@ DEFAULT_FIXED_HP = {
     "tree_depth_lambda": 0.5,
     "tree_n_estimators_lambda": 0.5,
     # Reg2Cls
-    "balanced": False,
+    "balanced": True,
     "multiclass_ordered_prob": 0.0,
     "cat_prob": 0.2,
     "max_categories": float("inf"),

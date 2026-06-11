@@ -623,6 +623,11 @@ class InducedSelfAttentionBlock(nn.Module):
         self.ind_vectors = nn.Parameter(torch.empty(num_inds, d_model))
         nn.init.trunc_normal_(self.ind_vectors, std=0.02)
 
+        nn.init.zeros_(self.multihead_attn1.linear2.weight)
+        nn.init.zeros_(self.multihead_attn1.linear2.bias)
+        nn.init.zeros_(self.multihead_attn1.attn.out_proj.weight)
+        nn.init.zeros_(self.multihead_attn1.attn.out_proj.bias)
+
     def induced_attention(self, src: Tensor, train_size: Optional[int] = None) -> Tensor:
         """Apply induced self-attention to input sequence.
 

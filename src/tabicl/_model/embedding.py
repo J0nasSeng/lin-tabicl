@@ -149,7 +149,7 @@ class ColEmbedding(nn.Module):
         self.max_classes = max_classes
         self.affine = affine
         self.mixed_radix_ensemble = mixed_radix_ensemble
-        self.in_linear = SkippableLinear(feature_group_size if feature_group else 1, embed_dim, bias=False)
+        self.in_linear = SkippableLinear(feature_group_size if feature_group else 1, embed_dim, bias=True)
 
         self.tf_col = SetTransformer(
             num_blocks=num_blocks,
@@ -167,21 +167,23 @@ class ColEmbedding(nn.Module):
 
         if target_aware:
             if max_classes > 0:  # Classification
-                self.y_encoder = OneHotAndLinear(max_classes, embed_dim, bias=False)
+                self.y_encoder = OneHotAndLinear(max_classes, embed_dim, bias=True)
             else:  # Regression
-                self.y_encoder = nn.Linear(1, embed_dim, bias=False)
+                self.y_encoder = nn.Linear(1, embed_dim, bias=True)
 
         if affine:
-            self.out_w = SkippableLinear(embed_dim, embed_dim, bias=False)
+            self.out_w = SkippableLinear(embed_dim, embed_dim, bias=True)
             self.ln_w = nn.LayerNorm(embed_dim, bias=not bias_free_ln) if norm_first else nn.Identity()
 
-            self.out_b = SkippableLinear(embed_dim, embed_dim, bias=False)
+            self.out_b = SkippableLinear(embed_dim, embed_dim, bias=True)
             self.ln_b = nn.LayerNorm(embed_dim, bias=not bias_free_ln) if norm_first else nn.Identity()
 
         self.inference_mgr = InferenceManager(enc_name="tf_col", out_dim=embed_dim)
 
         nn.init.xavier_uniform_(self.in_linear.weight)
         nn.init.xavier_uniform_(self.y_encoder.weight)
+        nn.init.zeros_(self.in_linear.bias)
+        nn.init.zeros_(self.y_encoder.bias)
 
     @staticmethod
     def map_feature_shuffle(reference_pattern: List[int], other_pattern: List[int]) -> List[int]:
@@ -388,7 +390,7 @@ class ColEmbedding(nn.Module):
                 else:
                     y_emb = self.y_encoder(y_train.unsqueeze(-1))
                 src[..., :train_size, :] = src[..., :train_size, :] + y_emb
-                # TODO: this needs a mask to exclude the reserved CLS tokens
+                # TODO: Check why the attention result dominates in terms of magnitude
                 src = self.tf_col(src, train_size=None if embed_with_test else train_size)
             else:
                 # Mixed-radix ensembling for many-class classification
