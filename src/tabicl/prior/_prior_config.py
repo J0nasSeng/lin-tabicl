@@ -11,23 +11,26 @@ DEFAULT_FIXED_HP = {
     # Reg2Cls
     "balanced": True,
     "multiclass_ordered_prob": 0.0,
+    "multiclass_jitter_scale": 0.0,
     "cat_prob": 0.2,
     "max_categories": float("inf"),
     "scale_by_max_features": False,
     "permute_features": True,
     "permute_labels": True,
+    "multiclass_type": "quantile",
+    #"is_causal": True,
 }
 
 DEFAULT_SAMPLED_HP = {
     # Reg2Cls
-    "multiclass_type": {"distribution": "meta_choice", "choice_values": ["value", "rank"]},
+    #"multiclass_type": {"distribution": "meta_choice", "choice_values": ["value", "rank", "quantile"]},
     # MLPSCM
     "mlp_activations": {
         "distribution": "meta_choice_mixed",
         "choice_values": get_activations(random=True, scale=True, diverse=True),
     },
     "block_wise_dropout": {"distribution": "meta_choice", "choice_values": [True, False]},
-    "mlp_dropout_prob": {"distribution": "meta_beta", "scale": 0.9, "min": 0.1, "max": 5.0},
+    #"mlp_dropout_prob": {"distribution": "meta_beta", "scale": 0.9, "min": 0.1, "max": 5.0},
     # MLPSCM and TreeSCM
     "is_causal": {"distribution": "meta_choice", "choice_values": [True, False]},
     "num_causes": {
@@ -42,7 +45,7 @@ DEFAULT_SAMPLED_HP = {
     "sort_features": {"distribution": "meta_choice", "choice_values": [True, False]},
     "num_layers": {
         "distribution": "meta_trunc_norm_log_scaled",
-        "max_mean": 6,
+        "max_mean": 4,
         "min_mean": 1,
         "round": True,
         "lower_bound": 2,

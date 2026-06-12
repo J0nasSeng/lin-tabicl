@@ -390,7 +390,6 @@ class ColEmbedding(nn.Module):
                 else:
                     y_emb = self.y_encoder(y_train.unsqueeze(-1))
                 src[..., :train_size, :] = src[..., :train_size, :] + y_emb
-                # TODO: Check why the attention result dominates in terms of magnitude
                 src = self.tf_col(src, train_size=None if embed_with_test else train_size)
             else:
                 # Mixed-radix ensembling for many-class classification
@@ -423,6 +422,61 @@ class ColEmbedding(nn.Module):
             embeddings = src
 
         return embeddings
+
+    def project_input(self, X: Tensor, d: Optional[Tensor] = None) -> Tensor:
+        """Project raw input features with ``in_linear`` only.
+
+        This method mirrors the column layout logic used in training forward but
+        skips set-transformer processing and affine heads. It is intended for
+        graph-backend residual fusion where a pre-column embedding signal is
+        added to column embeddings.
+
+        Parameters
+        ----------
+        X : Tensor
+            Input tensor of shape (B, T, H).
+
+        d : Optional[Tensor], default=None
+            Number of valid features per table, shape (B,). Only used when
+            feature grouping is disabled.
+
+        Returns
+        -------
+        Tensor
+            Projected tensor of shape (B, T, H+C, E) where C is reserved cls
+            token count and E is embedding dimension.
+        """
+
+        if self.feature_group:
+            assert d is None, "d is not supported when feature grouping is enabled."
+            Xg = self.feature_grouping(X)
+            if self.reserve_cls_tokens > 0:
+                Xg = F.pad(Xg, (0, 0, self.reserve_cls_tokens, 0), value=-100.0)
+            features = Xg.transpose(1, 2)  # (B, G+C, T, group_size)
+            src = self.in_linear(features)
+            return src.transpose(1, 2)  # (B, T, G+C, E)
+
+        if self.reserve_cls_tokens > 0:
+            X = F.pad(X, (self.reserve_cls_tokens, 0), value=-100.0)
+
+        if d is None:
+            features = X.transpose(1, 2).unsqueeze(-1)  # (B, H+C, T, 1)
+            src = self.in_linear(features)
+            return src.transpose(1, 2)  # (B, T, H+C, E)
+
+        if self.reserve_cls_tokens > 0:
+            d = d + self.reserve_cls_tokens
+
+        B, T, HC = X.shape
+        Xt = X.transpose(1, 2)  # (B, H+C, T)
+        indices = torch.arange(HC, device=X.device).unsqueeze(0).expand(B, HC)
+        mask = indices < d.unsqueeze(1)
+        features = Xt[mask].unsqueeze(-1)  # (N, T, 1)
+        effective_src = self.in_linear(features)
+
+        src = torch.zeros(B, HC, T, self.embed_dim, device=X.device, dtype=effective_src.dtype)
+        src[mask] = effective_src
+        return src.transpose(1, 2)  # (B, T, H+C, E)
 
     def _train_forward(
         self, X: Tensor, y_train: Tensor, d: Optional[Tensor] = None, embed_with_test: bool = False

@@ -68,6 +68,15 @@ class GraphMultiheadAttention(nn.Module):
             if edge_index.ndim != 2 or edge_index.shape[0] != 2:
                 raise ValueError("Each edge_index must have shape (2, E)")
 
+            if edge_index.numel() > 0:
+                edge_min = int(edge_index.min().item())
+                edge_max = int(edge_index.max().item())
+                if edge_min < 0 or edge_max >= T:
+                    raise ValueError(
+                        f"edge_index for batch element {b} must be within [0, {T - 1}], "
+                        f"got min={edge_min}, max={edge_max}"
+                    )
+
             edge_src = edge_index[0]
             edge_dst = edge_index[1]
             if edge_src.numel() == 0:

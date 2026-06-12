@@ -185,20 +185,35 @@ class MulticlassAssigner(nn.Module):
         The method used to determine class boundaries:
         - "rank": Boundaries are randomly sampled from the input.
         - "value": Boundaries are randomly sampled from a normal distribution.
+                - "quantile": Boundaries are sampled from empirical quantiles with
+                    optional local index jitter.
 
     ordered_prob : float, default=0.2
         Probability of keeping the natural class order.
+
+    jitter_scale : float, default=0.0
+        Jitter scale used only when ``mode="quantile"``. The jitter is applied
+        to ideal quantile indices and constrained to a local neighborhood.
     """
 
-    def __init__(self, num_classes: int, mode: str = "rank", ordered_prob: float = 0.2):
+    def __init__(
+        self,
+        num_classes: int,
+        mode: str = "rank",
+        ordered_prob: float = 0.2,
+        jitter_scale: float = 0.0,
+    ):
         """Initialize the MulticlassAssigner."""
         super().__init__()
         if num_classes < 2:
             raise ValueError("The number of classes must be at least 2 for MulticlassAssigner.")
+        if jitter_scale < 0:
+            raise ValueError("jitter_scale must be >= 0.")
 
         self.num_classes = num_classes
         self.ordered_prob = ordered_prob
         self.mode = mode
+        self.jitter_scale = float(jitter_scale)
 
     def forward(self, input: Tensor) -> Tensor:
         """Assign class labels to continuous input values.
@@ -223,6 +238,26 @@ class MulticlassAssigner(nn.Module):
             boundaries = input[boundary_indices]
         elif self.mode == "value":
             boundaries = torch.randn(self.num_classes - 1, device=device)
+        elif self.mode == "quantile":
+            # Sort the input to expose the empirical distribution.
+            sorted_input, _ = torch.sort(input)
+
+            # Ideal balanced class boundaries in index space.
+            steps = torch.arange(1, self.num_classes, device=device, dtype=torch.float32)
+            ideal_indices = steps * (T / self.num_classes)
+
+            if self.jitter_scale > 0.0:
+                max_jitter = (T / self.num_classes) * self.jitter_scale
+                jitter = (torch.rand(self.num_classes - 1, device=device) * 2.0 - 1.0) * max_jitter
+                boundary_indices = (ideal_indices + jitter).long().clamp(0, T - 1)
+            else:
+                boundary_indices = ideal_indices.long().clamp(0, T - 1)
+
+            boundaries = sorted_input[boundary_indices]
+        else:
+            raise ValueError(
+                f"Unsupported multiclass mode: {self.mode}. Expected one of ['rank', 'value', 'quantile']."
+            )
 
         # Compare input tensor with boundaries and sum across the boundary dimension to get classes
         classes = (input.unsqueeze(-1) > boundaries.unsqueeze(0)).sum(dim=1)
@@ -252,8 +287,10 @@ class Reg2Cls(nn.Module):
         - num_classes (int): Number of classes for classification conversion.
         - max_features (int): Maximum number of features allowed (defines output
           feature dim).
-        - multiclass_type (str): Strategy for multiclass conversion ('rank' or
-          'value').
+                - multiclass_type (str): Strategy for multiclass conversion ('rank',
+                    'value', or 'quantile').
+                - multiclass_jitter_scale (float): Jitter scale used for
+                    ``multiclass_type='quantile'``.
         - balanced (bool): Whether to enforce balanced classes (currently only
           for binary).
         - multiclass_ordered_prob (float): Prob. of keeping natural class order.
@@ -289,7 +326,10 @@ class Reg2Cls(nn.Module):
             self.class_assigner = BalancedBinarize()
         elif num_classes >= 2:
             self.class_assigner = MulticlassAssigner(
-                num_classes, mode=self.hp["multiclass_type"], ordered_prob=self.hp["multiclass_ordered_prob"]
+                num_classes,
+                mode=self.hp["multiclass_type"],
+                ordered_prob=self.hp["multiclass_ordered_prob"],
+                jitter_scale=self.hp.get("multiclass_jitter_scale", 0.0),
             )
         else:
             raise ValueError(f"Invalid number of classes: {num_classes}")

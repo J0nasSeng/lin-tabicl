@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 from .layers import ClassNode, OneHotAndLinear
 from .encoders import Encoder
-from .gat import GraphAttentionTransformer
+from .gat import GraphAttentionTransformer, GraphAttentionBlock
 from .graph import build_class_conditioned_graph
 from .kv_cache import KVCache
 from .inference import InferenceManager
@@ -98,6 +98,7 @@ class ICLearning(nn.Module):
         graph_seed: Optional[int] = None,
         graph_share_across_batch: bool = False,
         graph_share_require_identical_labels: bool = True,
+        graph_num_cls: int = 4,
     ):
         super().__init__()
 
@@ -114,6 +115,7 @@ class ICLearning(nn.Module):
         self.graph_seed = graph_seed
         self.graph_share_across_batch = graph_share_across_batch
         self.graph_share_require_identical_labels = graph_share_require_identical_labels
+        self.graph_num_cls = graph_num_cls
 
         if self.icl_backend not in ("encoder", "graph"):
             raise ValueError(f"Unknown icl_backend={self.icl_backend}. Expected 'encoder' or 'graph'.")
@@ -152,6 +154,44 @@ class ICLearning(nn.Module):
                 bias_free_ln=bias_free_ln,
                 recompute=recompute,
             )
+            if d_model % self.graph_num_cls != 0:
+                raise ValueError(
+                    f"d_model ({d_model}) must be divisible by graph_num_cls ({self.graph_num_cls}) for graph path"
+                )
+            self.graph_col_dim = d_model // self.graph_num_cls
+            self.graph_cls_tokens = nn.Parameter(torch.empty(self.graph_num_cls, self.graph_col_dim))
+            nn.init.trunc_normal_(self.graph_cls_tokens, std=0.02)
+            self.graph_col_blocks = nn.ModuleList(
+                [
+                    GraphAttentionBlock(
+                        d_model=self.graph_col_dim,
+                        nhead=nhead,
+                        dim_feedforward=max(self.graph_col_dim * 2, dim_feedforward // max(self.graph_num_cls, 1)),
+                        dropout=dropout,
+                        activation=activation,
+                        norm_first=norm_first,
+                        bias_free_ln=bias_free_ln,
+                    )
+                    for _ in range(num_blocks)
+                ]
+            )
+            self.graph_col_attn = nn.ModuleList(
+                [
+                    nn.MultiheadAttention(
+                        embed_dim=self.graph_col_dim,
+                        num_heads=nhead,
+                        dropout=dropout,
+                        batch_first=True,
+                    )
+                    for _ in range(num_blocks)
+                ]
+            )
+            self.graph_col_attn_ln = nn.ModuleList(
+                [nn.LayerNorm(self.graph_col_dim, bias=not bias_free_ln) for _ in range(num_blocks)]
+            )
+            self.graph_out_proj = nn.Linear(self.graph_num_cls * self.graph_col_dim, d_model)
+            nn.init.xavier_uniform_(self.graph_out_proj.weight)
+            nn.init.zeros_(self.graph_out_proj.bias)
         if self.norm_first:
             self.ln = nn.LayerNorm(d_model, bias=not bias_free_ln)
 
@@ -336,7 +376,90 @@ class ICLearning(nn.Module):
         indices = unique_vals.argsort()
         return indices[torch.searchsorted(unique_vals, y)]
 
-    def _icl_predictions(self, R: Tensor, y_train: Tensor, return_pre_decoder_repr: bool = False) -> Tensor | tuple[Tensor, Tensor]:
+    def _run_graph_column_pipeline(
+        self,
+        col_embeddings: Tensor,
+        y_train: Tensor,
+    ) -> Tensor:
+        """Graph-only column pipeline.
+
+        Parameters
+        ----------
+        col_embeddings : Tensor
+            Column embeddings of shape (B, T, C, D).
+
+        y_train : Tensor
+            Training labels of shape (B, train_size).
+
+        Returns
+        -------
+        Tensor
+            Sequence representations of shape (B, T, d_model).
+        """
+
+        if col_embeddings.ndim != 4:
+            raise ValueError("Graph column pipeline expects col_embeddings with shape (B, T, C, D)")
+
+        B, T, C, D = col_embeddings.shape
+        if D != self.graph_col_dim:
+            raise ValueError(
+                f"Graph column pipeline expects last dim {self.graph_col_dim}, got {D}."
+            )
+
+        graph = build_class_conditioned_graph(
+            y_train=y_train,
+            total_nodes=T,
+            min_train_neighbors=self.graph_min_train_neighbors,
+            max_train_neighbors=self.graph_max_train_neighbors,
+            same_label_ratio=self.graph_same_label_ratio,
+            cross_label_ratio=self.graph_cross_label_ratio,
+            test_k_per_class=self.graph_test_k_per_class,
+            seed=self.graph_seed,
+            share_graph_across_batch=self.graph_share_across_batch,
+            share_graph_require_identical_labels=self.graph_share_require_identical_labels,
+        )
+
+        # Append learnable CLS tokens along column axis.
+        cls_tokens = self.graph_cls_tokens.view(1, 1, self.graph_num_cls, D).expand(B, T, -1, -1)
+        x = torch.cat([col_embeddings, cls_tokens], dim=2)  # (B, T, C+cls, D)
+        total_cols = x.shape[2]
+
+        expanded_edges: list[Tensor] = []
+        for b, edge_index in enumerate(graph.edge_index):
+            if edge_index.ndim != 2 or edge_index.shape[0] != 2:
+                raise ValueError("Each graph edge index must have shape (2, E)")
+            if edge_index.numel() > 0:
+                min_idx = int(edge_index.min().item())
+                max_idx = int(edge_index.max().item())
+                if min_idx < 0 or max_idx >= T:
+                    raise ValueError(f"edge_index out of bounds for dataset {b}: [{min_idx}, {max_idx}] vs T={T}")
+            for _ in range(total_cols):
+                expanded_edges.append(edge_index)
+
+        for block_idx, block in enumerate(self.graph_col_blocks):
+            # Per-column graph message passing over sample nodes.
+            x_col = x.permute(0, 2, 1, 3).reshape(B * total_cols, T, D)
+            x_col = block(x_col, edge_index_batch=expanded_edges)
+            x = x_col.reshape(B, total_cols, T, D).permute(0, 2, 1, 3)
+
+            # Per-sample attention along column axis.
+            x_bt = x.reshape(B * T, total_cols, D)
+            attn_in = self.graph_col_attn_ln[block_idx](x_bt)
+            attn_out, _ = self.graph_col_attn[block_idx](attn_in, attn_in, attn_in, need_weights=False)
+            x_bt = x_bt + attn_out
+            x = x_bt.reshape(B, T, total_cols, D)
+
+        cls_out = x[:, :, -self.graph_num_cls :, :].reshape(B, T, self.graph_num_cls * D)
+        return self.graph_out_proj(cls_out)
+
+    def _icl_predictions(
+        self,
+        R: Tensor,
+        y_train: Tensor,
+        return_pre_decoder_repr: bool = False,
+        use_col_embeddings: bool = False,
+        pre_col_embeddings: Optional[Tensor] = None,
+    ) -> Tensor | tuple[Tensor, Tensor]:
         """In-context learning predictions.
 
         Parameters
@@ -360,14 +483,24 @@ class ICLearning(nn.Module):
             - For classification (max_classes>0): out_dim = max_classes
         """
 
-        train_size = y_train.shape[1]
-        if self.max_classes > 0:  # Classification
-            Ry_train = self.y_encoder(y_train.float())
-        else:  # Regression
-            Ry_train = self.y_encoder(y_train.unsqueeze(-1))
-        R[:, :train_size] = R[:, :train_size] + Ry_train
+        if use_col_embeddings and self.icl_backend != "graph":
+            raise ValueError("use_col_embeddings=True is supported only for graph ICL backend.")
 
-        src = self._apply_icl_backbone(R, train_size=train_size, y_train=y_train)
+        train_size = y_train.shape[1]
+        if use_col_embeddings:
+            if pre_col_embeddings is None:
+                raise ValueError("pre_col_embeddings must be provided when use_col_embeddings=True")
+            if self.icl_backend != "graph":
+                raise ValueError("use_col_embeddings=True is supported only for graph ICL backend")
+            src = self._run_graph_column_pipeline(R + pre_col_embeddings, y_train=y_train)
+        else:
+            if self.max_classes > 0:  # Classification
+                Ry_train = self.y_encoder(y_train.float())
+            else:  # Regression
+                Ry_train = self.y_encoder(y_train.unsqueeze(-1))
+
+            R[:, :train_size] = R[:, :train_size] + Ry_train
+            src = self._apply_icl_backbone(R, train_size=train_size, y_train=y_train)
         if self.norm_first:
             src = self.ln(src)
         if self.decoder_type == "mlp":
@@ -597,6 +730,8 @@ class ICLearning(nn.Module):
         softmax_temperature: float = 0.9,
         mgr_config: MgrConfig = None,
         return_pre_decoder_repr: bool = False,
+        use_col_embeddings: bool = False,
+        pre_col_embeddings: Optional[Tensor] = None,
     ) -> Tensor | tuple[Tensor, Tensor]:
         """In-context learning based on learned row representations.
 
@@ -642,15 +777,41 @@ class ICLearning(nn.Module):
         if self.training:
             train_size = y_train.shape[1]
             if return_pre_decoder_repr:
-                out, pre_decoder_repr = self._icl_predictions(R, y_train, return_pre_decoder_repr=True)
+                out, pre_decoder_repr = self._icl_predictions(
+                    R,
+                    y_train,
+                    return_pre_decoder_repr=True,
+                    use_col_embeddings=use_col_embeddings,
+                    pre_col_embeddings=pre_col_embeddings,
+                )
                 out = out[:, train_size:]
                 pre_decoder_repr = pre_decoder_repr[:, train_size:]
                 return out, pre_decoder_repr
 
-            out = self._icl_predictions(R, y_train)
+            out = self._icl_predictions(
+                R,
+                y_train,
+                use_col_embeddings=use_col_embeddings,
+                pre_col_embeddings=pre_col_embeddings,
+            )
             out = out[:, train_size:]
         else:
-            out = self._inference_forward(R, y_train, return_logits, softmax_temperature, mgr_config)
+            if use_col_embeddings:
+                out = self._icl_predictions(
+                    R,
+                    y_train,
+                    use_col_embeddings=True,
+                    pre_col_embeddings=pre_col_embeddings,
+                )
+                train_size = y_train.shape[1]
+                out = out[:, train_size:]
+                if self.max_classes > 0:
+                    num_classes = len(torch.unique(y_train[0]))
+                    out = out[..., :num_classes]
+                    if not return_logits:
+                        out = torch.softmax(out / softmax_temperature, dim=-1)
+            else:
+                out = self._inference_forward(R, y_train, return_logits, softmax_temperature, mgr_config)
 
         return out
 
@@ -854,12 +1015,14 @@ class ICLearning(nn.Module):
         R: Tensor,
         icl_cache: KVCache,
         y_train: Optional[Tensor] = None,
+        pre_col_embeddings: Optional[Tensor] = None,
         num_classes: Optional[int] = None,
         return_logits: bool = True,
         softmax_temperature: float = 0.9,
         use_cache: bool = False,
         store_cache: bool = True,
         mgr_config: MgrConfig = None,
+        use_col_embeddings: bool = False,
     ) -> Tensor:
         """In-context learning with KV caching support.
 
@@ -905,6 +1068,11 @@ class ICLearning(nn.Module):
                 If return_logits=True: Logits of shape (B, test_size, num_classes)
                 If return_logits=False: Probabilities of shape (B, test_size, num_classes)
         """
+
+        if use_col_embeddings:
+            raise NotImplementedError(
+                "Cache path for graph column-embedding pipeline is not implemented yet."
+            )
 
         if use_cache == store_cache:
             raise ValueError("Exactly one of use_cache or store_cache must be True")

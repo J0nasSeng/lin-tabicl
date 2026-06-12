@@ -646,7 +646,7 @@ if __name__ == "__main__":
         "--prior_type",
         type=str,
         default="mix_scm",
-        choices=["mlp_scm", "tree_scm", "mix_scm"],
+        choices=["mlp_scm", "tree_scm", "mix_scm", "nanotabicl"],
         help="Type of prior to use",
     )
     parser.add_argument("--n_jobs", type=int, default=-1, help="Number of jobs for parallel processing")

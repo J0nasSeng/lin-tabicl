@@ -113,7 +113,6 @@ def ddp_cleanup(func):
 
     return wrapper
 
-
 class Trainer:
     """This class handles the complete training lifecycle for TabICL, including:
 
@@ -299,7 +298,14 @@ class Trainer:
 
         # Wrap model into DDP container if using distributed training
         if self.ddp:
-            self.model = DDP(model, device_ids=[self.ddp_local_rank], broadcast_buffers=False)
+            # Backend-specific execution paths can leave whole parameter groups
+            # unused in a given step (e.g., graph backend bypassing row/encoder stacks).
+            self.model = DDP(
+                model,
+                device_ids=[self.ddp_local_rank],
+                broadcast_buffers=False,
+                find_unused_parameters=True,
+            )
             self.raw_model = self.model.module
         else:
             self.model = model
@@ -347,7 +353,7 @@ class Trainer:
             dataset,
             batch_size=None,  # No additional batching since PriorDataset handles batching internally
             shuffle=False,
-            num_workers=1,
+            num_workers=4,
             prefetch_factor=4,
             pin_memory=True if self.config.prior_device == "cpu" else False,
             pin_memory_device=self.config.device if self.config.prior_device == "cpu" else "",
@@ -672,8 +678,6 @@ class Trainer:
 
         y_train = micro_y[:, :train_size]
         y_test = micro_y[:, train_size:]
-        
-
 
         # Set DDP gradient sync for last micro batch only
         if self.ddp:

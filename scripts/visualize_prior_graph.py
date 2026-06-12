@@ -30,7 +30,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_seq_len", type=int, default=512)
     parser.add_argument("--min_train_size", type=float, default=0.1)
     parser.add_argument("--max_train_size", type=float, default=0.9)
-    parser.add_argument("--prior_type", type=str, default="mix_scm", choices=["mlp_scm", "tree_scm", "mix_scm"])
+    parser.add_argument(
+        "--prior_type",
+        type=str,
+        default="mix_scm",
+        choices=["mlp_scm", "tree_scm", "mix_scm", "nanotabicl"],
+    )
     parser.add_argument("--prior_device", type=str, default="cpu")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--graph_min_train_neighbors", type=int, default=8)

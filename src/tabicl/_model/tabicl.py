@@ -307,6 +307,7 @@ class TabICL(nn.Module):
             graph_seed=graph_seed,
             graph_share_across_batch=graph_share_across_batch,
             graph_share_require_identical_labels=graph_share_require_identical_labels,
+            graph_num_cls=row_num_cls,
         )
 
         # KV cache for efficient inference
@@ -373,22 +374,32 @@ class TabICL(nn.Module):
         if self.col_embedder.feature_group:
             d = None
 
-        # Column-wise embedding -> Row-wise interaction
-        representations = self.row_interactor(
-            self.col_embedder(
-                X,
-                y_train=y_train,
-                d=d,
-                embed_with_test=embed_with_test,
-            ),
+        col_embeddings = self.col_embedder(
+            X,
+            y_train=y_train,
             d=d,
+            embed_with_test=embed_with_test,
         )
+
+        # Column-wise embedding -> Row-wise interaction (encoder backend)
+        if self.icl_backend == "encoder":
+            representations = self.row_interactor(col_embeddings, d=d)
+            icl_input = representations
+            pre_col_embeddings = None
+            use_col_embeddings = False
+        else:
+            # Graph backend consumes column embeddings directly.
+            icl_input = col_embeddings
+            pre_col_embeddings = self.col_embedder.project_input(X, d=d)
+            use_col_embeddings = True
 
         # Dataset-wise in-context learning
         return self.icl_predictor(
-            representations,
+            icl_input,
             y_train=y_train,
             return_pre_decoder_repr=return_pre_decoder_repr,
+            use_col_embeddings=use_col_embeddings,
+            pre_col_embeddings=pre_col_embeddings,
         )
 
     def _inference_forward(
@@ -451,25 +462,32 @@ class TabICL(nn.Module):
         if inference_config is None:
             inference_config = InferenceConfig()
 
-        # Column-wise embedding -> Row-wise interaction
-        representations = self.row_interactor(
-            self.col_embedder(
-                X,
-                y_train=y_train,
-                embed_with_test=embed_with_test,
-                feature_shuffles=feature_shuffles,
-                mgr_config=inference_config.COL_CONFIG,
-            ),
-            mgr_config=inference_config.ROW_CONFIG,
+        col_embeddings = self.col_embedder(
+            X,
+            y_train=y_train,
+            embed_with_test=embed_with_test,
+            feature_shuffles=feature_shuffles,
+            mgr_config=inference_config.COL_CONFIG,
         )
+
+        if self.icl_backend == "encoder":
+            icl_input = self.row_interactor(col_embeddings, mgr_config=inference_config.ROW_CONFIG)
+            pre_col_embeddings = None
+            use_col_embeddings = False
+        else:
+            icl_input = col_embeddings
+            pre_col_embeddings = self.col_embedder.project_input(X)
+            use_col_embeddings = True
 
         # Dataset-wise in-context learning
         out = self.icl_predictor(
-            representations,
+            icl_input,
             y_train=y_train,
             return_logits=return_logits,
             softmax_temperature=softmax_temperature,
             mgr_config=inference_config.ICL_CONFIG,
+            use_col_embeddings=use_col_embeddings,
+            pre_col_embeddings=pre_col_embeddings,
         )
 
         return out
@@ -781,18 +799,26 @@ class TabICL(nn.Module):
             X = X_test
             y_train = None
 
-        # Column-wise embedding with cache support -> Row-wise interaction
-        representations = self.row_interactor(
-            self.col_embedder.forward_with_cache(
-                X,
-                col_cache=self._cache.col_cache,
-                y_train=y_train,
-                use_cache=use_cache,
-                store_cache=store_cache,
-                mgr_config=inference_config.COL_CONFIG,
-            ),
-            mgr_config=inference_config.ROW_CONFIG,
+        col_embeddings = self.col_embedder.forward_with_cache(
+            X,
+            col_cache=self._cache.col_cache,
+            y_train=y_train,
+            use_cache=use_cache,
+            store_cache=store_cache,
+            mgr_config=inference_config.COL_CONFIG,
         )
+
+        if self.icl_backend == "encoder":
+            representations = self.row_interactor(col_embeddings, mgr_config=inference_config.ROW_CONFIG)
+            use_col_embeddings = False
+            pre_col_embeddings = None
+        else:
+            representations = col_embeddings
+            use_col_embeddings = True
+            if use_cache:
+                pre_col_embeddings = self.col_embedder.project_input(X)
+            else:
+                pre_col_embeddings = self.col_embedder.project_input(X, d=None)
 
         # Dataset-wise in-context learning
         if cache_mode == "repr":
@@ -829,6 +855,8 @@ class TabICL(nn.Module):
                 use_cache=use_cache,
                 store_cache=store_cache,
                 mgr_config=inference_config.ICL_CONFIG,
+                use_col_embeddings=use_col_embeddings,
+                pre_col_embeddings=pre_col_embeddings,
             )
 
             if X_test is None:

@@ -173,7 +173,10 @@ def build_parser():
         help="If True, occasionally sample smaller sequence lengths to ensure model robustness on smaller datasets",
     )
     parser.add_argument(
-        "--prior_type", default="mix_scm", type=str, help="Prior type: dummy, mlp_scm, tree_scm, mix_scm"
+        "--prior_type",
+        default="mix_scm",
+        type=str,
+        help="Prior type: dummy, mlp_scm, tree_scm, mix_scm, nanotabicl",
     )
     parser.add_argument("--prior_device", default="cpu", type=str, help="Device for prior data generation")
 

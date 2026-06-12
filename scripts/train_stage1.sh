@@ -1,14 +1,14 @@
 # This script is used to train TabICL for the first stage of the curriculum learning
 
 # Choose ICL backbone: graph or encoder
-ICL_BACKEND=${ICL_BACKEND:-graph}
+ICL_BACKEND=${ICL_BACKEND:-encoder}
 # Enable wandb logging by setting WAND_LOG=True (and optionally WAND_MODE=online)
 WAND_LOG=${WAND_LOG:-True}
 WAND_MODE=${WAND_MODE:-offline}
 # GPU selection controls
 DEVICE=${DEVICE:-cuda}
-NUM_GPUS=${NUM_GPUS:-1}
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+NUM_GPUS=${NUM_GPUS:-2}
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-5,6}
 # Confusion matrix logging interval
 LOG_CONF_MAT_EVERY=${LOG_CONF_MAT_EVERY:-200}
 
@@ -39,11 +39,11 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --scheduler cosine_warmup \
             --warmup_proportion 0.02 \
             --gradient_clipping 1.0 \
-            --prior_type mix_scm \
+            --prior_type nanotabicl \
             --prior_device cuda \
             --batch_size_per_gp 64 \
             --min_features 2 \
-            --max_features 100 \
+            --max_features 10 \
             --max_classes 10 \
             --max_seq_len 1024 \
             --min_train_size 0.1 \

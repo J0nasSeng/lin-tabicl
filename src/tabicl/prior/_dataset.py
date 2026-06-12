@@ -33,6 +33,7 @@ from torch.utils.data import IterableDataset
 
 from ._mlp_scm import MLPSCM
 from ._tree_scm import TreeSCM
+from ._nanotabicl_prior import NanoTabICLPrior
 
 from ._hp_sampling import HpSamplerList
 from ._reg2cls import Reg2Cls
@@ -539,17 +540,19 @@ class SCMPrior(Prior):
         d : Tensor
             Number of active features after filtering (scalar Tensor).
         """
-
         if params["prior_type"] == "mlp_scm":
             prior_cls = MLPSCM
         elif params["prior_type"] == "tree_scm":
             prior_cls = TreeSCM
+        elif params["prior_type"] == "nanotabicl":
+            prior_cls = NanoTabICLPrior
         else:
             raise ValueError(f"Unknown prior type {params['prior_type']}")
 
         while True:
             X, y = prior_cls(**params)()
-            X, y = Reg2Cls(params)(X, y)
+            if params["prior_type"] != "nanotabicl":
+                X, y = Reg2Cls(params)(X, y)
 
             # Add batch dim for single dataset to be compatible with delete_unique_features and sanity_check
             X, y = X.unsqueeze(0), y.unsqueeze(0)
@@ -926,7 +929,7 @@ class PriorDataset(IterableDataset):
         min_train_size: Union[int, float] = 0.1,
         max_train_size: Union[int, float] = 0.9,
         replay_small: bool = False,
-        prior_type: str = "mlp_scm",
+        prior_type: str = "nanotabicl",
         scm_fixed_hp: Dict[str, Any] = DEFAULT_FIXED_HP,
         scm_sampled_hp: Dict[str, Any] = DEFAULT_SAMPLED_HP,
         n_jobs: int = -1,
@@ -947,7 +950,7 @@ class PriorDataset(IterableDataset):
                 max_train_size=max_train_size,
                 device=device,
             )
-        elif prior_type in ["mlp_scm", "tree_scm", "mix_scm"]:
+        elif prior_type in ["mlp_scm", "tree_scm", "mix_scm", "nanotabicl"]:
             self.prior = SCMPrior(
                 batch_size=batch_size,
                 batch_size_per_gp=batch_size_per_gp,
@@ -971,7 +974,7 @@ class PriorDataset(IterableDataset):
             )
         else:
             raise ValueError(
-                f"Unknown prior type '{prior_type}'. Available options: 'mlp_scm', 'tree_scm', 'mix_scm', or 'dummy'."
+                f"Unknown prior type '{prior_type}'. Available options: 'mlp_scm', 'tree_scm', 'mix_scm', 'nanotabicl', or 'dummy'."
             )
 
         self.batch_size = batch_size
