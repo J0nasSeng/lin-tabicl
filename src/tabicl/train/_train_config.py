@@ -195,6 +195,13 @@ def build_parser():
         type=str2bool,
         help="If True, compile the model using torch.compile for speedup",
     )
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        default="tabicl",
+        choices=["tabicl", "nanotabicl"],
+        help="Model architecture to train: full TabICL or lightweight NanoTabICL",
+    )
 
     # Column Embedding Config
     parser.add_argument("--embed_dim", type=int, default=128, help="Base embedding dimension")

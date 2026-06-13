@@ -144,6 +144,7 @@ class TabICL(nn.Module):
     def __init__(
         self,
         max_classes: int = 10,
+        max_features: int = 100,
         num_quantiles: int = 999,
         embed_dim: int = 128,
         col_num_blocks: int = 3,
@@ -213,6 +214,7 @@ class TabICL(nn.Module):
             out_dim = max_classes
 
         self.max_classes = max_classes
+        self.max_features = max_features
         self.num_quantiles = num_quantiles
         self.embed_dim = embed_dim
         self.col_num_blocks = col_num_blocks
@@ -263,7 +265,9 @@ class TabICL(nn.Module):
             feature_group_size=col_feature_group_size,
             target_aware=col_target_aware,
             max_classes=max_classes,
+            max_features=max_features,
             reserve_cls_tokens=row_num_cls,
+            enable_column_identity_rotation=icl_backend == "graph",
             ssmax=col_ssmax,
             recompute=recompute,
         )

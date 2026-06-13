@@ -38,7 +38,8 @@ dependencies = [
     "transformers",
     "wandb",
     "rtpt",
-    "umap-learn"
+    "umap-learn",
+    "matplotlib"
 ]
 
 [project.optional-dependencies]

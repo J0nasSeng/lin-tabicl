@@ -3154,6 +3154,7 @@ source = { editable = "." }
 dependencies = [
     { name = "einops" },
     { name = "huggingface-hub" },
+    { name = "matplotlib" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "psutil" },
@@ -3243,6 +3244,7 @@ requires-dist = [
     { name = "gluonts", marker = "extra == 'all'", specifier = ">=0.16.0" },
     { name = "gluonts", marker = "extra == 'forecast'", specifier = ">=0.16.0" },
     { name = "huggingface-hub" },
+    { name = "matplotlib" },
     { name = "matplotlib", marker = "extra == 'all'", specifier = ">=3.10.3" },
     { name = "matplotlib", marker = "extra == 'doc'", specifier = ">=3.10.3" },
     { name = "matplotlib", marker = "extra == 'forecast'", specifier = ">=3.10.3" },

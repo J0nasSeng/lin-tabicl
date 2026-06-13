@@ -5,6 +5,7 @@ from src.tabicl._model.graph import build_class_conditioned_graph
 from src.tabicl._model.gat import GraphMultiheadAttention
 from src.tabicl._model.gat import GraphAttentionBlock
 from src.tabicl._model.learning import ICLearning
+from src.tabicl._model.tabicl import TabICL
 from src.tabicl.train._losses import entropy_regularizer
 
 
@@ -308,4 +309,37 @@ def test_graph_attention_block_alpha_initialization_and_forward_shape():
 
     out = block(src, edge_index_batch)
     assert out.shape == src.shape
+    assert torch.isfinite(out).all()
+
+
+def test_tabicl_graph_backend_forward_with_column_identity_rotation():
+    torch.manual_seed(0)
+
+    batch_size = 2
+    train_size = 8
+    total_rows = 12
+    num_features = 6
+
+    X = torch.randn(batch_size, total_rows, num_features)
+    y_train = _build_labels(batch_size=batch_size, train_size=train_size, num_classes=2)
+    d = torch.tensor([4, 6], dtype=torch.long)
+
+    model = TabICL(
+        max_classes=5,
+        max_features=num_features,
+        embed_dim=16,
+        col_num_blocks=1,
+        col_nhead=4,
+        col_num_inds=8,
+        row_num_blocks=1,
+        row_nhead=4,
+        row_num_cls=4,
+        icl_num_blocks=1,
+        icl_nhead=4,
+        icl_backend="graph",
+    )
+    model.train()
+
+    out = model(X, y_train, d=d)
+    assert out.shape == (batch_size, total_rows - train_size, 5)
     assert torch.isfinite(out).all()

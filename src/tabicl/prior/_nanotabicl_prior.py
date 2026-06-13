@@ -53,10 +53,11 @@ class NanoTabICLPrior:
         self.max_features = int(kwargs.get("max_features", num_features))
         self.multiclass_type = str(kwargs.get("multiclass_type", "quantile"))
         self.multiclass_jitter_scale = float(kwargs.get("multiclass_jitter_scale", 0.0))
+        self.cat_prob = float(kwargs.get("cat_prob", 0.0))
         self.device = device
 
     def __call__(self) -> tuple[torch.Tensor, torch.Tensor]:
-        x_cat_sizes = rand_cat_sizes(self.num_features)
+        x_cat_sizes = rand_cat_sizes(self.num_features, self.cat_prob)
         y_cat_sizes = [self.num_classes if self.num_classes > 0 else 0]
 
         tensors = rand_dataset_filtered(
@@ -203,8 +204,8 @@ def rand_dataset_filtered(
             if pval < 0.05:
                 return tensors
 
-def rand_cat_sizes(n_features: int, max_cat_size: int = 100) -> list[int]:
-    cat_fraction = np.clip(np.random.uniform(-0.5, 1.2), 0.0, 1.0)
+def rand_cat_sizes(n_features: int, cat_prob: float = 0.0, max_cat_size: int = 100) -> list[int]:
+    cat_fraction = np.clip(np.random.uniform(-0.5, 1.2), 0.0, 1.0) if cat_prob > 0 else 0.0
     n_cat = round(n_features * cat_fraction)
     cat_size_limit = randlogint(2, max_cat_size + 1)
     return [0] * (n_features - n_cat) + [randlogint(2, cat_size_limit + 1) for _ in range(n_cat)]

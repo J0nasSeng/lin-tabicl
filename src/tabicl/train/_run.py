@@ -29,7 +29,15 @@ try:
 except ImportError:
     confusion_matrix = None
 
+try:
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.metrics import balanced_accuracy_score
+except ImportError:
+    RandomForestClassifier = None
+    balanced_accuracy_score = None
+
 from tabicl._model.tabicl import TabICL
+from tabicl._model.nanotabicl import NanoTabICLv2
 from tabicl.prior._dataset import PriorDataset
 from tabicl.prior._genload import LoadPriorDataset
 from tabicl.train._optim import get_scheduler
@@ -141,6 +149,7 @@ class Trainer:
         self.load_checkpoint()
         self.rtpt = RTPT(name_initials="JS", experiment_name="TabICL_Stage1", max_iterations=self.config.max_steps)
         self.rtpt.start()
+        self.cached_batch = None
 
     def configure_ddp(self):
         """Set up distributed training and system configuration.
@@ -236,9 +245,13 @@ class Trainer:
             self.wandb_run = None
 
     def build_model(self):
-        """Build and initialize the TabICL model."""
+        """Build and initialize the selected training model."""
+
+        model_type = str(getattr(self.config, "model_type", "tabicl")).lower()
+        self.model_type = model_type
 
         self.model_config = {
+            "model_type": model_type,
             "max_classes": self.config.max_classes,
             "embed_dim": self.config.embed_dim,
             "col_num_blocks": self.config.col_num_blocks,
@@ -267,7 +280,31 @@ class Trainer:
             "norm_first": self.config.norm_first,
         }
 
-        model = TabICL(**self.model_config)
+        if model_type == "tabicl":
+            model = TabICL(**{k: v for k, v in self.model_config.items() if k != "model_type"})
+        elif model_type == "nanotabicl":
+            if self.config.max_classes <= 0:
+                raise ValueError("NanoTabICL training currently requires max_classes > 0 in this Trainer.")
+
+            self.nano_model_config = {
+                "model_type": model_type,
+                "max_classes": self.config.max_classes,
+                "out_dim": self.config.max_classes,
+                "embed_dim": self.config.embed_dim,
+                "col_num_blocks": self.config.col_num_blocks,
+                "row_num_blocks": self.config.row_num_blocks,
+                "icl_num_blocks": self.config.icl_num_blocks,
+                "col_nhead": self.config.col_nhead,
+                "row_nhead": self.config.row_nhead,
+                "icl_nhead": self.config.icl_nhead,
+                "n_cls_cols": self.config.row_num_cls,
+                "n_cls_rows": self.config.col_num_inds,
+            }
+            model = NanoTabICLv2(**{k: v for k, v in self.nano_model_config.items() if k != "model_type"})
+            self.model_config = self.nano_model_config
+        else:
+            raise ValueError(f"Unknown model_type={model_type}. Expected 'tabicl' or 'nanotabicl'.")
+
         model.to(device=self.config.device)
 
         if self.master_process:
@@ -275,20 +312,23 @@ class Trainer:
             print(f"Model has {num_params} parameters.")
 
         # Freeze model components if requested
-        if self.config.freeze_col:
+        if model_type == "tabicl" and self.config.freeze_col:
             model.col_embedder.eval()
             for param in model.col_embedder.parameters():
                 param.requires_grad = False
 
-        if self.config.freeze_row:
+        if model_type == "tabicl" and self.config.freeze_row:
             model.row_interactor.eval()
             for param in model.row_interactor.parameters():
                 param.requires_grad = False
 
-        if self.config.freeze_icl:
+        if model_type == "tabicl" and self.config.freeze_icl:
             model.icl_predictor.eval()
             for param in model.icl_predictor.parameters():
                 param.requires_grad = False
+
+        if model_type == "nanotabicl" and (self.config.freeze_col or self.config.freeze_row or self.config.freeze_icl):
+            raise ValueError("freeze_col/freeze_row/freeze_icl are only supported for model_type='tabicl'.")
 
         # Compile model if requested
         if self.config.model_compile:
@@ -639,6 +679,57 @@ class Trainer:
 
         return micro_X, micro_y
 
+    def fit_ensemble(self, micro_batch):
+        """Debug helper: fit one random-forest ensemble per dataset.
+
+        Uses only the train partition of each dataset in the micro batch and
+        prints balanced accuracy on the corresponding test partition.
+
+        Parameters
+        ----------
+        micro_batch : tuple
+            (micro_X, micro_y, micro_d, micro_seq_len, micro_train_size)
+            matching the format expected by ``run_micro_batch``.
+        """
+        if RandomForestClassifier is None or balanced_accuracy_score is None:
+            raise ModuleNotFoundError(
+                "scikit-learn is required for fit_ensemble debugging. "
+                "Install with `uv sync --extra pretrain` or add sklearn to your environment."
+            )
+
+        micro_X, micro_y, micro_d, micro_seq_len, micro_train_size = micro_batch
+        seq_len, train_size = self.validate_micro_batch(micro_seq_len, micro_train_size)
+        micro_X, micro_y = self.align_micro_batch(micro_X, micro_y, micro_d, seq_len)
+
+        X_cpu = micro_X.detach().cpu()
+        y_cpu = micro_y.detach().cpu().long()
+        d_cpu = micro_d.detach().cpu().long()
+
+        print(f"fit_ensemble debug: datasets={X_cpu.shape[0]}, train_size={train_size}, test_size={seq_len - train_size}")
+
+        accuracies = []
+
+        for ds_idx in range(X_cpu.shape[0]):
+            d_i = int(d_cpu[ds_idx].item())
+            X_ds = X_cpu[ds_idx, :, :d_i].numpy()
+            y_ds = y_cpu[ds_idx].numpy()
+
+            X_train, X_test = X_ds[:train_size], X_ds[train_size:]
+            y_train, y_test = y_ds[:train_size], y_ds[train_size:]
+
+            if X_test.shape[0] == 0:
+                print(f"  dataset {ds_idx}: skipped (empty test set)")
+                continue
+
+            clf = RandomForestClassifier(n_estimators=20, random_state=0, n_jobs=1)
+            clf.fit(X_train, y_train)
+            y_pred = clf.predict(X_test)
+
+            bacc = balanced_accuracy_score(y_test, y_pred)
+            accuracies.append(bacc)
+            print(f"  dataset {ds_idx}: balanced_accuracy={bacc:.4f}")
+        print(f"fit_ensemble debug: average balanced_accuracy={np.mean(accuracies):.4f}")
+
     def run_micro_batch(
         self,
         micro_batch,
@@ -667,6 +758,10 @@ class Trainer:
         dict
             Result dictionary with 'ce' and 'accuracy' keys.
         """
+
+        # debugging
+        #self.fit_ensemble(micro_batch)
+
         micro_X, micro_y, micro_d, micro_seq_len, micro_train_size = micro_batch
         seq_len, train_size = self.validate_micro_batch(micro_seq_len, micro_train_size)
         micro_X, micro_y = self.align_micro_batch(micro_X, micro_y, micro_d, seq_len)
@@ -834,6 +929,8 @@ class Trainer:
         self.optimizer.zero_grad(set_to_none=True)
 
         # Pad nested tensors to the same size
+        if self.cached_batch is not None:
+            batch = self.cached_batch
         batch = [t.to_padded_tensor(padding=0.0) if t.is_nested else t for t in batch]
 
         # Split the batch into micro-batches along the first dimension
@@ -941,6 +1038,9 @@ class Trainer:
             results.update(confusion_plot_payload)
         if should_log_conf_mat and umap_payload:
             results.update(umap_payload)
+
+        if self.cached_batch is None:
+            self.cached_batch = batch
 
         return results
 
