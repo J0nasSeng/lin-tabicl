@@ -493,12 +493,13 @@ class ICLearning(nn.Module):
                 raise ValueError("pre_col_embeddings must have the same shape as col_embeddings")
             x = x + pre_col_embeddings
 
-        cls_tokens = self.graph_cls_tokens.view(1, 1, self.graph_num_cls, D).expand(B, x.shape[1], -1, -1)
-        x = torch.cat([x, cls_tokens], dim=2)
-
         train_size = y_train.shape[1]
         y_encoded = self.y_encoder(y_train.float()).view(B, train_size, self.graph_num_cls, D)
         x[:, :train_size, -self.graph_num_cls :, :] = x[:, :train_size, -self.graph_num_cls :, :] + y_encoded
+
+        cls_tokens = self.graph_cls_tokens.view(1, 1, self.graph_num_cls, D).expand(B, x.shape[1], -1, -1)
+        x = torch.cat([x, cls_tokens], dim=2)
+        
         return x
 
     def _icl_predictions(
