@@ -228,12 +228,12 @@ def test_graph_builder_shared_graph_fallback_for_non_identical_labels():
 
 def test_graph_multihead_attention_vectorized_matches_legacy_loop():
     torch.manual_seed(0)
-    B, T, D, H = 3, 7, 16, 4
+    B, T, C, D, H = 3, 7, 1, 16, 4
 
     model = GraphMultiheadAttention(d_model=D, nhead=H, dropout=0.0)
     model.eval()
 
-    src = torch.randn(B, T, D)
+    src = torch.randn(B, T, C, D)
     edge_index_batch = [
         torch.tensor([[0, 1, 2, 2], [1, 2, 0, 3]], dtype=torch.long),
         torch.empty((2, 0), dtype=torch.long),
@@ -253,6 +253,72 @@ def test_graph_multihead_attention_vectorized_matches_legacy_loop():
 
             if edge_src.numel() == 0:
                 out_old.append((1.0 - alpha) * x)
+                continue
+
+            q = model.q_proj(x).view(T, C, model.nhead, model.head_dim)
+            k = model.k_proj(x).view(T, C, model.nhead, model.head_dim)
+            v = model.v_proj(x).view(T, C, model.nhead, model.head_dim)
+
+            q_dst = q[edge_dst]
+            k_src = k[edge_src]
+            v_src = v[edge_src]
+
+            attn_logits = (q_dst * k_src).sum(dim=-1) * model.scale
+
+            edge_weight = torch.zeros_like(attn_logits)
+            unique_dst = torch.unique(edge_dst)
+            unique_col = torch.arange(C, device=src.device, dtype=torch.long)
+            for h in range(model.nhead):
+                for c in unique_col.tolist():
+                    logits_hc = attn_logits[:, c, h]
+                    for dst_idx in unique_dst.tolist():
+                        mask = edge_dst == dst_idx
+                        if mask.any():
+                            edge_weight[mask, c, h] = torch.softmax(logits_hc[mask], dim=0)
+
+            messages = v_src * edge_weight.unsqueeze(-1)
+
+            agg = torch.zeros((T, C, model.nhead, model.head_dim), dtype=src.dtype, device=src.device)
+            for c in unique_col.tolist():
+                for h in range(model.nhead):
+                    agg[:, c, h, :].index_add_(0, edge_dst, messages[:, c, h, :])
+
+            attn_out = model.out_proj(agg.reshape(T, C, model.d_model))
+            out_old.append((1.0 - alpha) * x + alpha * attn_out)
+
+        out_old = torch.stack(out_old, dim=0)
+
+    assert torch.allclose(out_new, out_old, atol=1e-6, rtol=1e-6)
+
+
+def test_graph_multihead_attention_multicol_matches_expanded_reference():
+    torch.manual_seed(0)
+    B, T, C, D, H = 2, 6, 3, 16, 4
+
+    model = GraphMultiheadAttention(d_model=D, nhead=H, dropout=0.0)
+    model.eval()
+
+    src = torch.randn(B, T, C, D)
+    edge_index_batch = [
+        torch.tensor([[0, 1, 2, 2], [1, 2, 0, 3]], dtype=torch.long),
+        torch.tensor([[1, 3, 4], [0, 2, 5]], dtype=torch.long),
+    ]
+
+    with torch.no_grad():
+        out_new = model(src, edge_index_batch)
+        alpha = torch.sigmoid(model.alpha)
+
+        src_bc = src.permute(0, 2, 1, 3).reshape(B * C, T, D)
+        out_ref_bc = torch.empty_like(src_bc)
+        for bc in range(B * C):
+            b = bc // C
+            x = src_bc[bc]
+            edge_index = edge_index_batch[b].to(device=x.device, dtype=torch.long)
+            edge_src = edge_index[0]
+            edge_dst = edge_index[1]
+
+            if edge_src.numel() == 0:
+                out_ref_bc[bc] = (1.0 - alpha) * x
                 continue
 
             q = model.q_proj(x).view(T, model.nhead, model.head_dim)
@@ -275,17 +341,16 @@ def test_graph_multihead_attention_vectorized_matches_legacy_loop():
                         edge_weight[mask, h] = torch.softmax(logits_h[mask], dim=0)
 
             messages = v_src * edge_weight.unsqueeze(-1)
-
             agg = torch.zeros((T, model.nhead, model.head_dim), dtype=src.dtype, device=src.device)
             for h in range(model.nhead):
                 agg[:, h, :].index_add_(0, edge_dst, messages[:, h, :])
 
             attn_out = model.out_proj(agg.reshape(T, model.d_model))
-            out_old.append((1.0 - alpha) * x + alpha * attn_out)
+            out_ref_bc[bc] = (1.0 - alpha) * x + alpha * attn_out
 
-        out_old = torch.stack(out_old, dim=0)
+        out_ref = out_ref_bc.reshape(B, C, T, D).permute(0, 2, 1, 3)
 
-    assert torch.allclose(out_new, out_old, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(out_new, out_ref, atol=1e-6, rtol=1e-6)
 
 
 def test_graph_attention_block_alpha_initialization_and_forward_shape():
@@ -301,7 +366,7 @@ def test_graph_attention_block_alpha_initialization_and_forward_shape():
     alpha = torch.sigmoid(block.attn.alpha.detach().cpu())
     assert torch.isclose(alpha, torch.tensor(0.05), atol=1e-8)
 
-    src = torch.randn(2, 6, 16)
+    src = torch.randn(2, 6, 1, 16)
     edge_index_batch = [
         torch.tensor([[0, 1, 2, 3], [1, 2, 3, 4]], dtype=torch.long),
         torch.tensor([[0, 2, 4], [2, 4, 5]], dtype=torch.long),

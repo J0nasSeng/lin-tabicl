@@ -251,7 +251,7 @@ class ICLearning(nn.Module):
             share_graph_across_batch=self.graph_share_across_batch,
             share_graph_require_identical_labels=self.graph_share_require_identical_labels,
         )
-        return self.gat_icl(R, edge_index_batch=graph.edge_index)
+        return self.gat_icl(R.unsqueeze(2), edge_index_batch=graph.edge_index).squeeze(2)
 
     def _grouping(self, num_classes: int) -> tuple[Tensor, int]:
         """Divide classes into balanced groups for hierarchical classification.
@@ -424,7 +424,6 @@ class ICLearning(nn.Module):
         x = torch.cat([col_embeddings, cls_tokens], dim=2)  # (B, T, C+cls, D)
         total_cols = x.shape[2]
 
-        expanded_edges: list[Tensor] = []
         for b, edge_index in enumerate(graph.edge_index):
             if edge_index.ndim != 2 or edge_index.shape[0] != 2:
                 raise ValueError("Each graph edge index must have shape (2, E)")
@@ -433,14 +432,10 @@ class ICLearning(nn.Module):
                 max_idx = int(edge_index.max().item())
                 if min_idx < 0 or max_idx >= T:
                     raise ValueError(f"edge_index out of bounds for dataset {b}: [{min_idx}, {max_idx}] vs T={T}")
-            for _ in range(total_cols):
-                expanded_edges.append(edge_index)
 
         for block_idx, block in enumerate(self.graph_col_blocks):
             # Per-column graph message passing over sample nodes.
-            x_col = x.permute(0, 2, 1, 3).reshape(B * total_cols, T, D)
-            x_col = block(x_col, edge_index_batch=expanded_edges)
-            x = x_col.reshape(B, total_cols, T, D).permute(0, 2, 1, 3)
+            x = block(x, edge_index_batch=graph.edge_index)
 
             # Per-sample attention along column axis.
             x_bt = x.reshape(B * T, total_cols, D)

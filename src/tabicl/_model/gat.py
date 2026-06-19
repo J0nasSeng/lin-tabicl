@@ -37,7 +37,7 @@ class GraphMultiheadAttention(nn.Module):
         Parameters
         ----------
         src : Tensor
-            Input node features of shape (B, T, D).
+            Input node features of shape (B, T, C, D).
 
         edge_index_batch : list[Tensor]
             List of length B. Each tensor has shape (2, E) where index 0 is source
@@ -46,20 +46,20 @@ class GraphMultiheadAttention(nn.Module):
         Returns
         -------
         Tensor
-            Updated node features of shape (B, T, D).
+            Updated node features of shape (B, T, C, D).
         """
 
-        if src.ndim != 3:
-            raise ValueError("src must have shape (B, T, D)")
+        if src.ndim != 4:
+            raise ValueError("src must have shape (B, T, C, D)")
         if len(edge_index_batch) != src.shape[0]:
             raise ValueError("edge_index_batch length must equal batch size")
 
         if residual_src is None:
             residual_src = src
         if residual_src.shape != src.shape:
-            raise ValueError("residual_src must have shape (B, T, D)")
+            raise ValueError("residual_src must have shape (B, T, C, D)")
 
-        B, T, _ = src.shape
+        B, T, C, _ = src.shape
         all_edge_src: list[Tensor] = []
         all_edge_dst: list[Tensor] = []
 
@@ -95,9 +95,9 @@ class GraphMultiheadAttention(nn.Module):
         global_edge_src = torch.cat(all_edge_src, dim=0)
         global_edge_dst = torch.cat(all_edge_dst, dim=0)
 
-        q = self.q_proj(src).view(B * T, self.nhead, self.head_dim)
-        k = self.k_proj(src).view(B * T, self.nhead, self.head_dim)
-        v = self.v_proj(src).view(B * T, self.nhead, self.head_dim)
+        q = self.q_proj(src).view(B * T, C, self.nhead, self.head_dim)
+        k = self.k_proj(src).view(B * T, C, self.nhead, self.head_dim)
+        v = self.v_proj(src).view(B * T, C, self.nhead, self.head_dim)
 
         q_dst = q[global_edge_dst]
         k_src = k[global_edge_src]
@@ -106,10 +106,11 @@ class GraphMultiheadAttention(nn.Module):
         attn_logits = (q_dst * k_src).sum(dim=-1) * self.scale
 
         E = global_edge_dst.numel()
-        head_ids = torch.arange(self.nhead, device=src.device, dtype=torch.long).repeat(E)
-        dst_rep = global_edge_dst.repeat_interleave(self.nhead)
-        group_index = dst_rep * self.nhead + head_ids
-        num_groups = B * T * self.nhead
+        head_ids = torch.arange(self.nhead, device=src.device, dtype=torch.long).view(1, 1, self.nhead)
+        col_ids = torch.arange(C, device=src.device, dtype=torch.long).view(1, C, 1)
+        dst_rep = global_edge_dst.view(E, 1, 1)
+        group_index = (dst_rep * (C * self.nhead) + col_ids * self.nhead + head_ids).reshape(-1)
+        num_groups = B * T * C * self.nhead
 
         logits_flat = attn_logits.reshape(-1)
         max_per_group = torch.full((num_groups,), float("-inf"), dtype=src.dtype, device=src.device)
@@ -118,14 +119,14 @@ class GraphMultiheadAttention(nn.Module):
         exp_logits = torch.exp(logits_flat - max_per_group[group_index])
         sum_per_group = torch.zeros((num_groups,), dtype=src.dtype, device=src.device)
         sum_per_group.index_add_(0, group_index, exp_logits)
-        edge_weight = (exp_logits / sum_per_group[group_index].clamp_min(1e-12)).view(E, self.nhead)
+        edge_weight = (exp_logits / sum_per_group[group_index].clamp_min(1e-12)).view(E, C, self.nhead)
         edge_weight = self.dropout(edge_weight)
 
         messages = v_src * edge_weight.unsqueeze(-1)
 
-        agg = torch.zeros((B * T, self.nhead, self.head_dim), dtype=src.dtype, device=src.device)
+        agg = torch.zeros((B * T, C, self.nhead, self.head_dim), dtype=src.dtype, device=src.device)
         agg.index_add_(0, global_edge_dst, messages)
-        attn_out = self.out_proj(agg.view(B, T, self.d_model))
+        attn_out = self.out_proj(agg.view(B, T, C, self.d_model))
         return (1.0 - alpha) * residual_src + alpha * attn_out
 
 
