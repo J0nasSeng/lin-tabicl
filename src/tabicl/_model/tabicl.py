@@ -389,21 +389,19 @@ class TabICL(nn.Module):
         if self.icl_backend == "encoder":
             representations = self.row_interactor(col_embeddings, d=d)
             icl_input = representations
-            pre_col_embeddings = None
-            use_col_embeddings = False
         else:
-            # Graph backend consumes column embeddings directly.
-            icl_input = col_embeddings
             pre_col_embeddings = self.col_embedder.project_input(X, d=d)
-            use_col_embeddings = True
+            icl_input = self.icl_predictor.prepare_graph_input(
+                col_embeddings=col_embeddings,
+                y_train=y_train,
+                pre_col_embeddings=pre_col_embeddings,
+            )
 
         # Dataset-wise in-context learning
         return self.icl_predictor(
             icl_input,
             y_train=y_train,
             return_pre_decoder_repr=return_pre_decoder_repr,
-            use_col_embeddings=use_col_embeddings,
-            pre_col_embeddings=pre_col_embeddings,
         )
 
     def _inference_forward(
@@ -476,12 +474,13 @@ class TabICL(nn.Module):
 
         if self.icl_backend == "encoder":
             icl_input = self.row_interactor(col_embeddings, mgr_config=inference_config.ROW_CONFIG)
-            pre_col_embeddings = None
-            use_col_embeddings = False
         else:
-            icl_input = col_embeddings
             pre_col_embeddings = self.col_embedder.project_input(X)
-            use_col_embeddings = True
+            icl_input = self.icl_predictor.prepare_graph_input(
+                col_embeddings=col_embeddings,
+                y_train=y_train,
+                pre_col_embeddings=pre_col_embeddings,
+            )
 
         # Dataset-wise in-context learning
         out = self.icl_predictor(
@@ -490,8 +489,6 @@ class TabICL(nn.Module):
             return_logits=return_logits,
             softmax_temperature=softmax_temperature,
             mgr_config=inference_config.ICL_CONFIG,
-            use_col_embeddings=use_col_embeddings,
-            pre_col_embeddings=pre_col_embeddings,
         )
 
         return out

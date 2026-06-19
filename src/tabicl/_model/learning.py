@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 from .layers import ClassNode, OneHotAndLinear
 from .encoders import Encoder
-from .gat import GraphAttentionTransformer, GraphAttentionBlock
+from .gat import GraphAttentionTransformer
 from .graph import build_class_conditioned_graph
 from .kv_cache import KVCache
 from .inference import InferenceManager
@@ -161,9 +161,10 @@ class ICLearning(nn.Module):
             self.graph_col_dim = d_model // self.graph_num_cls
             self.graph_cls_tokens = nn.Parameter(torch.empty(self.graph_num_cls, self.graph_col_dim))
             nn.init.trunc_normal_(self.graph_cls_tokens, std=0.02)
-            self.graph_col_blocks = nn.ModuleList(
+            self.graph_col_gats = nn.ModuleList(
                 [
-                    GraphAttentionBlock(
+                    GraphAttentionTransformer(
+                        num_blocks=1,
                         d_model=self.graph_col_dim,
                         nhead=nhead,
                         dim_feedforward=max(self.graph_col_dim * 2, dim_feedforward // max(self.graph_num_cls, 1)),
@@ -171,6 +172,7 @@ class ICLearning(nn.Module):
                         activation=activation,
                         norm_first=norm_first,
                         bias_free_ln=bias_free_ln,
+                        recompute=recompute,
                     )
                     for _ in range(num_blocks)
                 ]
@@ -378,15 +380,16 @@ class ICLearning(nn.Module):
 
     def _run_graph_column_pipeline(
         self,
-        col_embeddings: Tensor,
+        graph_input: Tensor,
         y_train: Tensor,
     ) -> Tensor:
         """Graph-only column pipeline.
 
         Parameters
         ----------
-        col_embeddings : Tensor
-            Column embeddings of shape (B, T, C, D).
+        graph_input : Tensor
+            Graph-ready input of shape (B, T, C_total, D), where C_total includes
+            appended graph CLS columns and pre-encoded train-label signal.
 
         y_train : Tensor
             Training labels of shape (B, train_size).
@@ -397,13 +400,17 @@ class ICLearning(nn.Module):
             Sequence representations of shape (B, T, d_model).
         """
 
-        if col_embeddings.ndim != 4:
-            raise ValueError("Graph column pipeline expects col_embeddings with shape (B, T, C, D)")
+        if graph_input.ndim != 4:
+            raise ValueError("Graph column pipeline expects graph_input with shape (B, T, C, D)")
 
-        B, T, C, D = col_embeddings.shape
+        B, T, C, D = graph_input.shape
         if D != self.graph_col_dim:
             raise ValueError(
                 f"Graph column pipeline expects last dim {self.graph_col_dim}, got {D}."
+            )
+        if C < self.graph_num_cls:
+            raise ValueError(
+                f"Graph column pipeline expects at least {self.graph_num_cls} columns for CLS outputs, got {C}."
             )
 
         graph = build_class_conditioned_graph(
@@ -419,10 +426,8 @@ class ICLearning(nn.Module):
             share_graph_require_identical_labels=self.graph_share_require_identical_labels,
         )
 
-        # Append learnable CLS tokens along column axis.
-        cls_tokens = self.graph_cls_tokens.view(1, 1, self.graph_num_cls, D).expand(B, T, -1, -1)
-        x = torch.cat([col_embeddings, cls_tokens], dim=2)  # (B, T, C+cls, D)
-        total_cols = x.shape[2]
+        x = graph_input
+        total_cols = C
 
         for b, edge_index in enumerate(graph.edge_index):
             if edge_index.ndim != 2 or edge_index.shape[0] != 2:
@@ -433,7 +438,7 @@ class ICLearning(nn.Module):
                 if min_idx < 0 or max_idx >= T:
                     raise ValueError(f"edge_index out of bounds for dataset {b}: [{min_idx}, {max_idx}] vs T={T}")
 
-        for block_idx, block in enumerate(self.graph_col_blocks):
+        for block_idx, block in enumerate(self.graph_col_gats):
             # Per-column graph message passing over sample nodes.
             x = block(x, edge_index_batch=graph.edge_index)
 
@@ -446,6 +451,55 @@ class ICLearning(nn.Module):
 
         cls_out = x[:, :, -self.graph_num_cls :, :].reshape(B, T, self.graph_num_cls * D)
         return self.graph_out_proj(cls_out)
+
+    def prepare_graph_input(
+        self,
+        col_embeddings: Tensor,
+        y_train: Tensor,
+        pre_col_embeddings: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Prepare graph-ready 4D input with column identity and train-label signals.
+
+        Parameters
+        ----------
+        col_embeddings : Tensor
+            Column embeddings of shape (B, T, C, D).
+
+        y_train : Tensor
+            Training labels of shape (B, train_size).
+
+        pre_col_embeddings : Optional[Tensor], default=None
+            Optional projected input features of shape (B, T, C, D) carrying
+            column-identity signal.
+
+        Returns
+        -------
+        Tensor
+            Graph-ready tensor of shape (B, T, C + graph_num_cls, D).
+        """
+
+        if self.icl_backend != "graph":
+            raise ValueError("prepare_graph_input is supported only for graph ICL backend")
+        if col_embeddings.ndim != 4:
+            raise ValueError("col_embeddings must have shape (B, T, C, D)")
+
+        B, _, _, D = col_embeddings.shape
+        if D != self.graph_col_dim:
+            raise ValueError(f"Expected last dim {self.graph_col_dim}, got {D}")
+
+        x = col_embeddings
+        if pre_col_embeddings is not None:
+            if pre_col_embeddings.shape != col_embeddings.shape:
+                raise ValueError("pre_col_embeddings must have the same shape as col_embeddings")
+            x = x + pre_col_embeddings
+
+        cls_tokens = self.graph_cls_tokens.view(1, 1, self.graph_num_cls, D).expand(B, x.shape[1], -1, -1)
+        x = torch.cat([x, cls_tokens], dim=2)
+
+        train_size = y_train.shape[1]
+        y_encoded = self.y_encoder(y_train.float()).view(B, train_size, self.graph_num_cls, D)
+        x[:, :train_size, -self.graph_num_cls :, :] = x[:, :train_size, -self.graph_num_cls :, :] + y_encoded
+        return x
 
     def _icl_predictions(
         self,
@@ -478,16 +532,17 @@ class ICLearning(nn.Module):
             - For classification (max_classes>0): out_dim = max_classes
         """
 
-        if use_col_embeddings and self.icl_backend != "graph":
-            raise ValueError("use_col_embeddings=True is supported only for graph ICL backend.")
-
         train_size = y_train.shape[1]
-        if use_col_embeddings:
-            if pre_col_embeddings is None:
-                raise ValueError("pre_col_embeddings must be provided when use_col_embeddings=True")
-            if self.icl_backend != "graph":
-                raise ValueError("use_col_embeddings=True is supported only for graph ICL backend")
-            src = self._run_graph_column_pipeline(R + pre_col_embeddings, y_train=y_train)
+        if self.icl_backend == "graph":
+            if R.ndim == 4:
+                src = self._run_graph_column_pipeline(R, y_train=y_train)
+            elif R.ndim == 3:
+                # Backward-compatible direct graph path for callers passing row representations.
+                Ry_train = self.y_encoder(y_train.float())
+                R[:, :train_size] = R[:, :train_size] + Ry_train
+                src = self._apply_icl_backbone(R, train_size=train_size, y_train=y_train)
+            else:
+                raise ValueError("Graph backend expects R with shape (B, T, D) or (B, T, C, D)")
         else:
             if self.max_classes > 0:  # Classification
                 Ry_train = self.y_encoder(y_train.float())
@@ -776,28 +831,16 @@ class ICLearning(nn.Module):
                     R,
                     y_train,
                     return_pre_decoder_repr=True,
-                    use_col_embeddings=use_col_embeddings,
-                    pre_col_embeddings=pre_col_embeddings,
                 )
                 out = out[:, train_size:]
                 pre_decoder_repr = pre_decoder_repr[:, train_size:]
                 return out, pre_decoder_repr
 
-            out = self._icl_predictions(
-                R,
-                y_train,
-                use_col_embeddings=use_col_embeddings,
-                pre_col_embeddings=pre_col_embeddings,
-            )
+            out = self._icl_predictions(R, y_train)
             out = out[:, train_size:]
         else:
-            if use_col_embeddings:
-                out = self._icl_predictions(
-                    R,
-                    y_train,
-                    use_col_embeddings=True,
-                    pre_col_embeddings=pre_col_embeddings,
-                )
+            if self.icl_backend == "graph":
+                out = self._icl_predictions(R, y_train)
                 train_size = y_train.shape[1]
                 out = out[:, train_size:]
                 if self.max_classes > 0:
