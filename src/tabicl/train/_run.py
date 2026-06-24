@@ -42,6 +42,7 @@ from tabicl.prior._dataset import PriorDataset
 from tabicl.prior._genload import LoadPriorDataset
 from tabicl.train._optim import get_scheduler
 from tabicl.train._losses import entropy_regularizer, supervised_contrastive_loss
+from tabicl.train._scheduled_dataloader import ScheduledDataLoader, parse_step_size_schedule
 from tabicl.train._train_config import build_parser
 from tabicl.train._umap_logging import build_test_umap_wandb_images
 from rtpt import RTPT
@@ -149,7 +150,6 @@ class Trainer:
         self.load_checkpoint()
         self.rtpt = RTPT(name_initials="JS", experiment_name="TabICL_Stage1", max_iterations=self.config.max_steps)
         self.rtpt.start()
-        self.cached_batch = None
 
     def configure_ddp(self):
         """Set up distributed training and system configuration.
@@ -406,7 +406,18 @@ class Trainer:
         if self.master_process:
             print(train_dataset)
 
-        self.train_dataloader = self._build_prior_dataloader(train_dataset)
+        train_dataloader = self._build_prior_dataloader(train_dataset)
+        loader_schedule = parse_step_size_schedule(
+            steps_csv=self.config.scheduled_loader_steps,
+            sizes_csv=self.config.scheduled_loader_sizes,
+        )
+        self.train_dataloader = ScheduledDataLoader(
+            dataloader=train_dataloader,
+            batch_size=self.config.batch_size,
+            schedule=loader_schedule,
+            step_getter=lambda: self.curr_step,
+            seed=self.config.np_seed + self.ddp_rank,
+        )
         self.val_dataloader = self._build_prior_dataloader(val_dataset)
 
     def configure_optimizer(self):
@@ -559,11 +570,11 @@ class Trainer:
         for step in step_progress:
             # Get the next batch
             with Timer() as prior_timer:
-                if self.cached_batch is not None:
-                    batch = self.cached_batch
-                else:
+                try:
                     batch = next(train_dataloader)
-                    self.cached_batch = batch 
+                except StopIteration:
+                    train_dataloader = iter(self.train_dataloader)
+                    batch = next(train_dataloader)
             prior_time = prior_timer.elapsed
 
             # Train the model on the batch

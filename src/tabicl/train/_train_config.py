@@ -59,6 +59,18 @@ def build_parser():
         "--micro_batch_size", type=int, default=8, help="Size of micro-batches for gradient accumulation"
     )
     parser.add_argument(
+        "--scheduled_loader_steps",
+        type=str,
+        default="0",
+        help="Comma-separated schedule steps for train reservoir loader (must start with 0)",
+    )
+    parser.add_argument(
+        "--scheduled_loader_sizes",
+        type=str,
+        default="inf",
+        help="Comma-separated schedule sizes (positive ints or inf). Must include inf.",
+    )
+    parser.add_argument(
         "--log_conf_mat_every",
         type=int,
         default=100,

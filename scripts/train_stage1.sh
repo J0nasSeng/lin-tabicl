@@ -65,6 +65,8 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --save_temp_every 1000 \
             --save_perm_every 5000 \
             --recompute True \
+            --scheduled_loader_steps 0,300,600,1000,2000 \
+            --scheduled_loader_sizes 64,256,1024,2048,inf
             #--model_type nanotabicl
 
 
