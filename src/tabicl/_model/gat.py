@@ -184,7 +184,7 @@ class GraphAttentionBlock(nn.Module):
         return x
 
 class GraphAttentionTransformer(nn.Module):
-    """Stack of sparse graph attention blocks."""
+    """Graph-column transformer with sparse graph attention and intra-row attention."""
 
     def __init__(
         self,
@@ -197,9 +197,11 @@ class GraphAttentionTransformer(nn.Module):
         norm_first: bool = True,
         bias_free_ln: bool = False,
         recompute: bool = False,
+        num_output_cls: int | None = None,
+        out_dim: int | None = None,
     ):
         super().__init__()
-        self.blocks = nn.ModuleList(
+        self.graph_blocks = nn.ModuleList(
             [
                 GraphAttentionBlock(
                     d_model=d_model,
@@ -213,13 +215,59 @@ class GraphAttentionTransformer(nn.Module):
                 for _ in range(num_blocks)
             ]
         )
+        self.col_attn = nn.ModuleList(
+            [
+                nn.MultiheadAttention(
+                    embed_dim=d_model,
+                    num_heads=nhead,
+                    dropout=dropout,
+                    batch_first=True,
+                )
+                for _ in range(num_blocks)
+            ]
+        )
+        self.col_attn_ln = nn.ModuleList([nn.LayerNorm(d_model, bias=not bias_free_ln) for _ in range(num_blocks)])
+
+        if (num_output_cls is None) != (out_dim is None):
+            raise ValueError("num_output_cls and out_dim must be provided together")
+        if num_output_cls is not None and num_output_cls <= 0:
+            raise ValueError("num_output_cls must be > 0")
+
+        self.num_output_cls = num_output_cls
+        self.out_proj = None
+        if out_dim is not None and num_output_cls is not None:
+            self.out_proj = nn.Linear(num_output_cls * d_model, out_dim)
+            nn.init.xavier_uniform_(self.out_proj.weight)
+            nn.init.zeros_(self.out_proj.bias)
+
         self.recompute = recompute
 
     def forward(self, src: Tensor, edge_index_batch: list[Tensor]) -> Tensor:
+        if src.ndim != 4:
+            raise ValueError("GraphAttentionTransformer expects src with shape (B, T, C, D)")
+
+        B, T, C, D = src.shape
+        if self.num_output_cls is not None and C < self.num_output_cls:
+            raise ValueError(
+                f"GraphAttentionTransformer expects at least {self.num_output_cls} columns for output CLS, got {C}."
+            )
+
         out = src
-        for block in self.blocks:
+        for block_idx, block in enumerate(self.graph_blocks):
             if self.recompute:
                 out = checkpoint(partial(block, edge_index_batch=edge_index_batch), out, use_reentrant=False)
             else:
                 out = block(out, edge_index_batch=edge_index_batch)
-        return out
+
+            x_bt = out.reshape(B * T, C, D)
+            attn_in = self.col_attn_ln[block_idx](x_bt)
+            attn_out, _ = self.col_attn[block_idx](attn_in, attn_in, attn_in, need_weights=False)
+            out = (x_bt + attn_out).reshape(B, T, C, D)
+
+        if self.num_output_cls is None:
+            return out
+
+        cls_out = out[:, :, -self.num_output_cls :, :].reshape(B, T, self.num_output_cls * D)
+        if self.out_proj is None:
+            return cls_out
+        return self.out_proj(cls_out)

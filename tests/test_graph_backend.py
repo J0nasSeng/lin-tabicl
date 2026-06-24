@@ -82,7 +82,6 @@ def test_iclearning_graph_backend_forward_shape():
     d_model = 16
 
     y_train = _build_labels(batch_size=batch_size, train_size=train_size, num_classes=3).float()
-    R = torch.randn(batch_size, total_nodes, d_model)
 
     model = ICLearning(
         max_classes=5,
@@ -101,9 +100,35 @@ def test_iclearning_graph_backend_forward_shape():
     )
     model.train()
 
-    out = model(R, y_train)
+    col_embeddings = torch.randn(batch_size, total_nodes, model.graph_num_cls, model.graph_col_dim)
+    graph_input = model.prepare_graph_input(col_embeddings=col_embeddings, y_train=y_train)
+    out = model(graph_input, y_train)
     assert out.shape == (batch_size, total_nodes - train_size, 5)
     assert torch.isfinite(out).all()
+
+
+def test_iclearning_graph_backend_requires_4d_graph_input():
+    batch_size = 2
+    train_size = 12
+    total_nodes = 20
+    d_model = 16
+
+    y_train = _build_labels(batch_size=batch_size, train_size=train_size, num_classes=3).float()
+    row_repr = torch.randn(batch_size, total_nodes, d_model)
+
+    model = ICLearning(
+        max_classes=5,
+        out_dim=5,
+        d_model=d_model,
+        num_blocks=2,
+        nhead=4,
+        dim_feedforward=32,
+        icl_backend="graph",
+    )
+    model.train()
+
+    with pytest.raises(ValueError, match=r"Graph backend expects R with shape \(B, T, C, D\)"):
+        model(row_repr, y_train)
 
 
 def test_iclearning_graph_backend_rejects_regression():

@@ -143,17 +143,6 @@ class ICLearning(nn.Module):
                 recompute=recompute,
             )
         else:
-            self.gat_icl = GraphAttentionTransformer(
-                num_blocks=num_blocks,
-                d_model=d_model,
-                nhead=nhead,
-                dim_feedforward=dim_feedforward,
-                dropout=dropout,
-                activation=activation,
-                norm_first=norm_first,
-                bias_free_ln=bias_free_ln,
-                recompute=recompute,
-            )
             if d_model % self.graph_num_cls != 0:
                 raise ValueError(
                     f"d_model ({d_model}) must be divisible by graph_num_cls ({self.graph_num_cls}) for graph path"
@@ -161,39 +150,19 @@ class ICLearning(nn.Module):
             self.graph_col_dim = d_model // self.graph_num_cls
             self.graph_cls_tokens = nn.Parameter(torch.empty(self.graph_num_cls, self.graph_col_dim))
             nn.init.trunc_normal_(self.graph_cls_tokens, std=0.02)
-            self.graph_col_gats = nn.ModuleList(
-                [
-                    GraphAttentionTransformer(
-                        num_blocks=1,
-                        d_model=self.graph_col_dim,
-                        nhead=nhead,
-                        dim_feedforward=max(self.graph_col_dim * 2, dim_feedforward // max(self.graph_num_cls, 1)),
-                        dropout=dropout,
-                        activation=activation,
-                        norm_first=norm_first,
-                        bias_free_ln=bias_free_ln,
-                        recompute=recompute,
-                    )
-                    for _ in range(num_blocks)
-                ]
+            self.gat_icl = GraphAttentionTransformer(
+                num_blocks=num_blocks,
+                d_model=self.graph_col_dim,
+                nhead=nhead,
+                dim_feedforward=max(self.graph_col_dim * 2, dim_feedforward // max(self.graph_num_cls, 1)),
+                dropout=dropout,
+                activation=activation,
+                norm_first=norm_first,
+                bias_free_ln=bias_free_ln,
+                recompute=recompute,
+                num_output_cls=self.graph_num_cls,
+                out_dim=d_model,
             )
-            self.graph_col_attn = nn.ModuleList(
-                [
-                    nn.MultiheadAttention(
-                        embed_dim=self.graph_col_dim,
-                        num_heads=nhead,
-                        dropout=dropout,
-                        batch_first=True,
-                    )
-                    for _ in range(num_blocks)
-                ]
-            )
-            self.graph_col_attn_ln = nn.ModuleList(
-                [nn.LayerNorm(self.graph_col_dim, bias=not bias_free_ln) for _ in range(num_blocks)]
-            )
-            self.graph_out_proj = nn.Linear(self.graph_num_cls * self.graph_col_dim, d_model)
-            nn.init.xavier_uniform_(self.graph_out_proj.weight)
-            nn.init.zeros_(self.graph_out_proj.bias)
         if self.norm_first:
             self.ln = nn.LayerNorm(d_model, bias=not bias_free_ln)
 
@@ -235,25 +204,11 @@ class ICLearning(nn.Module):
         return class_mass
 
     def _apply_icl_backbone(self, R: Tensor, train_size: int, y_train: Optional[Tensor] = None) -> Tensor:
-        """Apply selected ICL backbone (encoder or graph attention)."""
+        """Apply encoder ICL backbone."""
 
-        if self.icl_backend == "encoder":
-            return self.tf_icl(R, train_size=train_size)
-
-        assert y_train is not None, "y_train is required for graph backend"
-        graph = build_class_conditioned_graph(
-            y_train=y_train,
-            total_nodes=R.shape[1],
-            min_train_neighbors=self.graph_min_train_neighbors,
-            max_train_neighbors=self.graph_max_train_neighbors,
-            same_label_ratio=self.graph_same_label_ratio,
-            cross_label_ratio=self.graph_cross_label_ratio,
-            test_k_per_class=self.graph_test_k_per_class,
-            seed=self.graph_seed,
-            share_graph_across_batch=self.graph_share_across_batch,
-            share_graph_require_identical_labels=self.graph_share_require_identical_labels,
-        )
-        return self.gat_icl(R.unsqueeze(2), edge_index_batch=graph.edge_index).squeeze(2)
+        if self.icl_backend != "encoder":
+            raise ValueError("_apply_icl_backbone is encoder-only; graph backend uses _run_graph_column_pipeline")
+        return self.tf_icl(R, train_size=train_size)
 
     def _grouping(self, num_classes: int) -> tuple[Tensor, int]:
         """Divide classes into balanced groups for hierarchical classification.
@@ -427,7 +382,6 @@ class ICLearning(nn.Module):
         )
 
         x = graph_input
-        total_cols = C
 
         for b, edge_index in enumerate(graph.edge_index):
             if edge_index.ndim != 2 or edge_index.shape[0] != 2:
@@ -438,19 +392,7 @@ class ICLearning(nn.Module):
                 if min_idx < 0 or max_idx >= T:
                     raise ValueError(f"edge_index out of bounds for dataset {b}: [{min_idx}, {max_idx}] vs T={T}")
 
-        for block_idx, block in enumerate(self.graph_col_gats):
-            # Per-column graph message passing over sample nodes.
-            x = block(x, edge_index_batch=graph.edge_index)
-
-            # Per-sample attention along column axis.
-            x_bt = x.reshape(B * T, total_cols, D)
-            attn_in = self.graph_col_attn_ln[block_idx](x_bt)
-            attn_out, _ = self.graph_col_attn[block_idx](attn_in, attn_in, attn_in, need_weights=False)
-            x_bt = x_bt + attn_out
-            x = x_bt.reshape(B, T, total_cols, D)
-
-        cls_out = x[:, :, -self.graph_num_cls :, :].reshape(B, T, self.graph_num_cls * D)
-        return self.graph_out_proj(cls_out)
+        return self.gat_icl(x, edge_index_batch=graph.edge_index)
 
     def prepare_graph_input(
         self,
@@ -535,15 +477,12 @@ class ICLearning(nn.Module):
 
         train_size = y_train.shape[1]
         if self.icl_backend == "graph":
-            if R.ndim == 4:
-                src = self._run_graph_column_pipeline(R, y_train=y_train)
-            elif R.ndim == 3:
-                # Backward-compatible direct graph path for callers passing row representations.
-                Ry_train = self.y_encoder(y_train.float())
-                R[:, :train_size] = R[:, :train_size] + Ry_train
-                src = self._apply_icl_backbone(R, train_size=train_size, y_train=y_train)
-            else:
-                raise ValueError("Graph backend expects R with shape (B, T, D) or (B, T, C, D)")
+            if R.ndim != 4:
+                raise ValueError(
+                    "Graph backend expects R with shape (B, T, C, D). "
+                    "Use prepare_graph_input for graph-mode inputs."
+                )
+            src = self._run_graph_column_pipeline(R, y_train=y_train)
         else:
             if self.max_classes > 0:  # Classification
                 Ry_train = self.y_encoder(y_train.float())
@@ -965,6 +904,9 @@ class ICLearning(nn.Module):
                 If return_logits=False: Probabilities of shape (B, test_size, num_classes)
         """
 
+        if self.icl_backend == "graph":
+            raise ValueError("Representation-cache path is not supported for graph ICL backend.")
+
         if mgr_config is None:
             mgr_config = InferenceConfig().ICL_CONFIG
         self.inference_mgr.configure(**mgr_config)
@@ -1107,6 +1049,9 @@ class ICLearning(nn.Module):
                 If return_logits=True: Logits of shape (B, test_size, num_classes)
                 If return_logits=False: Probabilities of shape (B, test_size, num_classes)
         """
+
+        if self.icl_backend == "graph":
+            raise ValueError("KV cache path is not supported for graph ICL backend.")
 
         if use_col_embeddings:
             raise NotImplementedError(
