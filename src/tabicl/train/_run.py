@@ -278,6 +278,7 @@ class Trainer:
             "dropout": self.config.dropout,
             "activation": self.config.activation,
             "norm_first": self.config.norm_first,
+            "recompute": self.config.recompute,
         }
 
         if model_type == "tabicl":

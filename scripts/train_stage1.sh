@@ -7,8 +7,8 @@ WAND_LOG=${WAND_LOG:-True}
 WAND_MODE=${WAND_MODE:-offline}
 # GPU selection controls
 DEVICE=${DEVICE:-cuda}
-NUM_GPUS=${NUM_GPUS:-1}
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1}
+NUM_GPUS=${NUM_GPUS:-2}
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
 # Confusion matrix logging interval
 LOG_CONF_MAT_EVERY=${LOG_CONF_MAT_EVERY:-150}
 
@@ -64,6 +64,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --checkpoint_dir /workspace/checkpoints/stage1/ \
             --save_temp_every 1000 \
             --save_perm_every 5000 \
+            --recompute True \
             #--model_type nanotabicl
 
 
