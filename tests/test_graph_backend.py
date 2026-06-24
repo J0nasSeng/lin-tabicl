@@ -378,6 +378,27 @@ def test_graph_multihead_attention_multicol_matches_expanded_reference():
     assert torch.allclose(out_new, out_ref, atol=1e-6, rtol=1e-6)
 
 
+def test_graph_multihead_attention_chunked_matches_non_chunked():
+    torch.manual_seed(0)
+    B, T, C, D, H = 2, 64, 2, 16, 4
+
+    src = torch.randn(B, T, C, D)
+    dense_edges = torch.cartesian_prod(torch.arange(T), torch.arange(T)).T
+    edge_index_batch = [dense_edges.clone(), dense_edges.clone()]
+
+    model_non_chunked = GraphMultiheadAttention(d_model=D, nhead=H, dropout=0.0, max_parallel_edges=10**9)
+    model_chunked = GraphMultiheadAttention(d_model=D, nhead=H, dropout=0.0, max_parallel_edges=2048)
+    model_chunked.load_state_dict(model_non_chunked.state_dict())
+    model_non_chunked.eval()
+    model_chunked.eval()
+
+    with torch.no_grad():
+        out_non_chunked = model_non_chunked(src, edge_index_batch)
+        out_chunked = model_chunked(src, edge_index_batch)
+
+    assert torch.allclose(out_chunked, out_non_chunked, atol=1e-6, rtol=1e-6)
+
+
 def test_graph_attention_block_alpha_initialization_and_forward_shape():
     torch.manual_seed(0)
     block = GraphAttentionBlock(

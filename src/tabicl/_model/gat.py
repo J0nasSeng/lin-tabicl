@@ -11,10 +11,12 @@ from torch.utils.checkpoint import checkpoint
 class GraphMultiheadAttention(nn.Module):
     """Sparse graph multi-head attention with per-destination softmax weights."""
 
-    def __init__(self, d_model: int, nhead: int, dropout: float = 0.0):
+    def __init__(self, d_model: int, nhead: int, dropout: float = 0.0, max_parallel_edges: int = 65536):
         super().__init__()
         if d_model % nhead != 0:
             raise ValueError(f"d_model ({d_model}) must be divisible by nhead ({nhead})")
+        if max_parallel_edges <= 0:
+            raise ValueError("max_parallel_edges must be > 0")
 
         self.d_model = d_model
         self.nhead = nhead
@@ -27,6 +29,7 @@ class GraphMultiheadAttention(nn.Module):
         self.out_proj = nn.Linear(d_model, d_model)
         self.dropout = nn.Dropout(dropout)
         self.alpha = nn.Parameter(torch.logit(torch.tensor(0.05, dtype=torch.float32)))
+        self.max_parallel_edges = int(max_parallel_edges)
 
         nn.init.xavier_uniform_(self.out_proj.weight)
         nn.init.zeros_(self.out_proj.bias)
@@ -99,33 +102,61 @@ class GraphMultiheadAttention(nn.Module):
         k = self.k_proj(src).view(B * T, C, self.nhead, self.head_dim)
         v = self.v_proj(src).view(B * T, C, self.nhead, self.head_dim)
 
-        q_dst = q[global_edge_dst]
-        k_src = k[global_edge_src]
-        v_src = v[global_edge_src]
-
-        attn_logits = (q_dst * k_src).sum(dim=-1) * self.scale
-
         E = global_edge_dst.numel()
         head_ids = torch.arange(self.nhead, device=src.device, dtype=torch.long).view(1, 1, self.nhead)
         col_ids = torch.arange(C, device=src.device, dtype=torch.long).view(1, C, 1)
-        dst_rep = global_edge_dst.view(E, 1, 1)
-        group_index = (dst_rep * (C * self.nhead) + col_ids * self.nhead + head_ids).reshape(-1)
         num_groups = B * T * C * self.nhead
+        chunk_size = min(E, self.max_parallel_edges)
+        denom_floor = torch.finfo(src.dtype).tiny
 
-        logits_flat = attn_logits.reshape(-1)
+        def _chunk_group_index(edge_dst_chunk: Tensor) -> Tensor:
+            dst_rep = edge_dst_chunk.view(-1, 1, 1)
+            return (dst_rep * (C * self.nhead) + col_ids * self.nhead + head_ids).reshape(-1)
+
         max_per_group = torch.full((num_groups,), float("-inf"), dtype=src.dtype, device=src.device)
-        max_per_group.scatter_reduce_(0, group_index, logits_flat, reduce="amax", include_self=True)
+        for start in range(0, E, chunk_size):
+            end = min(start + chunk_size, E)
+            edge_src_chunk = global_edge_src[start:end]
+            edge_dst_chunk = global_edge_dst[start:end]
 
-        exp_logits = torch.exp(logits_flat - max_per_group[group_index])
+            q_dst_chunk = q[edge_dst_chunk]
+            k_src_chunk = k[edge_src_chunk]
+            logits_chunk = ((q_dst_chunk * k_src_chunk).sum(dim=-1) * self.scale).reshape(-1)
+            group_index_chunk = _chunk_group_index(edge_dst_chunk)
+            max_per_group.scatter_reduce_(0, group_index_chunk, logits_chunk, reduce="amax", include_self=True)
+
         sum_per_group = torch.zeros((num_groups,), dtype=src.dtype, device=src.device)
-        sum_per_group.index_add_(0, group_index, exp_logits)
-        edge_weight = (exp_logits / sum_per_group[group_index].clamp_min(1e-12)).view(E, C, self.nhead)
-        edge_weight = self.dropout(edge_weight)
+        for start in range(0, E, chunk_size):
+            end = min(start + chunk_size, E)
+            edge_src_chunk = global_edge_src[start:end]
+            edge_dst_chunk = global_edge_dst[start:end]
 
-        messages = v_src * edge_weight.unsqueeze(-1)
+            q_dst_chunk = q[edge_dst_chunk]
+            k_src_chunk = k[edge_src_chunk]
+            logits_chunk = ((q_dst_chunk * k_src_chunk).sum(dim=-1) * self.scale).reshape(-1)
+            group_index_chunk = _chunk_group_index(edge_dst_chunk)
+            exp_chunk = torch.exp(logits_chunk - max_per_group[group_index_chunk])
+            sum_per_group.index_add_(0, group_index_chunk, exp_chunk)
 
         agg = torch.zeros((B * T, C, self.nhead, self.head_dim), dtype=src.dtype, device=src.device)
-        agg.index_add_(0, global_edge_dst, messages)
+        for start in range(0, E, chunk_size):
+            end = min(start + chunk_size, E)
+            edge_src_chunk = global_edge_src[start:end]
+            edge_dst_chunk = global_edge_dst[start:end]
+
+            q_dst_chunk = q[edge_dst_chunk]
+            k_src_chunk = k[edge_src_chunk]
+            v_src_chunk = v[edge_src_chunk]
+            logits_chunk = ((q_dst_chunk * k_src_chunk).sum(dim=-1) * self.scale).reshape(-1)
+            group_index_chunk = _chunk_group_index(edge_dst_chunk)
+            exp_chunk = torch.exp(logits_chunk - max_per_group[group_index_chunk])
+
+            edge_weight = (exp_chunk / sum_per_group[group_index_chunk].clamp_min(denom_floor)).view(
+                end - start, C, self.nhead
+            )
+            edge_weight = self.dropout(edge_weight)
+            messages = v_src_chunk * edge_weight.unsqueeze(-1)
+            agg.index_add_(0, edge_dst_chunk, messages)
         attn_out = self.out_proj(agg.view(B, T, C, self.d_model))
         return (1.0 - alpha) * residual_src + alpha * attn_out
 
