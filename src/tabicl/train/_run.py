@@ -174,7 +174,7 @@ class Trainer:
 
             # Adjust batch size for distributed training
             original_batch_size = self.config.batch_size
-            self.config.batch_size = original_batch_size # math.ceil(original_batch_size / self.ddp_world_size)
+            self.config.batch_size = math.ceil(original_batch_size / self.ddp_world_size)
 
             if self.master_process:
                 print(f"DDP training with {self.ddp_world_size} processes")
@@ -414,25 +414,25 @@ class Trainer:
         if self.master_process:
             print(train_dataset)
 
-        train_dataloader = self._build_prior_dataloader(train_dataset)
-        loader_schedule = parse_step_size_schedule(
-            steps_csv=self.config.scheduled_loader_steps,
-            sizes_csv=self.config.scheduled_loader_sizes,
-        )
-        if self.config.micro_batch_size != self.config.batch_size_per_gp and self.master_process:
-            warnings.warn(
-                "micro_batch_size != batch_size_per_gp: ScheduledDataLoader will preserve prior groups in each "
-                "returned batch, but trainer micro-batch splits may still mix groups.",
-                stacklevel=2,
-            )
-        self.train_dataloader = ScheduledDataLoader(
-            dataloader=train_dataloader,
-            batch_size=self.config.batch_size,
-            batch_size_per_gp=self.config.batch_size_per_gp,
-            schedule=loader_schedule,
-            step_getter=lambda: self.curr_step,
-            seed=self.config.np_seed + self.ddp_rank,
-        )
+        self.train_dataloader = self._build_prior_dataloader(train_dataset)
+        #loader_schedule = parse_step_size_schedule(
+        #    steps_csv=self.config.scheduled_loader_steps,
+        #    sizes_csv=self.config.scheduled_loader_sizes,
+        #)
+        #if self.config.micro_batch_size != self.config.batch_size_per_gp and self.master_process:
+        #    warnings.warn(
+        #        "micro_batch_size != batch_size_per_gp: ScheduledDataLoader will preserve prior groups in each "
+        #        "returned batch, but trainer micro-batch splits may still mix groups.",
+        #        stacklevel=2,
+        #    )
+        #self.train_dataloader = ScheduledDataLoader(
+        #    dataloader=train_dataloader,
+        #    batch_size=self.config.batch_size,
+        #    batch_size_per_gp=self.config.batch_size_per_gp,
+        #    schedule=loader_schedule,
+        #    step_getter=lambda: self.curr_step,
+        #    seed=self.config.np_seed + self.ddp_rank,
+        #)
         self.val_dataloader = self._build_prior_dataloader(val_dataset)
 
     def configure_optimizer(self):

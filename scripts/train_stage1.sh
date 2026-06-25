@@ -32,12 +32,13 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --batch_size 64 \
             --micro_batch_size 1 \
             --log_conf_mat_every ${LOG_CONF_MAT_EVERY} \
-            --lr 1e-4 \
+            --lr 5e-5 \
+            --weight_decay 1e-4 \
             --supcon_weight 0.0 \
             --entropy_weight 0.0 \
             --icl_decoder_type soft_kmeans \
             --scheduler cosine_warmup \
-            --warmup_proportion 0.02 \
+            --warmup_proportion 0.05 \
             --gradient_clipping 2.0 \
             --prior_type nanotabicl \
             --prior_device cpu \
