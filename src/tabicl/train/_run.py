@@ -142,12 +142,12 @@ class Trainer:
     def __init__(self, config):
         self.config = config
         self.configure_ddp()
-        self.configure_wandb()
         self.build_model()
         self.configure_prior()
         self.configure_optimizer()
         self.configure_amp()
         self.load_checkpoint()
+        self.configure_wandb()
         self.rtpt = RTPT(name_initials="JS", experiment_name="TabICL_Stage1", max_iterations=self.config.max_steps)
         self.rtpt.start()
 
@@ -174,7 +174,7 @@ class Trainer:
 
             # Adjust batch size for distributed training
             original_batch_size = self.config.batch_size
-            self.config.batch_size = math.ceil(original_batch_size / self.ddp_world_size)
+            self.config.batch_size = original_batch_size # math.ceil(original_batch_size / self.ddp_world_size)
 
             if self.master_process:
                 print(f"DDP training with {self.ddp_world_size} processes")
@@ -224,10 +224,18 @@ class Trainer:
                 os.makedirs(self.config.wandb_dir, exist_ok=True)
 
             id_path = os.path.join(self.config.checkpoint_dir, "wand_id.txt")
-            if self.config.wandb_id is None:
-                if os.path.exists(id_path):
-                    with open(id_path, "r") as f:
-                        self.config.wandb_id = f.read().strip()
+            checkpoint_exists = False
+            if getattr(self.config, "checkpoint_path", None):
+                checkpoint_exists = os.path.exists(self.config.checkpoint_path)
+            elif getattr(self.config, "checkpoint_dir", None):
+                checkpoint_exists = self.get_latest_checkpoint() is not None
+
+            # Reuse a stored run id only when a checkpoint exists to resume from.
+            if self.config.wandb_id is None and checkpoint_exists and os.path.exists(id_path):
+                with open(id_path, "r") as f:
+                    self.config.wandb_id = f.read().strip()
+
+            resume_mode = "allow" if self.config.wandb_id is not None else "never"
 
             self.wandb_run = wandb.init(
                 dir=self.config.wandb_dir,
@@ -235,7 +243,7 @@ class Trainer:
                 name=self.config.wandb_name,
                 id=self.config.wandb_id,
                 config=self.config,
-                resume="allow",
+                resume=resume_mode,
                 mode=self.config.wandb_mode,
             )
 
@@ -411,9 +419,16 @@ class Trainer:
             steps_csv=self.config.scheduled_loader_steps,
             sizes_csv=self.config.scheduled_loader_sizes,
         )
+        if self.config.micro_batch_size != self.config.batch_size_per_gp and self.master_process:
+            warnings.warn(
+                "micro_batch_size != batch_size_per_gp: ScheduledDataLoader will preserve prior groups in each "
+                "returned batch, but trainer micro-batch splits may still mix groups.",
+                stacklevel=2,
+            )
         self.train_dataloader = ScheduledDataLoader(
             dataloader=train_dataloader,
             batch_size=self.config.batch_size,
+            batch_size_per_gp=self.config.batch_size_per_gp,
             schedule=loader_schedule,
             step_getter=lambda: self.curr_step,
             seed=self.config.np_seed + self.ddp_rank,
@@ -622,7 +637,11 @@ class Trainer:
             if self.wandb_run is not None:
                 # Add learning rate to results
                 results["lr"] = self.scheduler.get_last_lr()[0]
-                wandb.log(results, step=self.curr_step)
+                wandb_step = int(self.curr_step)
+                run_step = getattr(self.wandb_run, "step", None)
+                if isinstance(run_step, int):
+                    wandb_step = max(wandb_step, run_step)
+                wandb.log(results, step=wandb_step)
             
             self.rtpt.step()
 
@@ -772,14 +791,27 @@ class Trainer:
         return payload
 
     def _apply_optimizer_updates(self):
+        # Always unscale once before any grad inspection/clipping/step so logged norms
+        # reflect true (unscaled) gradients when AMP GradScaler is enabled.
+        self.scaler.unscale_(self.optimizer)
+
+        grad_norm_sum = 0.0
+        grad_param_count = 0
+        for param in self.model.parameters():
+            if param.grad is None:
+                continue
+            grad_norm_sum += param.grad.detach().norm(2).item()
+            grad_param_count += 1
+        avg_unscaled_grad_norm = grad_norm_sum / grad_param_count if grad_param_count > 0 else 0.0
+
         if self.config.gradient_clipping > 0:
-            self.scaler.unscale_(self.optimizer)
             nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clipping)
 
         self.scaler.step(self.optimizer)
         self.scaler.update()
         self.optimizer.zero_grad(set_to_none=True)
         self.scheduler.step()
+        return avg_unscaled_grad_norm
 
     def validate_micro_batch(self, micro_seq_len, micro_train_size):
         """Validate consistent sequence length and train size within a micro batch.
@@ -1025,6 +1057,7 @@ class Trainer:
             micro_results = {}
             micro_results["ce"] = (ce_loss / num_micro_batches).item()
             micro_results["loss"] = loss.item() / num_micro_batches
+            #micro_results["loss"] = self.scaler.scale(scaled_loss).item() / num_micro_batches
             accuracy = (pred.argmax(dim=1) == true).sum() / len(true)
             micro_results["accuracy"] = accuracy.item() / num_micro_batches
             if supcon_weight > 0:
@@ -1116,7 +1149,7 @@ class Trainer:
                 f"Please check configuration to reduce memory consumption."
             )
 
-        self._apply_optimizer_updates()
+        results["grad_norm"] = self._apply_optimizer_updates()
 
         return results
 

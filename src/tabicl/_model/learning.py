@@ -94,7 +94,7 @@ class ICLearning(nn.Module):
         graph_cross_label_ratio: float = 0.1,
         graph_test_k_per_class: int = 8,
         decoder_type: Literal["mlp", "soft_kmeans"] = "mlp",
-        soft_kmeans_temperature: float = 0.1,
+        soft_kmeans_temperature: float = 1.0,
         graph_seed: Optional[int] = None,
         graph_share_across_batch: bool = False,
         graph_share_require_identical_labels: bool = True,

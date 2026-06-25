@@ -12,7 +12,7 @@ DEFAULT_FIXED_HP = {
     "balanced": True,
     "multiclass_ordered_prob": 0.0,
     "multiclass_jitter_scale": 0.0,
-    "cat_prob": 0.2,
+    "cat_prob": 0.,
     "max_categories": float("inf"),
     "scale_by_max_features": False,
     "permute_features": True,

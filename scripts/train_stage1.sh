@@ -4,13 +4,13 @@
 ICL_BACKEND=${ICL_BACKEND:-graph}
 # Enable wandb logging by setting WAND_LOG=True (and optionally WAND_MODE=online)
 WAND_LOG=${WAND_LOG:-True}
-WAND_MODE=${WAND_MODE:-offline}
+WAND_MODE=${WAND_MODE:-online}
 # GPU selection controls
 DEVICE=${DEVICE:-cuda}
-NUM_GPUS=${NUM_GPUS:-2}
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
+NUM_GPUS=${NUM_GPUS:-3}
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,3}
 # Confusion matrix logging interval
-LOG_CONF_MAT_EVERY=${LOG_CONF_MAT_EVERY:-150}
+LOG_CONF_MAT_EVERY=${LOG_CONF_MAT_EVERY:-1000}
 
 export CUDA_VISIBLE_DEVICES
 
@@ -30,7 +30,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --torch_seed 42 \
             --max_steps 10000 \
             --batch_size 64 \
-            --micro_batch_size 8 \
+            --micro_batch_size 1 \
             --log_conf_mat_every ${LOG_CONF_MAT_EVERY} \
             --lr 1e-4 \
             --supcon_weight 0.0 \
@@ -38,9 +38,9 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --icl_decoder_type soft_kmeans \
             --scheduler cosine_warmup \
             --warmup_proportion 0.02 \
-            --gradient_clipping 10.0 \
+            --gradient_clipping 2.0 \
             --prior_type nanotabicl \
-            --prior_device cuda \
+            --prior_device cpu \
             --batch_size_per_gp 8 \
             --min_features 2 \
             --max_features 10 \
@@ -56,7 +56,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --row_nhead 8 \
             --row_num_cls 4 \
             --row_rope_base 100000 \
-            --icl_num_blocks 4 \
+            --icl_num_blocks 10 \
             --icl_nhead 8 \
             --icl_backend ${ICL_BACKEND} \
             --ff_factor 2 \
@@ -65,8 +65,8 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --save_temp_every 1000 \
             --save_perm_every 5000 \
             --recompute True \
-            --scheduled_loader_steps 0,300,600,1000,2000 \
-            --scheduled_loader_sizes 64,256,1024,2048,inf
+            #--scheduled_loader_steps 0,300,600,1000,2000 \
+            #--scheduled_loader_sizes 64,256,1024,2048,inf
             #--model_type nanotabicl
 
 
