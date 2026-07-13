@@ -447,12 +447,28 @@ class Trainer:
         """Configure automatic mixed precision (AMP) for training."""
 
         self.amp = self.config.amp and "cuda" in self.config.device
-        self.scaler = torch.GradScaler("cuda", enabled=self.amp)
+
+        dtype_map = {
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "float32": torch.float32,
+        }
+        if self.config.dtype not in dtype_map:
+            raise ValueError(f"Unsupported training dtype: {self.config.dtype}")
+
+        autocast_dtype = dtype_map[self.config.dtype]
+        use_grad_scaler = self.amp and self.config.dtype == "float16"
+        self.scaler = torch.GradScaler("cuda", enabled=use_grad_scaler)
+
         if self.amp:
             if self.master_process:
-                print(f"Automatic Mixed Precision is enabled.")
+                print(
+                    f"Automatic Mixed Precision is enabled. "
+                    f"compute_dtype={self.config.dtype}, grad_scaler={use_grad_scaler}"
+                )
             self.amp_ctx = torch.autocast(
-                device_type="cuda", dtype=torch.float16 if self.config.dtype == "float16" else torch.float32
+                device_type="cuda",
+                dtype=autocast_dtype,
             )
         else:
             self.amp_ctx = nullcontext()
@@ -1057,7 +1073,7 @@ class Trainer:
             micro_results = {}
             micro_results["ce"] = (ce_loss / num_micro_batches).item()
             micro_results["loss"] = loss.item() / num_micro_batches
-            #micro_results["loss"] = self.scaler.scale(scaled_loss).item() / num_micro_batches
+            micro_results["scale"] = self.scaler.get_scale() / num_micro_batches
             accuracy = (pred.argmax(dim=1) == true).sum() / len(true)
             micro_results["accuracy"] = accuracy.item() / num_micro_batches
             if supcon_weight > 0:

@@ -1,16 +1,16 @@
 # This script is used to train TabICL for the first stage of the curriculum learning
 
 # Choose ICL backbone: graph or encoder
-ICL_BACKEND=${ICL_BACKEND:-graph}
+ICL_BACKEND=${ICL_BACKEND:-encoder}
 # Enable wandb logging by setting WAND_LOG=True (and optionally WAND_MODE=online)
 WAND_LOG=${WAND_LOG:-True}
 WAND_MODE=${WAND_MODE:-online}
 # GPU selection controls
 DEVICE=${DEVICE:-cuda}
-NUM_GPUS=${NUM_GPUS:-3}
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,3}
+NUM_GPUS=${NUM_GPUS:-2}
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-3,5}
 # Confusion matrix logging interval
-LOG_CONF_MAT_EVERY=${LOG_CONF_MAT_EVERY:-1000}
+LOG_CONF_MAT_EVERY=${LOG_CONF_MAT_EVERY:-2000}
 
 export CUDA_VISIBLE_DEVICES
 
@@ -25,21 +25,21 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --wandb_dir /workspace/wandb/ \
             --wandb_mode ${WAND_MODE} \
             --device ${DEVICE} \
-            --dtype float16 \
+            --dtype bfloat16 \
             --np_seed 42 \
             --torch_seed 42 \
             --max_steps 10000 \
-            --batch_size 64 \
+            --batch_size 128 \
             --micro_batch_size 1 \
             --log_conf_mat_every ${LOG_CONF_MAT_EVERY} \
-            --lr 5e-5 \
+            --lr 1e-4 \
             --weight_decay 1e-4 \
             --supcon_weight 0.0 \
             --entropy_weight 0.0 \
             --icl_decoder_type soft_kmeans \
             --scheduler cosine_warmup \
-            --warmup_proportion 0.05 \
-            --gradient_clipping 2.0 \
+            --warmup_proportion 0.02 \
+            --gradient_clipping 10.0 \
             --prior_type nanotabicl \
             --prior_device cpu \
             --batch_size_per_gp 8 \
@@ -48,7 +48,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --max_classes 10 \
             --max_seq_len 1024 \
             --min_train_size 0.1 \
-            --max_train_size 0.9 \
+            --max_train_size 0.6 \
             --embed_dim 128 \
             --col_num_blocks 3 \
             --col_nhead 8 \
@@ -62,7 +62,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --icl_backend ${ICL_BACKEND} \
             --ff_factor 2 \
             --norm_first True \
-            --checkpoint_dir /workspace/checkpoints/stage1/ \
+            --checkpoint_dir /workspace/checkpoints_bfloat16/stage1/ \
             --save_temp_every 1000 \
             --save_perm_every 5000 \
             --recompute True \
