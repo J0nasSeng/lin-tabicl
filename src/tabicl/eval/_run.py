@@ -124,9 +124,11 @@ def _forward_with_full_repr_tabicl(model: TabICL, x_i, y_train, d_i):
     )
 
     pred_test = out_full[:, train_size:]
-    if model.max_classes > 0:
-        num_classes = len(torch.unique(y_train[0]))
-        pred_test = pred_test[..., :num_classes]
+    # Prior labels may use arbitrary global class IDs (NanoTabICL remaps
+    # classes, e.g. binary labels can be [2, 7]). Do not truncate logits to
+    # [:num_classes], because that assumes the active IDs are [0, ..., K-1]
+    # and can discard the logits for the actual target classes. Keeping the
+    # complete output lets argmax return the same global IDs as y_test.
 
     return pred_test, repr_full
 

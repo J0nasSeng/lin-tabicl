@@ -16,7 +16,7 @@ from typing import Callable
 import numpy as np
 import torch
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import balanced_accuracy_score
+from sklearn.metrics import recall_score
 
 from tabicl.eval._run import _build_model_from_checkpoint, _evaluate_one_dataset
 from tabicl.prior._dataset import PriorDataset
@@ -30,8 +30,33 @@ BASELINE_FACTORIES: dict[str, Callable[[int], object]] = {
 	),
 }
 SCORES: dict[str, Callable[[np.ndarray, np.ndarray], float]] = {
-	"balanced_accuracy": balanced_accuracy_score,
+	"balanced_accuracy": lambda y_true, y_pred: _balanced_accuracy(y_true, y_pred),
 }
+
+
+def _balanced_accuracy(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+	"""Compute balanced accuracy without warning on unknown predictions.
+
+	TabICL can assign a test row to a class that is absent from the sampled
+	test partition. ``balanced_accuracy_score`` delegates to recall and emits a
+	warning in that case. Balanced accuracy is the mean recall over the true
+	classes, so explicitly supplying those labels gives the same value without
+	allowing a spurious prediction class to alter the class set.
+
+	This evaluation script calls the low-level TabICL model directly; it does not
+	construct the sklearn ensemble and therefore has no class-label permutation
+	setting to disable. The training labels are passed to the model unchanged.
+	"""
+	labels = np.unique(y_true)
+	return float(
+		recall_score(
+			y_true,
+			y_pred,
+			labels=labels,
+			average="macro",
+			zero_division=0,
+		)
+	)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -45,7 +70,7 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--min-seq-len", type=int, default=None)
 	parser.add_argument("--min-train-size", type=float, default=0.1)
 	parser.add_argument("--max-train-size", type=float, default=0.9)
-	parser.add_argument("--prior-type", choices=["mlp_scm", "tree_scm", "mix_scm", "nanotabicl"], default="mix_scm")
+	parser.add_argument("--prior-type", choices=["mlp_scm", "tree_scm", "mix_scm", "nanotabicl"], default="nanotabicl")
 	parser.add_argument("--prior-device", default="cpu")
 	parser.add_argument("--device", default=None, help="Inference device (default: cuda when available)")
 	parser.add_argument("--seed", type=int, default=42)

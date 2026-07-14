@@ -40,7 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument(
 		"--prior-type",
 		choices=["mlp_scm", "tree_scm", "mix_scm", "nanotabicl"],
-		default="mix_scm",
+		default="nanotabicl",
 	)
 	parser.add_argument("--prior-device", default="cpu")
 	parser.add_argument("--rf-jobs", type=int, default=-1, help="Random-forest parallelism.")
