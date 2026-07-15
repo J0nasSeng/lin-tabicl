@@ -194,7 +194,7 @@ class ICLearning(nn.Module):
         train_repr = src[:, :train_size, :]
         sim = torch.matmul(src, train_repr.transpose(1, 2))
         sim = sim / math.sqrt(src.shape[-1])
-        sim = sim / self.soft_kmeans_temperature
+        sim = sim / 0.2 #self.soft_kmeans_temperature
 
         assign = torch.softmax(sim, dim=-1)
         y_one_hot = F.one_hot(y_train.long(), num_classes=self.max_classes).to(dtype=src.dtype)

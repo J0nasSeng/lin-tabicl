@@ -50,6 +50,7 @@ class EvalSample:
     x: torch.Tensor
     y_full: torch.Tensor
     y_pred_test: torch.Tensor
+    y_logits_test: torch.Tensor
     y_true_test: torch.Tensor
     repr_full: torch.Tensor
     train_size: int
@@ -168,6 +169,7 @@ def _evaluate_one_dataset(model, model_type: str, batch: tuple[torch.Tensor, ...
         x=x_i.detach().cpu().squeeze(0),
         y_full=y_i.detach().cpu().squeeze(0),
         y_pred_test=y_pred_test.detach().cpu().squeeze(0),
+        y_logits_test=pred_test.detach().cpu().squeeze(0),
         y_true_test=y_true_test.detach().cpu().squeeze(0),
         repr_full=repr_full.detach().cpu().squeeze(0),
         train_size=train_size,

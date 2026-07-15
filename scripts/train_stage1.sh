@@ -7,8 +7,8 @@ WAND_LOG=${WAND_LOG:-True}
 WAND_MODE=${WAND_MODE:-online}
 # GPU selection controls
 DEVICE=${DEVICE:-cuda}
-NUM_GPUS=${NUM_GPUS:-2}
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-3,5}
+NUM_GPUS=${NUM_GPUS:-3}
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-4,6,7}
 # Confusion matrix logging interval
 LOG_CONF_MAT_EVERY=${LOG_CONF_MAT_EVERY:-2000}
 
@@ -32,8 +32,8 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --batch_size 128 \
             --micro_batch_size 1 \
             --log_conf_mat_every ${LOG_CONF_MAT_EVERY} \
-            --lr 1e-4 \
-            --weight_decay 1e-4 \
+            --lr 3e-4 \
+            --weight_decay 1e-5 \
             --supcon_weight 0.0 \
             --entropy_weight 0.0 \
             --icl_decoder_type soft_kmeans \
@@ -62,7 +62,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --icl_backend ${ICL_BACKEND} \
             --ff_factor 2 \
             --norm_first True \
-            --checkpoint_dir /workspace/checkpoints_bfloat16/stage1/ \
+            --checkpoint_dir /workspace/checkpoints/stage1/ \
             --save_temp_every 1000 \
             --save_perm_every 5000 \
             --recompute True \
