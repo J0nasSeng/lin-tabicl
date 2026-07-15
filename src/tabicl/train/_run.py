@@ -1048,7 +1048,15 @@ class Trainer:
                     class_weights[present_mask] = inv_freq.to(device=class_weights.device, dtype=class_weights.dtype)
                     class_weights = class_weights / class_weights.sum()  # Normalize to num present classes
 
-                ce_losses.append(F.cross_entropy(ds_logits, ds_targets, weight=class_weights, reduction="mean"))
+                if self.raw_model.icl_predictor.decoder_type == "soft_kmeans":
+                    # The soft-kNN decoder returns normalized class masses, not logits.
+                    # Use their log directly; passing them to cross_entropy would apply
+                    # an incorrect second softmax and assign mass to absent classes.
+                    eps = torch.finfo(ds_logits.dtype).tiny
+                    log_class_mass = ds_logits.clamp_min(eps).log()
+                    ce_losses.append(F.nll_loss(log_class_mass, ds_targets, weight=class_weights, reduction="mean"))
+                else:
+                    ce_losses.append(F.cross_entropy(ds_logits, ds_targets, weight=class_weights, reduction="mean"))
 
             ce_loss = torch.stack(ce_losses).mean()
 

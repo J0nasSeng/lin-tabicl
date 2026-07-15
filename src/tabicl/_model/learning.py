@@ -94,7 +94,7 @@ class ICLearning(nn.Module):
         graph_cross_label_ratio: float = 0.1,
         graph_test_k_per_class: int = 8,
         decoder_type: Literal["mlp", "soft_kmeans"] = "mlp",
-        soft_kmeans_temperature: float = 1.0,
+        soft_kmeans_temperature: float = 0.2,
         graph_seed: Optional[int] = None,
         graph_share_across_batch: bool = False,
         graph_share_require_identical_labels: bool = True,
@@ -192,9 +192,14 @@ class ICLearning(nn.Module):
             raise ValueError("soft_kmeans decoder requires train_size > 0")
 
         train_repr = src[:, :train_size, :]
+
+        # normalize before similarity computation
+        src = F.normalize(src, p=2, dim=-1)
+        train_repr = F.normalize(train_repr, p=2, dim=-1)
+
         sim = torch.matmul(src, train_repr.transpose(1, 2))
         sim = sim / math.sqrt(src.shape[-1])
-        sim = sim / 0.2 #self.soft_kmeans_temperature
+        sim = sim / self.soft_kmeans_temperature
 
         assign = torch.softmax(sim, dim=-1)
         y_one_hot = F.one_hot(y_train.long(), num_classes=self.max_classes).to(dtype=src.dtype)

@@ -32,8 +32,8 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --batch_size 128 \
             --micro_batch_size 1 \
             --log_conf_mat_every ${LOG_CONF_MAT_EVERY} \
-            --lr 3e-4 \
-            --weight_decay 1e-5 \
+            --lr 2e-4 \
+            --weight_decay 1e-4 \
             --supcon_weight 0.0 \
             --entropy_weight 0.0 \
             --icl_decoder_type soft_kmeans \
