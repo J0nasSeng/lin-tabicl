@@ -1,7 +1,7 @@
 # This script is used to train TabICL for the first stage of the curriculum learning
 
 # Choose ICL backbone: graph or encoder
-ICL_BACKEND=${ICL_BACKEND:-encoder}
+ICL_BACKEND=${ICL_BACKEND:-graph}
 # Enable wandb logging by setting WAND_LOG=True (and optionally WAND_MODE=online)
 WAND_LOG=${WAND_LOG:-True}
 WAND_MODE=${WAND_MODE:-online}

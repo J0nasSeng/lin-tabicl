@@ -194,8 +194,8 @@ class ICLearning(nn.Module):
         train_repr = src[:, :train_size, :]
 
         # normalize before similarity computation
-        src = F.normalize(src, p=2, dim=-1)
-        train_repr = F.normalize(train_repr, p=2, dim=-1)
+        #src = F.normalize(src, p=2, dim=-1)
+        #train_repr = F.normalize(train_repr, p=2, dim=-1)
 
         sim = torch.matmul(src, train_repr.transpose(1, 2))
         sim = sim / math.sqrt(src.shape[-1])

@@ -24,9 +24,9 @@ from tabicl.prior._dataset import PriorDataset
 
 # Registries make adding another baseline or score a local change rather than
 # requiring changes to the evaluation loop and plotting code.
-BASELINE_FACTORIES: dict[str, Callable[[int], object]] = {
-	"random_forest": lambda seed: RandomForestClassifier(
-		n_estimators=200, random_state=seed, n_jobs=-1
+BASELINE_FACTORIES: dict[str, Callable[[int, int], object]] = {
+	"random_forest": lambda seed, n_estimators: RandomForestClassifier(
+		n_estimators=n_estimators, random_state=seed, n_jobs=1
 	),
 }
 SCORES: dict[str, Callable[[np.ndarray, np.ndarray, np.ndarray, np.ndarray], float]] = {
@@ -79,15 +79,38 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--num-datasets", type=int, default=1000, help="Datasets per class count")
 	parser.add_argument("--batch-size", type=int, default=32, help="Prior datasets generated per batch")
 	parser.add_argument("--min-features", type=int, default=2)
-	parser.add_argument("--max-features", type=int, default=100)
-	parser.add_argument("--max-seq-len", type=int, default=512)
+	parser.add_argument("--max-features", type=int, default=10)
+	parser.add_argument("--max-seq-len", type=int, default=1024)
 	parser.add_argument("--min-seq-len", type=int, default=None)
-	parser.add_argument("--min-train-size", type=float, default=0.1)
-	parser.add_argument("--max-train-size", type=float, default=0.9)
+	parser.add_argument("--min-train-size", type=float, default=0.2)
+	parser.add_argument("--max-train-size", type=float, default=0.6)
 	parser.add_argument("--prior-type", choices=["mlp_scm", "tree_scm", "mix_scm", "nanotabicl"], default="nanotabicl")
 	parser.add_argument("--prior-device", default="cpu")
 	parser.add_argument("--device", default=None, help="Inference device (default: cuda when available)")
 	parser.add_argument("--seed", type=int, default=42)
+	parser.add_argument(
+		"--normalize-features",
+		action="store_true",
+		help="Normalize each feature using its training-sample mean and standard deviation.",
+	)
+	parser.add_argument(
+		"--rf-n-estimators",
+		type=int,
+		default=50,
+		help="Number of RF trees per dataset; lower values speed up diagnostics (default: 50)",
+	)
+	parser.add_argument(
+		"--umap-n-neighbors",
+		type=int,
+		default=10,
+		help="UMAP neighborhood size for plots; lower values are faster (default: 10)",
+	)
+	parser.add_argument(
+		"--umap-n-epochs",
+		type=int,
+		default=100,
+		help="UMAP optimization epochs for plots; lower values are faster (default: 100)",
+	)
 	parser.add_argument(
 		"--skip-baselines",
 		action="store_true",
@@ -111,9 +134,40 @@ def _as_regular_tensors(batch: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, 
 	)
 
 
-def _plot_umap(sample, num_classes: int, dataset_index: int, output_dir: Path, seed: int) -> None:
-	"""Plot sample representations before the TabICL soft-kNN prediction layer."""
+def _normalize_features(batch: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
+	"""Normalize each dataset using statistics computed from its train rows only."""
+	x, y, d, seq_lens, train_sizes = batch
+	x = x.clone()
+	for index in range(x.shape[0]):
+		seq_len = int(seq_lens[index].item())
+		train_size = int(train_sizes[index].item())
+		feature_count = int(d[index].item())
+		features = x[index, :seq_len, :feature_count]
+		train_features = features[:train_size]
+		finite = torch.isfinite(train_features)
+		count = finite.sum(dim=0, keepdim=True).clamp_min(1)
+		finite_train_features = torch.where(finite, train_features, 0.0)
+		mean = finite_train_features.sum(dim=0, keepdim=True) / count
+		centered = torch.where(finite, train_features - mean, 0.0)
+		std = (centered.square().sum(dim=0, keepdim=True) / count).sqrt().clamp_min(1e-6)
+		x[index, :seq_len, :feature_count] = (features - mean) / std
+	return x, y, d, seq_lens, train_sizes
+
+
+def _plot_umap(
+	sample,
+	num_classes: int,
+	dataset_index: int,
+	output_dir: Path,
+	seed: int,
+	rf_accuracy: float,
+	umap_n_neighbors: int,
+	umap_n_epochs: int,
+) -> None:
+	"""Plot train and test representations before the soft-kNN layer side by side."""
 	try:
+		import matplotlib
+		matplotlib.use("Agg", force=True)
 		import matplotlib.pyplot as plt
 	except ImportError as exc:  # pragma: no cover - runtime dependency
 		raise ModuleNotFoundError("matplotlib is required for UMAP plots") from exc
@@ -125,46 +179,72 @@ def _plot_umap(sample, num_classes: int, dataset_index: int, output_dir: Path, s
 
 	representations = sample.repr_full.numpy()
 	labels = sample.y_full.numpy().astype(int)
-	balanced_accuracy = _balanced_accuracy(
+	train_size = sample.train_size
+	train_representations, test_representations = (
+		representations[:train_size],
+		representations[train_size:],
+	)
+	train_labels, test_labels = labels[:train_size], labels[train_size:]
+	tabicl_accuracy = _balanced_accuracy(
 		sample.y_true_test.numpy().astype(int), sample.y_pred_test.numpy().astype(int)
 	)
-	if representations.shape[0] < 3:
+	if train_representations.shape[0] < 3 or test_representations.shape[0] < 3:
 		return
 
-	n_neighbors = min(15, representations.shape[0] - 1)
+	# Fit one embedding jointly so train/test coordinates are comparable. This
+	# also halves the expensive UMAP optimization work. A single worker avoids
+	# joblib worker teardown issues in headless Python 3.14 runs.
+	n_neighbors = min(umap_n_neighbors, representations.shape[0] - 1)
 	embeddings = UMAP(
 		n_components=2,
 		n_neighbors=n_neighbors,
 		min_dist=0.1,
 		metric="euclidean",
-		random_state=seed,
+		n_epochs=umap_n_epochs,
+		# Avoid joblib worker teardown issues in headless Python 3.14 runs.
+		n_jobs=1,
+		random_state=None,
 	).fit_transform(representations)
+	train_embedding, test_embedding = embeddings[:train_size], embeddings[train_size:]
 
-	fig, ax = plt.subplots(figsize=(7, 6), dpi=150)
-	scatter = ax.scatter(
-		embeddings[:, 0],
-		embeddings[:, 1],
-		c=labels,
-		cmap="tab10",
-		s=16,
-		alpha=0.8,
+	fig, axes = plt.subplots(1, 2, figsize=(12, 5), dpi=150, constrained_layout=True)
+	all_labels = np.concatenate((train_labels, test_labels))
+	label_min, label_max = all_labels.min(), all_labels.max()
+	if label_min == label_max:
+		label_min -= 0.5
+		label_max += 0.5
+	for ax, embedding, partition_labels, title in zip(
+		axes,
+		(train_embedding, test_embedding),
+		(train_labels, test_labels),
+		("Training", "Test"),
+	):
+		scatter = ax.scatter(
+			embedding[:, 0],
+			embedding[:, 1],
+			c=partition_labels,
+			cmap="tab10",
+			vmin=label_min,
+			vmax=label_max,
+			s=16,
+			alpha=0.8,
+		)
+		ax.set(title=title, xlabel="UMAP-1", ylabel="UMAP-2")
+		ax.grid(alpha=0.2)
+
+	fig.colorbar(
+		scatter,
+		ax=axes,
+		orientation="horizontal",
+		location="bottom",
+		label="Class label",
+		pad=0.12,
+		fraction=0.08,
 	)
-	fig.colorbar(scatter, ax=ax, label="Class label")
-	ax.set(
-		title=f"TabICL sample representations before soft-kNN (K={num_classes}, dataset={dataset_index})",
-		xlabel="UMAP-1",
-		ylabel="UMAP-2",
+	fig.suptitle(
+		f"TabICL representations before soft-kNN (K={num_classes}, dataset={dataset_index})\n"
+		f"TabICL accuracy: {tabicl_accuracy:.3f} | RF accuracy: {rf_accuracy:.3f}"
 	)
-	ax.text(
-		0.02,
-		0.98,
-		f"Balanced accuracy: {balanced_accuracy:.3f}",
-		transform=ax.transAxes,
-		va="top",
-		bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "none"},
-	)
-	ax.grid(alpha=0.2)
-	fig.tight_layout()
 	output_dir.mkdir(parents=True, exist_ok=True)
 	fig.savefig(output_dir / f"umap_k{num_classes}_dataset{dataset_index:05d}.png")
 	plt.close(fig)
@@ -189,6 +269,8 @@ def _evaluate_class_count(model, args: argparse.Namespace, num_classes: int, dev
 	processed = 0
 	while processed < args.num_datasets:
 		batch = _as_regular_tensors(prior.get_batch())
+		if args.normalize_features:
+			batch = _normalize_features(batch)
 		for index in range(int(batch[0].shape[0])):
 			if processed >= args.num_datasets:
 				break
@@ -197,7 +279,27 @@ def _evaluate_class_count(model, args: argparse.Namespace, num_classes: int, dev
 			# backend exactly as represented by the supplied checkpoint.
 			sample = _evaluate_one_dataset(model, "tabicl", batch, index, device)
 			if args.skip_baselines:
-				_plot_umap(sample, num_classes, processed, args.output_dir / "umap", args.seed + processed)
+				x = sample.x.numpy()
+				y = sample.y_full.numpy().astype(int)
+				train_size = sample.train_size
+				random_forest = BASELINE_FACTORIES["random_forest"](
+					args.seed + processed, args.rf_n_estimators
+				)
+				random_forest.fit(
+					np.nan_to_num(x[:train_size]), y[:train_size]
+				)
+				rf_prediction = random_forest.predict(np.nan_to_num(x[train_size:])).astype(int)
+				rf_accuracy = _balanced_accuracy(y[train_size:], rf_prediction)
+				_plot_umap(
+					sample,
+					num_classes,
+					processed,
+					args.output_dir / "umap",
+					args.seed + processed,
+					rf_accuracy,
+					args.umap_n_neighbors,
+					args.umap_n_epochs,
+				)
 				processed += 1
 				continue
 
@@ -217,7 +319,7 @@ def _evaluate_class_count(model, args: argparse.Namespace, num_classes: int, dev
 				)
 			}
 			for name, factory in BASELINE_FACTORIES.items():
-				baseline = factory(args.seed + processed)
+				baseline = factory(args.seed + processed, args.rf_n_estimators)
 				# RF versions differ in NaN support; replacing non-finite
 				# values keeps this baseline portable across sklearn versions.
 				baseline.fit(np.nan_to_num(x_train), y_train)
@@ -243,6 +345,8 @@ def _evaluate_class_count(model, args: argparse.Namespace, num_classes: int, dev
 
 
 def _plot_results(rows: list[dict], output_dir: Path) -> None:
+	import matplotlib
+	matplotlib.use("Agg", force=True)
 	import matplotlib.pyplot as plt
 
 	output_dir.mkdir(parents=True, exist_ok=True)
@@ -252,6 +356,7 @@ def _plot_results(rows: list[dict], output_dir: Path) -> None:
 
 	for num_classes, class_rows in sorted(by_classes.items()):
 		for score_name in dict.fromkeys(row["score"] for row in class_rows):
+			print(f"Making plots for K={num_classes}, score={score_name}")
 			score_ylim = 2.3 if score_name == "cross_entropy" else 1
 			score_rows = [row for row in class_rows if row["score"] == score_name]
 			models = list(dict.fromkeys(row["model"] for row in score_rows))
@@ -260,7 +365,8 @@ def _plot_results(rows: list[dict], output_dir: Path) -> None:
 				for model in models
 			}
 
-			fig, ax = plt.subplots(figsize=(7, 5), dpi=150)
+			print(f"Bar Plots")
+			fig, ax = plt.subplots(figsize=(7, 5))
 			means = [values[model].mean() for model in models]
 			stds = [values[model].std() for model in models]
 			ax.bar(models, means, yerr=stds, capsize=5, color=["#4472C4", "#ED7D31"][:len(models)])
@@ -271,7 +377,8 @@ def _plot_results(rows: list[dict], output_dir: Path) -> None:
 			plt.close(fig)
 
 			tabicl = values["tabicl"]
-			fig, ax = plt.subplots(figsize=(6, 6), dpi=150)
+			fig, ax = plt.subplots(figsize=(6, 6))
+			print(f"Scatter Plots")
 			for baseline in (model for model in models if model != "tabicl"):
 				baseline_values = values[baseline]
 				ax.scatter(tabicl, baseline_values, s=18, alpha=0.45, label=baseline)
@@ -289,7 +396,8 @@ def _plot_results(rows: list[dict], output_dir: Path) -> None:
 			fig.savefig(output_dir / f"scatter_{score_name}_k{num_classes}.png")
 			plt.close(fig)
 
-			fig, ax = plt.subplots(figsize=(7, 5), dpi=150)
+			fig, ax = plt.subplots(figsize=(7, 5))
+			print(f"Feature Count Plots")
 			for model in models:
 				feature_counts = np.asarray([
 					row["n_features"] for row in score_rows if row["model"] == model
@@ -312,6 +420,12 @@ def main() -> None:
 	args = build_parser().parse_args()
 	if args.num_datasets < 1:
 		raise ValueError("--num-datasets must be positive")
+	if args.rf_n_estimators < 1:
+		raise ValueError("--rf-n-estimators must be positive")
+	if args.umap_n_neighbors < 2:
+		raise ValueError("--umap-n-neighbors must be at least 2")
+	if args.umap_n_epochs < 1:
+		raise ValueError("--umap-n-epochs must be positive")
 	if args.max_seq_len < 2:
 		raise ValueError("--max-seq-len must be at least 2")
 	if args.plot_results_only:
@@ -334,13 +448,15 @@ def main() -> None:
 		raise ValueError("The checkpoint must contain a TabICL model with icl_backend='graph'.")
 
 	rows = []
-	for num_classes in range(2, 11):
+	for num_classes in range(2, 5):
+		print(f"Evaluating {args.num_datasets} datasets for K={num_classes}...")
 		rows.extend(_evaluate_class_count(model, args, num_classes, device))
 	if args.skip_baselines:
 		print(f"Generated UMAP plots for {args.num_datasets} datasets for each K=2,...,10")
 		print(f"Saved UMAP plots to {args.output_dir / 'umap'}")
 		return
 
+	print(f"Making plots")
 	output_dir = args.output_dir
 	results_output = args.results_output or output_dir / "results.json"
 	results_output.parent.mkdir(parents=True, exist_ok=True)
