@@ -49,13 +49,13 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --max_seq_len 1024 \
             --min_train_size 0.1 \
             --max_train_size 0.6 \
-            --embed_dim 128 \
+            --embed_dim 256 \
             --col_num_blocks 3 \
             --col_nhead 8 \
             --col_num_inds 128 \
             --row_num_blocks 3 \
             --row_nhead 8 \
-            --row_num_cls 4 \
+            --row_num_cls 1 \
             --row_rope_base 100000 \
             --icl_num_blocks 10 \
             --icl_nhead 8 \

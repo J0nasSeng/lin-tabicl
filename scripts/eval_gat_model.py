@@ -34,6 +34,7 @@ SCORES: dict[str, Callable[[np.ndarray, np.ndarray, np.ndarray, np.ndarray], flo
 	"cross_entropy": lambda y_true, _y_pred, y_proba, labels: _cross_entropy(
 		y_true, y_proba, labels
 	),
+	"entropy": lambda _y_true, _y_pred, y_proba, _labels: _mean_entropy(y_proba),
 }
 
 
@@ -65,12 +66,37 @@ def _balanced_accuracy(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 def _cross_entropy(
 	y_true: np.ndarray, y_proba: np.ndarray, labels: np.ndarray
 ) -> float:
-	"""Compute cross entropy while accounting for classes absent during fitting."""
-	all_labels = np.unique(np.concatenate((y_true, np.asarray(labels))))
-	probabilities = np.zeros((y_proba.shape[0], all_labels.size), dtype=y_proba.dtype)
-	columns = np.searchsorted(all_labels, labels)
-	probabilities[:, columns] = y_proba
-	return float(log_loss(y_true, probabilities, labels=all_labels))
+	"""Compute cross entropy for the supplied, shared class support."""
+	y_proba = _normalize_probabilities(y_proba)
+	return float(log_loss(y_true, y_proba, labels=np.asarray(labels)))
+
+
+def _has_complete_label_support(y_train: np.ndarray, y_test: np.ndarray) -> bool:
+	"""Return whether every test label is represented in the training labels."""
+	return np.isin(np.unique(y_test), np.unique(y_train)).all()
+
+
+def _normalize_probabilities(y_proba: np.ndarray) -> np.ndarray:
+	"""Convert finite nonnegative scores into row-normalized probabilities."""
+	probabilities = np.asarray(y_proba, dtype=np.float64)
+	probabilities = np.nan_to_num(probabilities, nan=0.0, posinf=0.0, neginf=0.0)
+	probabilities = np.clip(probabilities, 0.0, None)
+	row_sums = probabilities.sum(axis=1, keepdims=True)
+	zero_rows = row_sums.squeeze(1) <= 0
+	if np.any(zero_rows):
+		probabilities[zero_rows] = 1.0 / probabilities.shape[1]
+		row_sums = probabilities.sum(axis=1, keepdims=True)
+	return probabilities / row_sums
+
+
+def _mean_entropy(y_proba: np.ndarray) -> float:
+	"""Compute the mean predictive entropy over test rows."""
+	probabilities = _normalize_probabilities(y_proba)
+	positive = probabilities > 0
+	entropy_terms = np.zeros_like(probabilities)
+	entropy_terms[positive] = -probabilities[positive] * np.log(probabilities[positive])
+	entropy = entropy_terms.sum(axis=1)
+	return float(entropy.mean())
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -98,6 +124,12 @@ def build_parser() -> argparse.ArgumentParser:
 		type=int,
 		default=50,
 		help="Number of RF trees per dataset; lower values speed up diagnostics (default: 50)",
+	)
+	parser.add_argument(
+		"--pretrained-tabicl-n-estimators",
+		type=int,
+		default=1,
+		help="Number of ensemble members for the pretrained TabICL baseline (default: 8)",
 	)
 	parser.add_argument(
 		"--umap-n-neighbors",
@@ -154,6 +186,26 @@ def _normalize_features(batch: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, 
 	return x, y, d, seq_lens, train_sizes
 
 
+def _build_pretrained_tabicl(n_estimators: int, device: str, seed: int):
+	"""Build the pretrained sklearn-compatible TabICL baseline.
+
+	The checkpoint is downloaded automatically on the first ``fit`` when it is
+	not already present in the Hugging Face cache, as documented in README.md.
+	"""
+	try:
+		from tabicl import TabICLClassifier
+	except ImportError as exc:  # pragma: no cover - package import failure
+		raise ModuleNotFoundError("The pretrained TabICL baseline requires tabicl.") from exc
+
+	return TabICLClassifier(
+		n_estimators=n_estimators,
+		device=device,
+		random_state=seed,
+		n_jobs=1,
+		verbose=False,
+	)
+
+
 def _plot_umap(
 	sample,
 	num_classes: int,
@@ -161,6 +213,7 @@ def _plot_umap(
 	output_dir: Path,
 	seed: int,
 	rf_accuracy: float,
+	tabicl_entropy: float,
 	umap_n_neighbors: int,
 	umap_n_epochs: int,
 ) -> None:
@@ -243,7 +296,8 @@ def _plot_umap(
 	)
 	fig.suptitle(
 		f"TabICL representations before soft-kNN (K={num_classes}, dataset={dataset_index})\n"
-		f"TabICL accuracy: {tabicl_accuracy:.3f} | RF accuracy: {rf_accuracy:.3f}"
+		f"TabICL accuracy: {tabicl_accuracy:.3f} | RF accuracy: {rf_accuracy:.3f} | "
+		f"TabICL predictive entropy: {tabicl_entropy:.3f}"
 	)
 	output_dir.mkdir(parents=True, exist_ok=True)
 	fig.savefig(output_dir / f"umap_k{num_classes}_dataset{dataset_index:05d}.png")
@@ -266,6 +320,11 @@ def _evaluate_class_count(model, args: argparse.Namespace, num_classes: int, dev
 	)
 
 	rows: list[dict] = []
+	pretrained_tabicl = _build_pretrained_tabicl(
+		args.pretrained_tabicl_n_estimators,
+		device,
+		args.seed,
+	)
 	processed = 0
 	while processed < args.num_datasets:
 		batch = _as_regular_tensors(prior.get_batch())
@@ -277,11 +336,22 @@ def _evaluate_class_count(model, args: argparse.Namespace, num_classes: int, dev
 
 			# The direct model path is intentional: it exercises the graph
 			# backend exactly as represented by the supplied checkpoint.
+			seq_len = int(batch[3][index].item())
+			train_size = int(batch[4][index].item())
+			y = batch[1][index, :seq_len].numpy().astype(int)
+			y_train, y_test = y[:train_size], y[train_size:]
+			if not _has_complete_label_support(y_train, y_test):
+				# Such a dataset cannot be evaluated fairly because a classifier
+				# fitted on the training split has no probability column for the
+				# unseen test label.
+				processed += 1
+				continue
+
 			sample = _evaluate_one_dataset(model, "tabicl", batch, index, device)
+			x = sample.x.numpy()
+			train_size = sample.train_size
+
 			if args.skip_baselines:
-				x = sample.x.numpy()
-				y = sample.y_full.numpy().astype(int)
-				train_size = sample.train_size
 				random_forest = BASELINE_FACTORIES["random_forest"](
 					args.seed + processed, args.rf_n_estimators
 				)
@@ -290,6 +360,11 @@ def _evaluate_class_count(model, args: argparse.Namespace, num_classes: int, dev
 				)
 				rf_prediction = random_forest.predict(np.nan_to_num(x[train_size:])).astype(int)
 				rf_accuracy = _balanced_accuracy(y[train_size:], rf_prediction)
+				if getattr(model.icl_predictor, "decoder_type", None) == "soft_kmeans":
+					tabicl_scores = sample.y_logits_test.float().numpy()
+				else:
+					tabicl_scores = torch.softmax(sample.y_logits_test.float(), dim=-1).numpy()
+				tabicl_entropy = _mean_entropy(tabicl_scores)
 				_plot_umap(
 					sample,
 					num_classes,
@@ -297,20 +372,23 @@ def _evaluate_class_count(model, args: argparse.Namespace, num_classes: int, dev
 					args.output_dir / "umap",
 					args.seed + processed,
 					rf_accuracy,
+					tabicl_entropy,
 					args.umap_n_neighbors,
 					args.umap_n_epochs,
 				)
 				processed += 1
 				continue
 
-			x = sample.x.numpy()
-			y = sample.y_full.numpy().astype(int)
-			train_size = sample.train_size
 			n_features = x.shape[1]
 			x_train, x_test = x[:train_size], x[train_size:]
-			y_train, y_test = y[:train_size], y[train_size:]
 
-			tabicl_proba = torch.softmax(sample.y_logits_test, dim=-1).numpy()
+			if getattr(model.icl_predictor, "decoder_type", None) == "soft_kmeans":
+				# soft-kmeans already returns class masses from a softmax over
+				# train-row similarities; applying another softmax is incorrect.
+				tabicl_scores = sample.y_logits_test.float().numpy()
+			else:
+				tabicl_scores = torch.softmax(sample.y_logits_test.float(), dim=-1).numpy()
+			tabicl_proba = _normalize_probabilities(tabicl_scores)
 			predictions = {
 				"tabicl": (
 					sample.y_pred_test.numpy().astype(int),
@@ -328,6 +406,16 @@ def _evaluate_class_count(model, args: argparse.Namespace, num_classes: int, dev
 					baseline.predict_proba(np.nan_to_num(x_test)),
 					baseline.classes_,
 				)
+
+			# Use the public sklearn-compatible API so the pretrained model applies
+			# its own documented preprocessing, ensemble averaging, and label mapping.
+			pretrained_tabicl.fit(x_train, y_train)
+			pretrained_proba = pretrained_tabicl.predict_proba(x_test)
+			predictions["pretrained_tabicl"] = (
+				pretrained_tabicl.classes_[np.argmax(pretrained_proba, axis=1)].astype(int),
+				pretrained_proba,
+				pretrained_tabicl.classes_,
+			)
 
 			for model_name, (prediction, probabilities, class_labels) in predictions.items():
 				for score_name, score_fn in SCORES.items():
@@ -357,7 +445,7 @@ def _plot_results(rows: list[dict], output_dir: Path) -> None:
 	for num_classes, class_rows in sorted(by_classes.items()):
 		for score_name in dict.fromkeys(row["score"] for row in class_rows):
 			print(f"Making plots for K={num_classes}, score={score_name}")
-			score_ylim = 2.3 if score_name == "cross_entropy" else 1
+			score_ylim = 2.3 if score_name in {"cross_entropy", "entropy"} else 1
 			score_rows = [row for row in class_rows if row["score"] == score_name]
 			models = list(dict.fromkeys(row["model"] for row in score_rows))
 			values = {
@@ -369,7 +457,13 @@ def _plot_results(rows: list[dict], output_dir: Path) -> None:
 			fig, ax = plt.subplots(figsize=(7, 5))
 			means = [values[model].mean() for model in models]
 			stds = [values[model].std() for model in models]
-			ax.bar(models, means, yerr=stds, capsize=5, color=["#4472C4", "#ED7D31"][:len(models)])
+			ax.bar(
+				models,
+				means,
+				yerr=stds,
+				capsize=5,
+				color=["#4472C4", "#ED7D31", "#70AD47"][:len(models)],
+			)
 			ax.set(title=f"K={num_classes}: mean {score_name}", ylabel=score_name, ylim=(0, score_ylim))
 			ax.grid(axis="y", alpha=0.25)
 			fig.tight_layout()
@@ -415,6 +509,65 @@ def _plot_results(rows: list[dict], output_dir: Path) -> None:
 			fig.savefig(output_dir / f"features_vs_{score_name}_k{num_classes}.png")
 			plt.close(fig)
 
+		accuracy_rows = [row for row in class_rows if row["score"] == "balanced_accuracy"]
+		entropy_rows = [row for row in class_rows if row["score"] == "entropy"]
+		cross_entropy_rows = [row for row in class_rows if row["score"] == "cross_entropy"]
+		if accuracy_rows and entropy_rows:
+			accuracy = {
+				(row["model"], row["dataset"]): row["value"] for row in accuracy_rows
+			}
+			entropy = {
+				(row["model"], row["dataset"]): row["value"] for row in entropy_rows
+			}
+			tabicl_pairs = [
+				(uncertainty, accuracy[key])
+				for key, uncertainty in entropy.items()
+				if key[0] == "tabicl" and key in accuracy
+			]
+			if tabicl_pairs:
+				entropy_values, accuracy_values = map(np.asarray, zip(*tabicl_pairs))
+				fig, ax = plt.subplots(figsize=(6, 5))
+				ax.scatter(entropy_values, accuracy_values, s=18, alpha=0.45, label="tabicl")
+				ax.set(
+					title=f"K={num_classes}: TabICL accuracy versus entropy",
+					xlabel="Mean predictive entropy",
+					ylabel="Balanced accuracy",
+					ylim=(0, 1),
+				)
+				ax.grid(alpha=0.25)
+				ax.legend()
+				fig.tight_layout()
+				fig.savefig(output_dir / f"tabicl_accuracy_vs_entropy_k{num_classes}.png")
+				plt.close(fig)
+
+		if accuracy_rows and cross_entropy_rows:
+			accuracy = {
+				(row["model"], row["dataset"]): row["value"] for row in accuracy_rows
+			}
+			cross_entropy = {
+				(row["model"], row["dataset"]): row["value"] for row in cross_entropy_rows
+			}
+			tabicl_pairs = [
+				(cross_entropy_value, accuracy[key])
+				for key, cross_entropy_value in cross_entropy.items()
+				if key[0] == "tabicl" and key in accuracy
+			]
+			if tabicl_pairs:
+				cross_entropy_values, accuracy_values = map(np.asarray, zip(*tabicl_pairs))
+				fig, ax = plt.subplots(figsize=(6, 5))
+				ax.scatter(cross_entropy_values, accuracy_values, s=18, alpha=0.45, label="tabicl")
+				ax.set(
+					title=f"K={num_classes}: TabICL accuracy versus cross entropy",
+					xlabel="Cross entropy",
+					ylabel="Balanced accuracy",
+					ylim=(0, 1),
+				)
+				ax.grid(alpha=0.25)
+				ax.legend()
+				fig.tight_layout()
+				fig.savefig(output_dir / f"tabicl_accuracy_vs_cross_entropy_k{num_classes}.png")
+				plt.close(fig)
+
 
 def main() -> None:
 	args = build_parser().parse_args()
@@ -422,6 +575,8 @@ def main() -> None:
 		raise ValueError("--num-datasets must be positive")
 	if args.rf_n_estimators < 1:
 		raise ValueError("--rf-n-estimators must be positive")
+	if args.pretrained_tabicl_n_estimators < 1:
+		raise ValueError("--pretrained-tabicl-n-estimators must be positive")
 	if args.umap_n_neighbors < 2:
 		raise ValueError("--umap-n-neighbors must be at least 2")
 	if args.umap_n_epochs < 1:
@@ -448,7 +603,7 @@ def main() -> None:
 		raise ValueError("The checkpoint must contain a TabICL model with icl_backend='graph'.")
 
 	rows = []
-	for num_classes in range(2, 5):
+	for num_classes in range(2, 11):
 		print(f"Evaluating {args.num_datasets} datasets for K={num_classes}...")
 		rows.extend(_evaluate_class_count(model, args, num_classes, device))
 	if args.skip_baselines:

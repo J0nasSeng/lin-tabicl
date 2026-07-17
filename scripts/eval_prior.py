@@ -34,8 +34,8 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--min-features", type=int, default=2)
 	parser.add_argument("--max-features", type=int, default=100)
 	parser.add_argument("--min-seq-len", type=int, default=None)
-	parser.add_argument("--max-seq-len", type=int, default=512)
-	parser.add_argument("--min-train-size", type=float, default=0.1)
+	parser.add_argument("--max-seq-len", type=int, default=1024)
+	parser.add_argument("--min-train-size", type=float, default=0.3)
 	parser.add_argument("--max-train-size", type=float, default=0.9)
 	parser.add_argument(
 		"--prior-type",
@@ -125,31 +125,29 @@ def evaluate_prior(args: argparse.Namespace) -> dict[int, list[float]]:
 
 
 def plot_histograms(scores_by_k: dict[int, list[float]], output: Path) -> None:
-	"""Save overlaid accuracy histograms, one distribution for every K."""
+	"""Save one accuracy histogram image for every K."""
 	output.parent.mkdir(parents=True, exist_ok=True)
-	fig, ax = plt.subplots(figsize=(10, 6), dpi=150)
-	bins = np.linspace(0.0, 1.0, 21)
+	bins = np.linspace(0.0, 1.0, 41)
 	for num_classes, scores in scores_by_k.items():
+		fig, ax = plt.subplots(figsize=(10, 6), dpi=150)
 		ax.hist(
 			scores,
 			bins=bins,
-			alpha=0.35,
 			density=False,
-			label=f"K={num_classes}",
 			edgecolor="black",
 			linewidth=0.4,
 		)
-	ax.set(
-		title="Random-forest balanced accuracy on prior datasets",
-		xlabel="Balanced accuracy",
-		ylabel="Number of datasets",
-		xlim=(0.0, 1.0),
-	)
-	ax.grid(axis="y", alpha=0.25)
-	ax.legend(ncol=3)
-	fig.tight_layout()
-	fig.savefig(output)
-	plt.close(fig)
+		ax.set(
+			title=f"Random-forest balanced accuracy on prior datasets (K={num_classes})",
+			xlabel="Balanced accuracy",
+			ylabel="Number of datasets",
+			xlim=(0.0, 1.0),
+		)
+		ax.grid(axis="y", alpha=0.25)
+		fig.tight_layout()
+		output_path = output.with_name(f"{output.stem}_k{num_classes}{output.suffix}")
+		fig.savefig(output_path)
+		plt.close(fig)
 
 
 def main() -> None:

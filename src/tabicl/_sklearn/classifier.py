@@ -409,7 +409,7 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
         assert "state_dict" in checkpoint, "The checkpoint doesn't contain the model state."
 
         self.model_path_ = model_path_
-        self.model_ = TabICL(**checkpoint["config"])
+        self.model_ = TabICL(**checkpoint["config"], icl_backend='encoder')
         self.model_config_ = checkpoint["config"]
         self.model_.load_state_dict(checkpoint["state_dict"])
         self.model_.eval()

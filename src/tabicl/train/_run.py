@@ -653,6 +653,7 @@ class Trainer:
             if self.wandb_run is not None:
                 # Add learning rate to results
                 results["lr"] = self.scheduler.get_last_lr()[0]
+                results.update(self._get_gat_alpha_metrics())
                 wandb_step = int(self.curr_step)
                 run_step = getattr(self.wandb_run, "step", None)
                 if isinstance(run_step, int):
@@ -664,6 +665,25 @@ class Trainer:
     def _should_log_conf_mat_now(self) -> bool:
         log_every = int(getattr(self.config, "log_conf_mat_every", 100))
         return log_every > 0 and ((self.curr_step + 1) % log_every == 0)
+
+    def _get_gat_alpha_metrics(self) -> dict[str, float]:
+        """Return effective residual strengths for all GAT layers.
+
+        ``GraphMultiheadAttention.alpha`` is stored as an unconstrained logit;
+        the forward pass uses ``sigmoid(alpha)``. Log the effective coefficient
+        used by the network rather than the underlying parameter so the W&B
+        plots directly show the residual/attention mixing strength.
+        """
+        if getattr(self.raw_model, "icl_backend", None) != "graph":
+            return {}
+
+        graph_blocks = getattr(getattr(self.raw_model, "icl_predictor", None), "gat_icl", None)
+        graph_blocks = getattr(graph_blocks, "graph_blocks", ())
+        return {
+            f"gat/graph_block_{layer_idx}/alpha": float(torch.sigmoid(block.attn.alpha).detach().cpu())
+            for layer_idx, block in enumerate(graph_blocks)
+            if hasattr(getattr(block, "attn", None), "alpha")
+        }
 
     def _prepare_padded_batch(self, batch):
         return [t.to_padded_tensor(padding=0.0) if t.is_nested else t for t in batch]

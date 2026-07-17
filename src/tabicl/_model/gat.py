@@ -28,7 +28,7 @@ class GraphMultiheadAttention(nn.Module):
         self.v_proj = nn.Linear(d_model, d_model)
         self.out_proj = nn.Linear(d_model, d_model)
         self.dropout = nn.Dropout(dropout)
-        self.alpha = nn.Parameter(torch.logit(torch.tensor(0.05, dtype=torch.float32)))
+        self.alpha = nn.Parameter(torch.logit(torch.tensor(0.2, dtype=torch.float32)))
         self.max_parallel_edges = int(max_parallel_edges)
 
         nn.init.xavier_uniform_(self.out_proj.weight)
