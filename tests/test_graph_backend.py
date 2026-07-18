@@ -209,6 +209,105 @@ def test_iclearning_soft_kmeans_decoder_forward_shape():
     assert torch.isfinite(pre).all()
 
 
+def test_iclearning_rbf_decoder_matches_reference_and_normalizes():
+    torch.manual_seed(3)
+    batch_size = 2
+    train_size = 6
+    total_nodes = 9
+    max_classes = 5
+    temperature = 0.7
+    y_train = torch.tensor(
+        [[0, 1, 0, 2, 1, 2], [2, 0, 1, 2, 0, 1]], dtype=torch.long
+    )
+    src = torch.randn(batch_size, total_nodes, 8, requires_grad=True)
+    model = ICLearning(
+        max_classes=max_classes,
+        out_dim=max_classes,
+        d_model=8,
+        num_blocks=1,
+        nhead=2,
+        dim_feedforward=16,
+        icl_backend="encoder",
+        decoder_type="rbf",
+        soft_kmeans_temperature=temperature,
+    )
+
+    log_probs = model._rbf_decoder(src, y_train, train_size)
+    probs = log_probs.exp()
+    assert log_probs.shape == (batch_size, total_nodes, max_classes)
+    assert torch.isfinite(log_probs).all()
+    assert torch.all(probs >= 0)
+    assert torch.allclose(probs.sum(dim=-1), torch.ones(batch_size, total_nodes), atol=1e-6)
+
+    src_float = src.float()
+    train = src_float[:, :train_size]
+    sq_dist = (
+        src_float.square().sum(dim=-1, keepdim=True)
+        + train.square().sum(dim=-1, keepdim=True).transpose(1, 2)
+        - 2 * torch.matmul(src_float, train.transpose(1, 2))
+    ).clamp_min(0)
+    assign = torch.softmax(-sq_dist / (2 * (temperature * src.shape[-1] ** 0.5) ** 2), dim=-1)
+    reference = torch.zeros(batch_size, total_nodes, max_classes)
+    for batch_index in range(batch_size):
+        for class_index in range(max_classes):
+            class_rows = y_train[batch_index] == class_index
+            reference[batch_index, :, class_index] = assign[batch_index, :, class_rows].sum(dim=-1)
+    assert torch.allclose(probs, reference, atol=1e-6)
+
+    (-log_probs[:, train_size:].gather(-1, y_train[:, : total_nodes - train_size].unsqueeze(-1))).mean().backward()
+    assert src.grad is not None
+    assert torch.isfinite(src.grad).all()
+
+
+def test_iclearning_rbf_decoder_rejects_nonpositive_temperature():
+    with pytest.raises(ValueError, match="soft_kmeans_temperature must be > 0"):
+        ICLearning(
+            max_classes=3,
+            out_dim=3,
+            d_model=8,
+            num_blocks=1,
+            nhead=2,
+            dim_feedforward=16,
+            icl_backend="encoder",
+            decoder_type="rbf",
+            soft_kmeans_temperature=0,
+        )
+
+
+def test_iclearning_euclidean_decoder_matches_reference():
+    torch.manual_seed(4)
+    y_train = torch.tensor([[0, 1, 0, 2]], dtype=torch.long)
+    src = torch.randn(1, 6, 8, requires_grad=True)
+    model = ICLearning(
+        max_classes=4,
+        out_dim=4,
+        d_model=8,
+        num_blocks=1,
+        nhead=2,
+        dim_feedforward=16,
+        icl_backend="encoder",
+        decoder_type="euclidean",
+    )
+
+    log_probabilities = model._euclidean_decoder(src, y_train, train_size=4)
+    probabilities = log_probabilities.exp()
+    src_normalized = torch.nn.functional.normalize(src.float(), p=2, dim=-1)
+    train_normalized = torch.nn.functional.normalize(src[:, :4].float(), p=2, dim=-1)
+    distances = torch.cdist(src_normalized, train_normalized, p=2).clamp_min(
+        torch.sqrt(torch.finfo(torch.float32).eps)
+    )
+    assignments = torch.softmax(-distances / model.soft_kmeans_temperature, dim=-1)
+    reference = torch.zeros_like(probabilities)
+    for class_index in range(model.max_classes):
+        reference[:, :, class_index] = assignments[:, :, y_train[0] == class_index].sum(dim=-1)
+
+    assert torch.allclose(probabilities, reference, atol=1e-6)
+    assert torch.allclose(probabilities.sum(dim=-1), torch.ones(1, 6), atol=1e-6)
+    (-log_probabilities[:, 4:, 0]).mean().backward()
+    assert src.grad is not None
+    assert torch.isfinite(src.grad).all()
+
+
 def test_graph_builder_shared_graph_when_labels_identical():
     batch_size = 3
     train_size = 15

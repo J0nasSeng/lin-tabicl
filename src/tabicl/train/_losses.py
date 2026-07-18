@@ -62,18 +62,23 @@ def supervised_contrastive_loss(
     return loss.to(dtype=embeddings.dtype)
 
 
-def entropy_regularizer(logits: Tensor) -> Tensor:
-    """Compute mean predictive entropy over a logits tensor.
+def entropy_regularizer(values: Tensor, input_type: str = "logits") -> Tensor:
+    """Compute mean predictive entropy from logits or log probabilities.
 
-    The input is flattened to shape (N, C) and entropy is computed as
-    ``-sum(p * log(p))`` with softmax probabilities ``p``.
+    The input is flattened to shape (N, C). ``input_type`` must be ``"logits"``
+    or ``"log_probs"``.
     """
 
-    if logits.ndim < 2:
-        raise ValueError("logits must have at least 2 dimensions")
+    if values.ndim < 2:
+        raise ValueError("values must have at least 2 dimensions")
+    if input_type not in ("logits", "log_probs"):
+        raise ValueError("input_type must be 'logits' or 'log_probs'")
 
-    flat_logits = logits.reshape(-1, logits.shape[-1]).float()
-    log_probs = F.log_softmax(flat_logits, dim=-1)
+    flat_values = values.reshape(-1, values.shape[-1]).float()
+    log_probs = F.log_softmax(flat_values, dim=-1) if input_type == "logits" else flat_values
     probs = torch.exp(log_probs)
-    entropy = -(probs * log_probs).sum(dim=-1).mean()
-    return entropy.to(dtype=logits.dtype)
+    positive = probs > 0
+    entropy_terms = torch.zeros_like(probs)
+    entropy_terms[positive] = -probs[positive] * log_probs[positive]
+    entropy = entropy_terms.sum(dim=-1).mean()
+    return entropy.to(dtype=values.dtype)

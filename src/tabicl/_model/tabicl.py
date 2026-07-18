@@ -173,7 +173,7 @@ class TabICL(nn.Module):
         icl_num_blocks: int = 12,
         icl_nhead: int = 8,
         icl_backend: Literal["encoder", "graph"] = "graph",
-        icl_decoder_type: Literal["mlp", "soft_kmeans"] = "mlp",
+        icl_decoder_type: Literal["mlp", "soft_kmeans", "rbf", "euclidean"] = "mlp",
         icl_soft_kmeans_temperature: float = 0.1,
         graph_min_train_neighbors: int = 8,
         graph_max_train_neighbors: int = 15,

@@ -360,8 +360,8 @@ def _evaluate_class_count(model, args: argparse.Namespace, num_classes: int, dev
 				)
 				rf_prediction = random_forest.predict(np.nan_to_num(x[train_size:])).astype(int)
 				rf_accuracy = _balanced_accuracy(y[train_size:], rf_prediction)
-				if getattr(model.icl_predictor, "decoder_type", None) == "soft_kmeans":
-					tabicl_scores = sample.y_logits_test.float().numpy()
+				if getattr(model.icl_predictor, "decoder_type", None) in ("soft_kmeans", "rbf", "euclidean"):
+					tabicl_scores = sample.y_logits_test.float().exp().numpy()
 				else:
 					tabicl_scores = torch.softmax(sample.y_logits_test.float(), dim=-1).numpy()
 				tabicl_entropy = _mean_entropy(tabicl_scores)
@@ -382,10 +382,10 @@ def _evaluate_class_count(model, args: argparse.Namespace, num_classes: int, dev
 			n_features = x.shape[1]
 			x_train, x_test = x[:train_size], x[train_size:]
 
-			if getattr(model.icl_predictor, "decoder_type", None) == "soft_kmeans":
-				# soft-kmeans already returns class masses from a softmax over
-				# train-row similarities; applying another softmax is incorrect.
-				tabicl_scores = sample.y_logits_test.float().numpy()
+			if getattr(model.icl_predictor, "decoder_type", None) in ("soft_kmeans", "rbf", "euclidean"):
+				# Kernel decoders already return class masses; applying another
+				# softmax is incorrect.
+				tabicl_scores = sample.y_logits_test.float().exp().numpy()
 			else:
 				tabicl_scores = torch.softmax(sample.y_logits_test.float(), dim=-1).numpy()
 			tabicl_proba = _normalize_probabilities(tabicl_scores)
@@ -445,7 +445,7 @@ def _plot_results(rows: list[dict], output_dir: Path) -> None:
 	for num_classes, class_rows in sorted(by_classes.items()):
 		for score_name in dict.fromkeys(row["score"] for row in class_rows):
 			print(f"Making plots for K={num_classes}, score={score_name}")
-			score_ylim = 2.3 if score_name in {"cross_entropy", "entropy"} else 1
+			score_ylim = 4 if score_name in {"cross_entropy", "entropy"} else 1
 			score_rows = [row for row in class_rows if row["score"] == score_name]
 			models = list(dict.fromkeys(row["model"] for row in score_rows))
 			values = {
@@ -453,18 +453,20 @@ def _plot_results(rows: list[dict], output_dir: Path) -> None:
 				for model in models
 			}
 
-			print(f"Bar Plots")
+			print(f"Box Plots")
 			fig, ax = plt.subplots(figsize=(7, 5))
-			means = [values[model].mean() for model in models]
-			stds = [values[model].std() for model in models]
-			ax.bar(
-				models,
-				means,
-				yerr=stds,
-				capsize=5,
-				color=["#4472C4", "#ED7D31", "#70AD47"][:len(models)],
+			boxplot = ax.boxplot(
+				[values[model] for model in models],
+				labels=models,
+				patch_artist=True,
+				showmeans=True,
 			)
-			ax.set(title=f"K={num_classes}: mean {score_name}", ylabel=score_name, ylim=(0, score_ylim))
+			for patch, color in zip(
+				boxplot["boxes"], ["#4472C4", "#ED7D31", "#70AD47"][:len(models)]
+			):
+				patch.set_facecolor(color)
+				patch.set_alpha(0.75)
+			ax.set(title=f"K={num_classes}: {score_name} distribution", ylabel=score_name, ylim=(0, score_ylim))
 			ax.grid(axis="y", alpha=0.25)
 			fig.tight_layout()
 			fig.savefig(output_dir / f"bar_{score_name}_k{num_classes}.png")

@@ -93,8 +93,8 @@ class ICLearning(nn.Module):
         graph_same_label_ratio: float = 0.9,
         graph_cross_label_ratio: float = 0.1,
         graph_test_k_per_class: int = 8,
-        decoder_type: Literal["mlp", "soft_kmeans"] = "mlp",
-        soft_kmeans_temperature: float = 0.2,
+        decoder_type: Literal["mlp", "soft_kmeans", "rbf", "euclidean"] = "mlp",
+        soft_kmeans_temperature: float = 1.0,
         graph_seed: Optional[int] = None,
         graph_share_across_batch: bool = False,
         graph_share_require_identical_labels: bool = True,
@@ -120,8 +120,10 @@ class ICLearning(nn.Module):
         if self.icl_backend not in ("encoder", "graph"):
             raise ValueError(f"Unknown icl_backend={self.icl_backend}. Expected 'encoder' or 'graph'.")
 
-        if self.decoder_type not in ("mlp", "soft_kmeans"):
-            raise ValueError(f"Unknown decoder_type={self.decoder_type}. Expected 'mlp' or 'soft_kmeans'.")
+        if self.decoder_type not in ("mlp", "soft_kmeans", "rbf", "euclidean"):
+            raise ValueError(
+                f"Unknown decoder_type={self.decoder_type}. Expected 'mlp', 'soft_kmeans', 'rbf', or 'euclidean'."
+            )
 
         if self.soft_kmeans_temperature <= 0:
             raise ValueError("soft_kmeans_temperature must be > 0")
@@ -179,12 +181,28 @@ class ICLearning(nn.Module):
         enc_name = "tf_icl" if self.icl_backend == "encoder" else "gat_icl"
         self.inference_mgr = InferenceManager(enc_name=enc_name, out_dim=out_dim)
 
-    def _soft_kmeans_decoder(self, src: Tensor, y_train: Tensor, train_size: int) -> Tensor:
-        """Decode via train-to-all matching and label-mass accumulation.
+    def _aggregate_kernel_assignments(
+        self,
+        log_kernel: Tensor,
+        y_train: Tensor,
+    ) -> Tensor:
+        """Aggregate train-row kernel assignments into log probabilities."""
+        y_one_hot = F.one_hot(y_train.long(), num_classes=self.max_classes).bool()
+        class_mask = y_one_hot.unsqueeze(1)
+        log_class_mass = torch.logsumexp(
+            log_kernel.unsqueeze(-1).masked_fill(~class_mask, float("-inf")),
+            dim=2,
+        )
+        # A dataset may use fewer classes than max_classes. Give absent classes a
+        # finite machine-small mass so cross_entropy with label smoothing remains
+        # well-defined, then renormalize in log space.
+        log_floor = math.log(torch.finfo(log_class_mass.dtype).tiny)
+        return F.log_softmax(log_class_mass.clamp_min(log_floor), dim=-1)
 
-        Computes similarity from all positions to train positions, then projects
-        soft assignment mass into class logits via one-hot train labels.
-        """
+    def _soft_kmeans_decoder(
+        self, src: Tensor, y_train: Tensor, train_size: int
+    ) -> Tensor:
+        """Decode via train-to-all dot-product matching and class aggregation."""
 
         if self.max_classes <= 0:
             raise ValueError("soft_kmeans decoder is only supported for classification (max_classes > 0).")
@@ -193,20 +211,61 @@ class ICLearning(nn.Module):
 
         train_repr = src[:, :train_size, :]
 
-        # normalize before similarity computation
-        #src = F.normalize(src, p=2, dim=-1)
-        #train_repr = F.normalize(train_repr, p=2, dim=-1)
+        # Compute similarities and the row-wise assignment distribution in float32.
+        # Keeping this path in float32 avoids underflow before class aggregation.
+        src_float = src.float()
+        train_repr_float = train_repr.float()
+        sim = torch.matmul(src_float, train_repr_float.transpose(1, 2))
+        sim = sim / math.sqrt(src.shape[-1]) / self.soft_kmeans_temperature
+        log_assign = torch.log_softmax(sim, dim=-1)
 
-        sim = torch.matmul(src, train_repr.transpose(1, 2))
-        sim = sim / math.sqrt(src.shape[-1])
-        sim = sim / self.soft_kmeans_temperature
+        return self._aggregate_kernel_assignments(log_assign, y_train)
 
-        assign = torch.softmax(sim, dim=-1)
-        y_one_hot = F.one_hot(y_train.long(), num_classes=self.max_classes).to(dtype=src.dtype)
-        class_mass = torch.matmul(assign, y_one_hot)
+    def _rbf_decoder(
+        self, src: Tensor, y_train: Tensor, train_size: int
+    ) -> Tensor:
+        """Decode using an RBF kernel over train-row representations."""
 
-        # Return logits compatible with CE and downstream slicing behavior.
-        return class_mass
+        if self.max_classes <= 0:
+            raise ValueError("rbf decoder is only supported for classification (max_classes > 0).")
+        if train_size <= 0:
+            raise ValueError("rbf decoder requires train_size > 0")
+
+        d = torch.tensor(src.shape[-1], dtype=src.dtype, device=src.device)
+
+        train_repr = src[:, :train_size, :]
+        src_float = src.float()
+        train_repr_float = train_repr.float()
+        src_sq = torch.sum(src_float.square(), dim=-1, keepdim=True)
+        train_sq = torch.sum(train_repr_float.square(), dim=-1, keepdim=True).transpose(1, 2)
+        interaction = torch.matmul(src_float, train_repr_float.transpose(1, 2))
+        sq_dist = (src_sq + train_sq - 2.0 * interaction).clamp_min(0.0)
+        sim = -sq_dist / (2.0 * (self.soft_kmeans_temperature * torch.sqrt(d))**2)
+        log_assign = torch.log_softmax(sim, dim=-1)
+        return self._aggregate_kernel_assignments(log_assign, y_train)
+
+    def _euclidean_decoder(
+        self, src: Tensor, y_train: Tensor, train_size: int
+    ) -> Tensor:
+        """Decode using negative Euclidean distance to training representations."""
+
+        if self.max_classes <= 0:
+            raise ValueError("euclidean decoder is only supported for classification (max_classes > 0).")
+        if train_size <= 0:
+            raise ValueError("euclidean decoder requires train_size > 0")
+
+        train_repr = src[:, :train_size, :]
+        src_float = src.float()
+        train_repr_float = train_repr.float()
+        src_float = F.normalize(src_float, p=2, dim=-1)
+        train_repr_float = F.normalize(train_repr_float, p=2, dim=-1)
+        src_sq = torch.sum(src_float.square(), dim=-1, keepdim=True)
+        train_sq = torch.sum(train_repr_float.square(), dim=-1, keepdim=True).transpose(1, 2)
+        interaction = torch.matmul(src_float, train_repr_float.transpose(1, 2))
+        sq_dist = (src_sq + train_sq - 2.0 * interaction).clamp_min(0.0)
+        sim = -torch.sqrt(sq_dist.clamp_min(torch.finfo(src_float.dtype).eps))
+        log_assign = torch.log_softmax(sim / self.soft_kmeans_temperature, dim=-1)
+        return self._aggregate_kernel_assignments(log_assign, y_train)
 
     def _apply_icl_backbone(self, R: Tensor, train_size: int, y_train: Optional[Tensor] = None) -> Tensor:
         """Apply encoder ICL backbone."""
@@ -500,8 +559,12 @@ class ICLearning(nn.Module):
             src = self.ln(src)
         if self.decoder_type == "mlp":
             out = self.decoder(src)
-        else:
+        elif self.decoder_type == "soft_kmeans":
             out = self._soft_kmeans_decoder(src, y_train=y_train, train_size=train_size)
+        elif self.decoder_type == "rbf":
+            out = self._rbf_decoder(src, y_train=y_train, train_size=train_size)
+        else:
+            out = self._euclidean_decoder(src, y_train=y_train, train_size=train_size)
 
         if return_pre_decoder_repr:
             return out, src
@@ -560,7 +623,10 @@ class ICLearning(nn.Module):
         else:
             num_classes = len(torch.unique(y_train[0]))
             out = out[:, train_size:, :num_classes]
-            if not return_logits:
+            if self.decoder_type in ("soft_kmeans", "rbf", "euclidean"):
+                if not return_logits:
+                    out = out.exp()
+            elif not return_logits:
                 out = torch.softmax(out / softmax_temperature, dim=-1)
 
         return out
@@ -791,7 +857,10 @@ class ICLearning(nn.Module):
                 if self.max_classes > 0:
                     num_classes = len(torch.unique(y_train[0]))
                     out = out[..., :num_classes]
-                    if not return_logits:
+                    if self.decoder_type in ("soft_kmeans", "rbf", "euclidean"):
+                        if not return_logits:
+                            out = out.exp()
+                    elif not return_logits:
                         out = torch.softmax(out / softmax_temperature, dim=-1)
             else:
                 out = self._inference_forward(R, y_train, return_logits, softmax_temperature, mgr_config)

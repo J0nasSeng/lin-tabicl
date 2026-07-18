@@ -32,14 +32,14 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --batch_size 128 \
             --micro_batch_size 1 \
             --log_conf_mat_every ${LOG_CONF_MAT_EVERY} \
-            --lr 2e-4 \
-            --weight_decay 1e-4 \
+            --lr 8e-4 \
+            --weight_decay 1e-3 \
             --supcon_weight 0.0 \
             --entropy_weight 0.0 \
-            --icl_decoder_type soft_kmeans \
+            --icl_decoder_type euclidean \
             --scheduler cosine_warmup \
             --warmup_proportion 0.02 \
-            --gradient_clipping 10.0 \
+            --gradient_clipping 1.0 \
             --prior_type nanotabicl \
             --prior_device cpu \
             --batch_size_per_gp 8 \
@@ -66,6 +66,8 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --save_temp_every 1000 \
             --save_perm_every 5000 \
             --recompute True \
+            --icl_soft_kmeans_temperature 0.5 \
+            --label_smoothing 0.1
             #--scheduled_loader_steps 0,300,600,1000,2000 \
             #--scheduled_loader_sizes 64,256,1024,2048,inf
             #--model_type nanotabicl

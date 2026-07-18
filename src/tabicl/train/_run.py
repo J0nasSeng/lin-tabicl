@@ -1049,34 +1049,19 @@ class Trainer:
 
             pred = pred_3d.flatten(end_dim=-2)
             true = y_test.long().flatten()
-            # Compute class-reweighted CE per dataset to handle dataset-level imbalance.
-            # Each dataset gets its own class weights based on its y_test distribution.
             num_classes = pred_3d.shape[-1]
             ce_losses = []
             for ds_idx in range(pred_3d.shape[0]):
                 ds_logits = pred_3d[ds_idx]
                 ds_targets = y_test[ds_idx].long()
-
-                class_counts = torch.bincount(ds_targets, minlength=num_classes).to(ds_logits.dtype)
-                present_mask = class_counts > 0
-
-                class_weights = torch.zeros(num_classes, device=ds_logits.device, dtype=ds_logits.dtype)
-                if present_mask.any():
-                    present_classes = present_mask.sum().to(ds_logits.dtype)
-                    inv_freq = 1 / torch.sqrt(class_counts[present_mask])
-                    inv_freq = inv_freq / inv_freq.mean()
-                    class_weights[present_mask] = inv_freq.to(device=class_weights.device, dtype=class_weights.dtype)
-                    class_weights = class_weights / class_weights.sum()  # Normalize to num present classes
-
-                if self.raw_model.icl_predictor.decoder_type == "soft_kmeans":
-                    # The soft-kNN decoder returns normalized class masses, not logits.
-                    # Use their log directly; passing them to cross_entropy would apply
-                    # an incorrect second softmax and assign mass to absent classes.
-                    eps = torch.finfo(ds_logits.dtype).tiny
-                    log_class_mass = ds_logits.clamp_min(eps).log()
-                    ce_losses.append(F.nll_loss(log_class_mass, ds_targets, weight=class_weights, reduction="mean"))
-                else:
-                    ce_losses.append(F.cross_entropy(ds_logits, ds_targets, weight=class_weights, reduction="mean"))
+                ce_losses.append(
+                    F.cross_entropy(
+                        ds_logits,
+                        ds_targets,
+                        label_smoothing=float(getattr(self.config, "label_smoothing", 0.1)),
+                        reduction="mean",
+                    )
+                )
 
             ce_loss = torch.stack(ce_losses).mean()
 
@@ -1088,7 +1073,12 @@ class Trainer:
 
             entropy_raw_loss = pred.new_zeros(())
             if entropy_weight > 0:
-                entropy_raw_loss = entropy_regularizer(pred_3d)
+                entropy_input_type = (
+                    "log_probs"
+                    if self.raw_model.icl_predictor.decoder_type in ("soft_kmeans", "rbf", "euclidean")
+                    else "logits"
+                )
+                entropy_raw_loss = entropy_regularizer(pred_3d, input_type=entropy_input_type)
 
             # Keep CE as primary objective; maximize predictive entropy via a negative entropy term.
             loss = ce_loss + supcon_weight * supcon_raw_loss - entropy_weight * entropy_raw_loss

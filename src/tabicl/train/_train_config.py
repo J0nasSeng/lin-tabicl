@@ -248,14 +248,20 @@ def build_parser():
         "--icl_decoder_type",
         type=str,
         default="mlp",
-        choices=["mlp", "soft_kmeans"],
-        help="ICL decoder type: standard MLP decoder or soft_kmeans matching decoder",
+        choices=["mlp", "soft_kmeans", "rbf", "euclidean"],
+        help="ICL decoder type: MLP, dot-product soft_kmeans, RBF, or Euclidean-distance assignment decoder",
     )
     parser.add_argument(
         "--icl_soft_kmeans_temperature",
         type=float,
         default=1.0,
-        help="Temperature for soft_kmeans decoder similarity softmax",
+        help="Temperature for soft_kmeans similarity, RBF bandwidth, or Euclidean assignment",
+    )
+    parser.add_argument(
+        "--label_smoothing",
+        type=float,
+        default=0.1,
+        help="Label-smoothing factor used by the classification cross-entropy loss",
     )
     parser.add_argument(
         "--graph_min_train_neighbors",
