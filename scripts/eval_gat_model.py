@@ -19,6 +19,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import log_loss, recall_score
 
 from tabicl.eval._run import _build_model_from_checkpoint, _evaluate_one_dataset
+from tabicl._preprocessing.normalizer import RobustScaler, Standardizer, infer_feature_types
 from tabicl.prior._dataset import PriorDataset
 
 
@@ -115,9 +116,15 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--device", default=None, help="Inference device (default: cuda when available)")
 	parser.add_argument("--seed", type=int, default=42)
 	parser.add_argument(
+		"--normalization",
+		choices=("none", "std", "robust"),
+		default="none",
+		help="Optional feature normalization applied before evaluation (default: none).",
+	)
+	parser.add_argument(
 		"--normalize-features",
 		action="store_true",
-		help="Normalize each feature using its training-sample mean and standard deviation.",
+		help="Compatibility alias for enabling feature normalization.",
 	)
 	parser.add_argument(
 		"--rf-n-estimators",
@@ -317,6 +324,7 @@ def _evaluate_class_count(model, args: argparse.Namespace, num_classes: int, dev
 		prior_type=args.prior_type,
 		device=args.prior_device,
 		n_jobs=1,
+		normalization=("std" if args.normalize_features and args.normalization == "none" else args.normalization),
 	)
 
 	rows: list[dict] = []
@@ -331,8 +339,6 @@ def _evaluate_class_count(model, args: argparse.Namespace, num_classes: int, dev
 		batch = _as_regular_tensors(prior.get_batch())
 		current_batch_index = batch_index
 		batch_index += 1
-		if args.normalize_features:
-			batch = _normalize_features(batch)
 		for index in range(int(batch[0].shape[0])):
 			if processed >= args.num_datasets:
 				break

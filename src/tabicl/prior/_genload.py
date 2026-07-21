@@ -37,6 +37,7 @@ import numpy as np
 from torch.utils.data import IterableDataset
 
 from tabicl.prior._dataset import PriorDataset
+from tabicl._preprocessing.normalizer import normalize_batch
 from tabicl.prior._prior_config import DEFAULT_FIXED_HP, DEFAULT_SAMPLED_HP
 
 warnings.filterwarnings(
@@ -236,6 +237,7 @@ class LoadPriorDataset(IterableDataset):
         timeout=60,
         delete_after_load=False,
         device="cpu",
+        normalization="none",
     ):
         super().__init__()
         self.data_dir = Path(data_dir)
@@ -247,6 +249,7 @@ class LoadPriorDataset(IterableDataset):
         self.timeout = timeout
         self.delete_after_load = delete_after_load
         self.device = device
+        self.normalization = normalization
 
         # Load metadata if available
         self.metadata = None
@@ -420,6 +423,13 @@ class LoadPriorDataset(IterableDataset):
             X_out = X_out.nested_tensor
             y_out = y_out.nested_tensor
 
+        X_out = normalize_batch(
+            X_out,
+            d_out,
+            seq_lens_out,
+            train_sizes_out,
+            self.normalization,
+        )
         return X_out, y_out, d_out, seq_lens_out, train_sizes_out
 
     def __repr__(self) -> str:
@@ -497,6 +507,7 @@ class SavePriorDataset:
             n_jobs=self.args.n_jobs,
             num_threads_per_generate=self.args.num_threads_per_generate,
             device=self.args.device,
+            normalization="none",
         )
         print(self.prior)
 

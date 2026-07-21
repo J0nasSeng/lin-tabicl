@@ -381,6 +381,7 @@ class Trainer:
                 prior_type=self.config.prior_type,
                 device=self.config.prior_device,
                 n_jobs=1,  # Set to 1 to avoid nested parallelism during DDP
+                normalization=getattr(self.config, "normalization", "none"),
             )
 
         val_start_offset = max(1, int(self.config.max_steps))
@@ -393,6 +394,7 @@ class Trainer:
             start_from=start_from,
             delete_after_load=(self.config.delete_after_load if not is_validation else False),
             device=self.config.prior_device,
+            normalization=getattr(self.config, "normalization", "none"),
         )
 
     def _build_prior_dataloader(self, dataset):
@@ -1069,9 +1071,21 @@ class Trainer:
 
             supcon_raw_loss = pred.new_zeros(())
             if supcon_weight > 0 and pre_decoder_repr_test is not None:
-                repr_flat = pre_decoder_repr_test.reshape(-1, pre_decoder_repr_test.shape[-1])
-                labels_flat = y_test.long().reshape(-1)
-                supcon_raw_loss = supervised_contrastive_loss(repr_flat, labels_flat)
+                # Compute SupCon independently for each dataset. Flattening the
+                # whole micro-batch would make equal labels from different
+                # datasets positive pairs, although their representations are
+                # not expected to be close.
+                supcon_losses = []
+                for ds_idx in range(pre_decoder_repr_test.shape[0]):
+                    ds_loss = supervised_contrastive_loss(
+                        pre_decoder_repr_test[ds_idx],
+                        y_test[ds_idx].long(),
+                        temperature=0.2
+                    )
+                    supcon_losses.append(ds_loss)
+
+                if supcon_losses:
+                    supcon_raw_loss = torch.stack(supcon_losses).mean()
 
             entropy_raw_loss = pred.new_zeros(())
             if entropy_weight > 0:

@@ -195,6 +195,12 @@ def build_parser():
         help="Prior type: dummy, mlp_scm, tree_scm, mix_scm, nanotabicl",
     )
     parser.add_argument("--prior_device", default="cpu", type=str, help="Device for prior data generation")
+    parser.add_argument(
+        "--normalization",
+        choices=("none", "std", "robust"),
+        default="none",
+        help="Optional feature normalization applied before the model (default: none).",
+    )
     parser.add_argument("--recompute", default=False, type=bool, help="If True, apply checkpointing in forward pass")
 
     ###########################################################################

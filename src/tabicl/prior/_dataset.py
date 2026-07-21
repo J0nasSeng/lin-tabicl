@@ -38,6 +38,7 @@ from ._nanotabicl_prior import NanoTabICLPrior
 from ._hp_sampling import HpSamplerList
 from ._reg2cls import Reg2Cls
 from ._prior_config import DEFAULT_FIXED_HP, DEFAULT_SAMPLED_HP
+from tabicl._preprocessing.normalizer import normalize_batch
 
 
 warnings.filterwarnings(
@@ -484,6 +485,7 @@ class SCMPrior(Prior):
         n_jobs: int = -1,
         num_threads_per_generate: int = 1,
         device: str = "cpu",
+        normalization: str = "none",
     ):
         super().__init__(
             batch_size=batch_size,
@@ -935,6 +937,7 @@ class PriorDataset(IterableDataset):
         n_jobs: int = -1,
         num_threads_per_generate: int = 1,
         device: str = "cpu",
+        normalization: str = "none",
     ):
         super().__init__()
         if prior_type == "dummy":
@@ -991,6 +994,9 @@ class PriorDataset(IterableDataset):
         self.max_train_size = max_train_size
         self.device = device
         self.prior_type = prior_type
+        if normalization not in ("none", "std", "robust"):
+            raise ValueError("normalization must be one of: 'none', 'std', 'robust'")
+        self.normalization = normalization
 
     def get_batch(self, batch_size: Optional[int] = None) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Generate a new batch of datasets.
@@ -1026,7 +1032,10 @@ class PriorDataset(IterableDataset):
         train_sizes : Tensor
             Position for train/test split for each dataset of shape ``(batch_size,)``.
         """
-        return self.prior.get_batch(batch_size)
+        batch = self.prior.get_batch(batch_size)
+        X, y, d, seq_lens, train_sizes = batch
+        X = normalize_batch(X, d, seq_lens, train_sizes, self.normalization)
+        return X, y, d, seq_lens, train_sizes
 
     def __iter__(self) -> "PriorDataset":
         """Return an iterator that yields batches indefinitely.
@@ -1068,6 +1077,7 @@ class PriorDataset(IterableDataset):
             f"  seq_len: {self.min_seq_len or 'None'} - {self.max_seq_len}\n"
             f"  sequence length varies across groups: {self.seq_len_per_gp}\n"
             f"  train_size: {self.min_train_size} - {self.max_train_size}\n"
+            f"  normalization: {self.normalization}\n"
             f"  device: {self.device}\n"
             f")"
         )

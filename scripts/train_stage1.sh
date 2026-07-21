@@ -42,6 +42,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --gradient_clipping 2.0 \
             --prior_type nanotabicl \
             --prior_device cpu \
+            --normalization robust \
             --batch_size_per_gp 8 \
             --min_features 2 \
             --max_features 10 \

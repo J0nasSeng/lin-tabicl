@@ -13,6 +13,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import balanced_accuracy_score
 
 from tabicl.prior._dataset import PriorDataset
+from tabicl._preprocessing.normalizer import RobustScaler, Standardizer, infer_feature_types
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -44,12 +45,23 @@ def build_parser() -> argparse.ArgumentParser:
 	)
 	parser.add_argument("--prior-device", default="cpu")
 	parser.add_argument("--rf-jobs", type=int, default=-1, help="Random-forest parallelism.")
+	parser.add_argument(
+		"--normalization",
+		choices=("none", "std", "robust"),
+		default="none",
+		help="Optional feature normalization applied before evaluation (default: none).",
+	)
 	parser.add_argument("--seed", type=int, default=42)
 	parser.add_argument(
 		"--output",
 		type=Path,
 		default=Path("prior_eval/accuracy_histogram.png"),
 		help="Path of the output histogram image.",
+	)
+	parser.add_argument(
+		"--basic-stats",
+		action="store_true",
+		help="Compute and plot basic feature statistics instead of random-forest accuracy.",
 	)
 	return parser
 
@@ -78,6 +90,7 @@ def _evaluate_class_count(
 		prior_type=args.prior_type,
 		device=args.prior_device,
 		n_jobs=1,
+		normalization=args.normalization,
 	)
 
 	scores: list[float] = []
@@ -126,6 +139,216 @@ def _evaluate_class_count(
 			)
 
 	return scores, base_frequencies, batch_statistics
+
+
+def _is_discrete_feature(values: np.ndarray) -> bool:
+	"""Classify an observed feature as discrete using its value cardinality.
+
+	The prior returns all features as floating-point tensors and does not expose
+	the latent categorical metadata. Consequently, basic-statistics evaluation
+	uses a conservative observed-cardinality heuristic: a feature is discrete if
+	it has at most 20 distinct finite values.
+	"""
+	finite_values = values[np.isfinite(values)]
+	return np.unique(finite_values).size <= 20
+
+
+def _skew(values: np.ndarray) -> float:
+	"""Compute the moment coefficient of skewness for finite values."""
+	values = values[np.isfinite(values)]
+	if values.size < 2:
+		return float("nan")
+	centered = values - np.mean(values)
+	std = np.std(values)
+	if std == 0:
+		return 0.0
+	return float(np.mean(centered**3) / std**3)
+
+
+def evaluate_basic_stats(args: argparse.Namespace) -> dict[str, list[float]]:
+	"""Sample prior datasets and summarize their feature distributions."""
+	prior = PriorDataset(
+		batch_size=args.batch_size,
+		min_features=args.min_features,
+		max_features=args.max_features,
+		max_classes=10,
+		min_seq_len=args.min_seq_len,
+		max_seq_len=args.max_seq_len,
+		min_train_size=args.min_train_size,
+		max_train_size=args.max_train_size,
+		prior_type=args.prior_type,
+		device=args.prior_device,
+		n_jobs=1,
+		normalization=args.normalization,
+	)
+
+	statistics = {
+		"continuous features": [],
+		"discrete features": [],
+		"feature mean": [],
+		"feature std": [],
+		"feature median": [],
+		"feature min": [],
+		"feature max": [],
+		"continuous feature skew": [],
+	}
+	grouped_statistics = {
+		"continuous features": {
+			name: []
+			for name in statistics
+			if name not in ("continuous features", "discrete features", "continuous feature skew")
+		},
+		"discrete features": {
+			name: []
+			for name in statistics
+			if name not in ("continuous features", "discrete features", "continuous feature skew")
+		},
+	}
+	processed = 0
+	while processed < args.num_datasets:
+		x_batch, _, feature_counts, seq_lens, train_sizes = _regular_batch(prior.get_batch())
+		for index in range(int(x_batch.shape[0])):
+			if processed >= args.num_datasets:
+				break
+
+			seq_len = int(seq_lens[index].item())
+			n_features = int(feature_counts[index].item())
+			x = x_batch[index, :seq_len, :n_features].cpu().numpy().astype(np.float64)
+			finite_x = x[np.isfinite(x)]
+			discrete_mask = np.asarray([_is_discrete_feature(x[:, feature]) for feature in range(n_features)])
+			continuous_mask = ~discrete_mask
+			discrete_count = int(discrete_mask.sum())
+
+			statistics["continuous features"].append(float(n_features - discrete_count))
+			statistics["discrete features"].append(float(discrete_count))
+			statistics["feature mean"].append(float(np.mean(finite_x)))
+			statistics["feature std"].append(float(np.std(finite_x)))
+			statistics["feature median"].append(float(np.median(finite_x)))
+			statistics["feature min"].append(float(np.min(finite_x)))
+			statistics["feature max"].append(float(np.max(finite_x)))
+			statistics["continuous feature skew"].append(_skew(x[:, continuous_mask]))
+
+			for group_name, feature_mask in (
+				("continuous features", continuous_mask),
+				("discrete features", discrete_mask),
+			):
+				group_values = x[:, feature_mask]
+				group_values = group_values[np.isfinite(group_values)]
+				for statistic_name in grouped_statistics[group_name]:
+					if group_values.size == 0:
+						value = np.nan
+					elif statistic_name == "feature mean":
+						value = np.mean(group_values)
+					elif statistic_name == "feature std":
+						value = np.std(group_values)
+					elif statistic_name == "feature median":
+						value = np.median(group_values)
+					elif statistic_name == "feature min":
+						value = np.min(group_values)
+					else:
+						value = np.max(group_values)
+					grouped_statistics[group_name][statistic_name].append(float(value))
+			processed += 1
+
+	plot_basic_statistics(statistics, grouped_statistics, args.output)
+	for name, values in statistics.items():
+		print(
+			f"{name}: mean={np.mean(values):.4f}, std={np.std(values):.4f}, "
+			f"median={np.median(values):.4f}, min={np.min(values):.4f}, max={np.max(values):.4f}"
+		)
+	return statistics
+
+
+def plot_basic_statistics(
+	statistics: dict[str, list[float]],
+	grouped_statistics: dict[str, dict[str, list[float]]],
+	output: Path,
+) -> None:
+	"""Plot dataset-averaged feature statistics on separate y-axes."""
+	output.parent.mkdir(parents=True, exist_ok=True)
+	feature_count_names = ["continuous features", "discrete features"]
+	distribution_names = [
+		"feature mean",
+		"feature std",
+		"feature median",
+		"feature min",
+		"feature max",
+		"continuous feature skew",
+	]
+	grouped_distribution_names = [
+		"feature mean",
+		"feature std",
+		"feature median",
+		"feature min",
+		"feature max",
+	]
+
+	fig, (count_ax, distribution_ax, grouped_ax) = plt.subplots(1, 3, figsize=(20, 6), dpi=150)
+	for ax, names, title, ylabel in (
+		(count_ax, feature_count_names, "Feature-type counts", "Number of features"),
+		(distribution_ax, distribution_names, "Feature-value statistics", "Value (dataset-level statistic)"),
+	):
+		means = np.asarray([np.mean(statistics[name]) for name in names])
+		stds = np.asarray([np.std(statistics[name]) for name in names])
+		medians = np.asarray([np.median(statistics[name]) for name in names])
+		minimums = np.asarray([np.min(statistics[name]) for name in names])
+		maximums = np.asarray([np.max(statistics[name]) for name in names])
+		positions = np.arange(len(names))
+
+		ax.bar(positions, means, color="tab:blue", alpha=0.7, edgecolor="black")
+		ax.errorbar(
+			positions,
+			means,
+			yerr=stds,
+			fmt="none",
+			ecolor="black",
+			capsize=5,
+			label="Mean ± std",
+		)
+		ax.scatter(positions, medians, marker="^", color="tab:green", zorder=3, label="Median")
+		for position, minimum, maximum in zip(positions, minimums, maximums):
+			ax.vlines(
+				position,
+				minimum,
+				maximum,
+				color="tab:red",
+				linewidth=1.5,
+				label="Min–max" if position == 0 else None,
+			)
+			ax.plot(position, minimum, "_", color="tab:red", markersize=10)
+			ax.plot(position, maximum, "_", color="tab:red", markersize=10)
+		ax.set_xticks(positions, names, rotation=25, ha="right")
+		ax.set_title(title)
+		ax.set_ylabel(ylabel)
+		ax.grid(axis="y", alpha=0.25)
+		ax.legend()
+
+	positions = np.arange(len(grouped_distribution_names))
+	width = 0.36
+	for offset, (group_name, color) in zip((-width / 2, width / 2), (("continuous features", "tab:orange"), ("discrete features", "tab:purple"))):
+		means = np.asarray([np.nanmean(grouped_statistics[group_name][name]) for name in grouped_distribution_names])
+		stds = np.asarray([np.nanstd(grouped_statistics[group_name][name]) for name in grouped_distribution_names])
+		medians = np.asarray([np.nanmedian(grouped_statistics[group_name][name]) for name in grouped_distribution_names])
+		minimums = np.asarray([np.nanmin(grouped_statistics[group_name][name]) for name in grouped_distribution_names])
+		maximums = np.asarray([np.nanmax(grouped_statistics[group_name][name]) for name in grouped_distribution_names])
+		bar_positions = positions + offset
+		grouped_ax.bar(bar_positions, means, width=width, color=color, alpha=0.7, edgecolor="black", label=group_name.title())
+		grouped_ax.errorbar(bar_positions, means, yerr=stds, fmt="none", ecolor="black", capsize=4)
+		grouped_ax.scatter(bar_positions, medians, marker="^", color="tab:green", zorder=3)
+		for position, minimum, maximum in zip(bar_positions, minimums, maximums):
+			grouped_ax.vlines(position, minimum, maximum, color="tab:red", linewidth=1.2)
+			grouped_ax.plot(position, minimum, "_", color="tab:red", markersize=8)
+			grouped_ax.plot(position, maximum, "_", color="tab:red", markersize=8)
+	grouped_ax.set_xticks(positions, grouped_distribution_names, rotation=25, ha="right")
+	grouped_ax.set_title("Statistics by feature type")
+	grouped_ax.set_ylabel("Value (dataset-level statistic)")
+	grouped_ax.grid(axis="y", alpha=0.25)
+	grouped_ax.legend()
+
+	fig.tight_layout()
+	output_path = output.with_name(f"{output.stem}_basic_stats{output.suffix}")
+	fig.savefig(output_path)
+	plt.close(fig)
 
 
 
@@ -292,7 +515,10 @@ def main() -> None:
 	np.random.seed(args.seed)
 	torch.manual_seed(args.seed)
 	started_at = time.perf_counter()
-	evaluate_prior(args)
+	if args.basic_stats:
+		evaluate_basic_stats(args)
+	else:
+		evaluate_prior(args)
 	elapsed = time.perf_counter() - started_at
 	print(f"Saved evaluation plots with prefix {args.output}")
 	print(f"Total runtime: {elapsed:.2f} seconds ({elapsed / 60.0:.2f} minutes)")
