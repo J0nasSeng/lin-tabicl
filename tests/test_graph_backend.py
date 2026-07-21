@@ -354,7 +354,7 @@ def test_graph_multihead_attention_vectorized_matches_legacy_loop():
     torch.manual_seed(0)
     B, T, C, D, H = 3, 7, 1, 16, 4
 
-    model = GraphMultiheadAttention(d_model=D, nhead=H, dropout=0.0)
+    model = GraphMultiheadAttention(d_model=D, nhead=H, dropout=0.0, learnable_residual=True)
     model.eval()
 
     src = torch.randn(B, T, C, D)
@@ -419,7 +419,7 @@ def test_graph_multihead_attention_multicol_matches_expanded_reference():
     torch.manual_seed(0)
     B, T, C, D, H = 2, 6, 3, 16, 4
 
-    model = GraphMultiheadAttention(d_model=D, nhead=H, dropout=0.0)
+    model = GraphMultiheadAttention(d_model=D, nhead=H, dropout=0.0, learnable_residual=True)
     model.eval()
 
     src = torch.randn(B, T, C, D)
@@ -485,8 +485,12 @@ def test_graph_multihead_attention_chunked_matches_non_chunked():
     dense_edges = torch.cartesian_prod(torch.arange(T), torch.arange(T)).T
     edge_index_batch = [dense_edges.clone(), dense_edges.clone()]
 
-    model_non_chunked = GraphMultiheadAttention(d_model=D, nhead=H, dropout=0.0, max_parallel_edges=10**9)
-    model_chunked = GraphMultiheadAttention(d_model=D, nhead=H, dropout=0.0, max_parallel_edges=2048)
+    model_non_chunked = GraphMultiheadAttention(
+        d_model=D, nhead=H, dropout=0.0, max_parallel_edges=10**9, learnable_residual=True
+    )
+    model_chunked = GraphMultiheadAttention(
+        d_model=D, nhead=H, dropout=0.0, max_parallel_edges=2048, learnable_residual=True
+    )
     model_chunked.load_state_dict(model_non_chunked.state_dict())
     model_non_chunked.eval()
     model_chunked.eval()
@@ -506,10 +510,11 @@ def test_graph_attention_block_alpha_initialization_and_forward_shape():
         dim_feedforward=32,
         dropout=0.0,
         norm_first=True,
+        learnable_residual=True,
     )
 
     alpha = torch.sigmoid(block.attn.alpha.detach().cpu())
-    assert torch.isclose(alpha, torch.tensor(0.05), atol=1e-8)
+    assert torch.isclose(alpha, torch.tensor(0.2), atol=1e-8)
 
     src = torch.randn(2, 6, 1, 16)
     edge_index_batch = [
@@ -519,6 +524,23 @@ def test_graph_attention_block_alpha_initialization_and_forward_shape():
 
     out = block(src, edge_index_batch)
     assert out.shape == src.shape
+    assert torch.isfinite(out).all()
+
+
+def test_graph_attention_uses_standard_residual_by_default():
+    model = GraphMultiheadAttention(d_model=16, nhead=4, dropout=0.0)
+    assert not hasattr(model, "alpha")
+    assert model.learnable_residual is False
+
+    src = torch.randn(2, 5, 1, 16)
+    edge_index_batch = [
+        torch.tensor([[0, 1, 2], [1, 2, 3]], dtype=torch.long),
+        torch.empty((2, 0), dtype=torch.long),
+    ]
+
+    out = model(src, edge_index_batch)
+    assert out.shape == src.shape
+    assert torch.allclose(out[1], src[1])
     assert torch.isfinite(out).all()
 
 

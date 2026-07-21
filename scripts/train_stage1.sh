@@ -7,8 +7,8 @@ WAND_LOG=${WAND_LOG:-True}
 WAND_MODE=${WAND_MODE:-online}
 # GPU selection controls
 DEVICE=${DEVICE:-cuda}
-NUM_GPUS=${NUM_GPUS:-3}
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-4,6,7}
+NUM_GPUS=${NUM_GPUS:-2}
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-2,3}
 # Confusion matrix logging interval
 LOG_CONF_MAT_EVERY=${LOG_CONF_MAT_EVERY:-2000}
 
@@ -25,21 +25,21 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --wandb_dir /workspace/wandb/ \
             --wandb_mode ${WAND_MODE} \
             --device ${DEVICE} \
-            --dtype bfloat16 \
+            --dtype float32 \
             --np_seed 42 \
             --torch_seed 42 \
             --max_steps 10000 \
-            --batch_size 128 \
-            --micro_batch_size 1 \
+            --batch_size 512 \
+            --micro_batch_size 3 \
             --log_conf_mat_every ${LOG_CONF_MAT_EVERY} \
             --lr 8e-4 \
-            --weight_decay 1e-3 \
-            --supcon_weight 0.0 \
+            --weight_decay 1e-4 \
+            --supcon_weight 0.1 \
             --entropy_weight 0.0 \
-            --icl_decoder_type euclidean \
+            --icl_decoder_type soft_kmeans \
             --scheduler cosine_warmup \
             --warmup_proportion 0.02 \
-            --gradient_clipping 1.0 \
+            --gradient_clipping 2.0 \
             --prior_type nanotabicl \
             --prior_device cpu \
             --batch_size_per_gp 8 \
@@ -57,17 +57,20 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --row_nhead 8 \
             --row_num_cls 1 \
             --row_rope_base 100000 \
-            --icl_num_blocks 10 \
+            --icl_num_blocks 4 \
             --icl_nhead 8 \
             --icl_backend ${ICL_BACKEND} \
             --ff_factor 2 \
             --norm_first True \
-            --checkpoint_dir /workspace/checkpoints/stage1/ \
+            --checkpoint_dir /workspace/checkpoints_d=4_supcon=0.1/stage1/ \
             --save_temp_every 1000 \
             --save_perm_every 5000 \
-            --recompute True \
             --icl_soft_kmeans_temperature 0.5 \
-            --label_smoothing 0.1
+            --label_smoothing 0.1 \
+            --graph_min_train_neighbors 3 \
+            --graph_max_train_neighbors 6 \
+            --graph_test_k_per_class 2 \
+            #--recompute True \
             #--scheduled_loader_steps 0,300,600,1000,2000 \
             #--scheduled_loader_sizes 64,256,1024,2048,inf
             #--model_type nanotabicl

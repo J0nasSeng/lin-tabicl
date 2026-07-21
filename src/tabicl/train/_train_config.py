@@ -264,6 +264,14 @@ def build_parser():
         help="Label-smoothing factor used by the classification cross-entropy loss",
     )
     parser.add_argument(
+        "--learnable-residual",
+        "--learnable_residual",
+        dest="learnable_residual",
+        default=False,
+        type=str2bool,
+        help="Use learnable sigmoid-alpha GAT residual mixing instead of a standard residual connection",
+    )
+    parser.add_argument(
         "--graph_min_train_neighbors",
         type=int,
         default=8,

@@ -156,7 +156,7 @@ def rand_dataset_filtered(
                 oob_score=True,
                 n_jobs=1,
                 random_state=1,
-                max_depth=3,
+                max_depth=6,
             ).fit(X_np, y_np)
 
             oob_proba = clf.oob_decision_function_
@@ -178,7 +178,7 @@ def rand_dataset_filtered(
             perm_scores = np.array([_balanced_accuracy(rng.permutation(y_true), y_pred) for _ in range(num_permutations)])
             pval = float((1.0 + np.sum(perm_scores >= observed_score)) / (num_permutations + 1.0))
 
-            if pval < 0.05:
+            if pval < 0.05:  # reject datasets that are not significantly better than random
                 return tensors
         else:
             # Regression branch: keep original bootstrap-MSE-improvement logic.

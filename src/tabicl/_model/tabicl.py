@@ -183,6 +183,7 @@ class TabICL(nn.Module):
         graph_seed: Optional[int] = None,
         graph_share_across_batch: bool = False,
         graph_share_require_identical_labels: bool = True,
+        learnable_residual: bool = False,
         icl_ssmax: Union[
             bool,
             Literal[
@@ -312,6 +313,7 @@ class TabICL(nn.Module):
             graph_share_across_batch=graph_share_across_batch,
             graph_share_require_identical_labels=graph_share_require_identical_labels,
             graph_num_cls=row_num_cls,
+            learnable_residual=learnable_residual,
         )
 
         # KV cache for efficient inference

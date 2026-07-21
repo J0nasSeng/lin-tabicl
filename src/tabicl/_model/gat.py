@@ -11,7 +11,14 @@ from torch.utils.checkpoint import checkpoint
 class GraphMultiheadAttention(nn.Module):
     """Sparse graph multi-head attention with per-destination softmax weights."""
 
-    def __init__(self, d_model: int, nhead: int, dropout: float = 0.0, max_parallel_edges: int = 2**12):
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dropout: float = 0.0,
+        max_parallel_edges: int = 2**12,
+        learnable_residual: bool = False,
+    ):
         super().__init__()
         if d_model % nhead != 0:
             raise ValueError(f"d_model ({d_model}) must be divisible by nhead ({nhead})")
@@ -28,7 +35,9 @@ class GraphMultiheadAttention(nn.Module):
         self.v_proj = nn.Linear(d_model, d_model)
         self.out_proj = nn.Linear(d_model, d_model)
         self.dropout = nn.Dropout(dropout)
-        self.alpha = nn.Parameter(torch.logit(torch.tensor(0.2, dtype=torch.float32)))
+        self.learnable_residual = bool(learnable_residual)
+        if self.learnable_residual:
+            self.alpha = nn.Parameter(torch.logit(torch.tensor(0.2, dtype=torch.float32)))
         self.max_parallel_edges = int(max_parallel_edges)
 
         nn.init.xavier_uniform_(self.out_proj.weight)
@@ -89,10 +98,15 @@ class GraphMultiheadAttention(nn.Module):
             all_edge_src.append(edge_src + offset)
             all_edge_dst.append(edge_dst + offset)
 
-        alpha = torch.sigmoid(self.alpha).to(dtype=src.dtype)
+        if not self.learnable_residual:
+            alpha = None
+        else:
+            alpha = torch.sigmoid(self.alpha).to(dtype=src.dtype)
 
-        # No incoming edges anywhere: keep only the self-connection part.
+        # No incoming edges anywhere: keep only the residual connection.
         if not all_edge_src:
+            if alpha is None:
+                return residual_src
             return (1.0 - alpha) * residual_src
 
         global_edge_src = torch.cat(all_edge_src, dim=0)
@@ -130,6 +144,8 @@ class GraphMultiheadAttention(nn.Module):
         agg = torch.zeros((B * T, C, self.nhead, self.head_dim), dtype=src.dtype, device=src.device)
         agg.index_add_(0, global_edge_dst, messages)
         attn_out = self.out_proj(agg.view(B, T, C, self.d_model))
+        if alpha is None:
+            return residual_src + attn_out
         return (1.0 - alpha) * residual_src + alpha * attn_out
 
 
@@ -145,11 +161,17 @@ class GraphAttentionBlock(nn.Module):
         activation: str | Callable[[Tensor], Tensor] = "gelu",
         norm_first: bool = True,
         bias_free_ln: bool = False,
+        learnable_residual: bool = False,
     ):
         super().__init__()
         self.norm_first = norm_first
 
-        self.attn = GraphMultiheadAttention(d_model=d_model, nhead=nhead, dropout=dropout)
+        self.attn = GraphMultiheadAttention(
+            d_model=d_model,
+            nhead=nhead,
+            dropout=dropout,
+            learnable_residual=learnable_residual,
+        )
 
         self.norm1 = nn.LayerNorm(d_model, bias=not bias_free_ln)
         self.norm2 = nn.LayerNorm(d_model, bias=not bias_free_ln)
@@ -202,6 +224,7 @@ class GraphAttentionTransformer(nn.Module):
         recompute: bool = False,
         num_output_cls: int | None = None,
         out_dim: int | None = None,
+        learnable_residual: bool = False,
     ):
         super().__init__()
         self.graph_blocks = nn.ModuleList(
@@ -214,6 +237,7 @@ class GraphAttentionTransformer(nn.Module):
                     activation=activation,
                     norm_first=norm_first,
                     bias_free_ln=bias_free_ln,
+                    learnable_residual=learnable_residual,
                 )
                 for _ in range(num_blocks)
             ]

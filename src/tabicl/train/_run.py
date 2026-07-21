@@ -282,6 +282,7 @@ class Trainer:
             "graph_seed": self.config.graph_seed,
             "graph_share_across_batch": self.config.graph_share_across_batch,
             "graph_share_require_identical_labels": self.config.graph_share_require_identical_labels,
+            "learnable_residual": getattr(self.config, "learnable_residual", False),
             "ff_factor": self.config.ff_factor,
             "dropout": self.config.dropout,
             "activation": self.config.activation,
@@ -677,7 +678,10 @@ class Trainer:
         if getattr(self.raw_model, "icl_backend", None) != "graph":
             return {}
 
-        graph_blocks = getattr(getattr(self.raw_model, "icl_predictor", None), "gat_icl", None)
+        predictor = getattr(self.raw_model, "icl_predictor", None)
+        if not getattr(predictor, "learnable_residual", False):
+            return {}
+        graph_blocks = getattr(predictor, "gat_icl", None)
         graph_blocks = getattr(graph_blocks, "graph_blocks", ())
         return {
             f"gat/graph_block_{layer_idx}/alpha": float(torch.sigmoid(block.attn.alpha).detach().cpu())
@@ -831,14 +835,12 @@ class Trainer:
         # reflect true (unscaled) gradients when AMP GradScaler is enabled.
         self.scaler.unscale_(self.optimizer)
 
-        grad_norm_sum = 0.0
-        grad_param_count = 0
+        grad_sq_sum = 0.0
         for param in self.model.parameters():
             if param.grad is None:
                 continue
-            grad_norm_sum += param.grad.detach().norm(2).item()
-            grad_param_count += 1
-        avg_unscaled_grad_norm = grad_norm_sum / grad_param_count if grad_param_count > 0 else 0.0
+            grad_sq_sum += param.grad.detach().float().pow(2).sum().item()
+        global_grad_norm = grad_sq_sum**0.5
 
         if self.config.gradient_clipping > 0:
             nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clipping)
@@ -847,7 +849,7 @@ class Trainer:
         self.scaler.update()
         self.optimizer.zero_grad(set_to_none=True)
         self.scheduler.step()
-        return avg_unscaled_grad_norm
+        return global_grad_norm
 
     def validate_micro_batch(self, micro_seq_len, micro_train_size):
         """Validate consistent sequence length and train size within a micro batch.

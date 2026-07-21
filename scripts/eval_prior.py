@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import argparse
-import multiprocessing as mp
 import time
-from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -65,44 +63,33 @@ def _regular_batch(batch: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
 
 
 def _evaluate_class_count(
-	num_classes: int,
-	num_datasets: int,
-	batch_size: int,
-	n_ensembles: int,
-	min_features: int,
-	max_features: int,
-	min_seq_len: int | None,
-	max_seq_len: int,
-	min_train_size: float,
-	max_train_size: float,
-	prior_type: str,
-	prior_device: str,
-	rf_jobs: int,
-	seed: int,
-) -> tuple[int, list[float], list[float]]:
-	"""Sample and evaluate datasets for one class count in a worker process."""
+	args: argparse.Namespace, num_classes: int
+) -> tuple[list[float], list[float], list[tuple[float, float, float, float, float]]]:
+	"""Sample and evaluate datasets for one class count."""
 	prior = PriorDataset(
-		batch_size=batch_size,
-		min_features=min_features,
-		max_features=max_features,
+		batch_size=args.batch_size,
+		min_features=args.min_features,
+		max_features=args.max_features,
 		max_classes=num_classes,
-		min_seq_len=min_seq_len,
-		max_seq_len=max_seq_len,
-		min_train_size=min_train_size,
-		max_train_size=max_train_size,
-		prior_type=prior_type,
-		device=prior_device,
+		min_seq_len=args.min_seq_len,
+		max_seq_len=args.max_seq_len,
+		min_train_size=args.min_train_size,
+		max_train_size=args.max_train_size,
+		prior_type=args.prior_type,
+		device=args.prior_device,
 		n_jobs=1,
 	)
 
 	scores: list[float] = []
 	base_frequencies: list[float] = []
+	batch_statistics: list[tuple[float, float, float, float, float]] = []
 	processed = 0
-	while processed < num_datasets:
+	while processed < args.num_datasets:
 		batch = _regular_batch(prior.get_batch())
 		x_batch, y_batch, feature_counts, seq_lens, train_sizes = batch
+		batch_scores: list[float] = []
 		for index in range(int(x_batch.shape[0])):
-			if processed >= num_datasets:
+			if processed >= args.num_datasets:
 				break
 
 			seq_len = int(seq_lens[index].item())
@@ -114,61 +101,104 @@ def _evaluate_class_count(
 			x_train, x_test = x[:train_size], x[train_size:]
 			y_train, y_test = y[:train_size], y[train_size:]
 			classifier = RandomForestClassifier(
-				n_estimators=n_ensembles,
-				random_state=seed + processed,
-				n_jobs=rf_jobs,
+				n_estimators=args.n_ensembles,
+				random_state=args.seed + num_classes * args.num_datasets + processed,
+				n_jobs=args.rf_jobs,
 			)
 			classifier.fit(np.nan_to_num(x_train), y_train)
 			prediction = classifier.predict(np.nan_to_num(x_test))
-			scores.append(float(balanced_accuracy_score(y_test, prediction)))
+			score = float(balanced_accuracy_score(y_test, prediction))
+			scores.append(score)
+			batch_scores.append(score)
 
 			class_counts = np.bincount(y, minlength=num_classes)
 			base_frequencies.append(float(class_counts.max() / class_counts.sum()))
 			processed += 1
+		if batch_scores:
+			batch_statistics.append(
+				(
+					float(np.mean(batch_scores)),
+					float(np.std(batch_scores)),
+					float(np.median(batch_scores)),
+					float(np.min(batch_scores)),
+					float(np.max(batch_scores)),
+				)
+			)
 
-	return num_classes, scores, base_frequencies
+	return scores, base_frequencies, batch_statistics
+
 
 
 def evaluate_prior(args: argparse.Namespace) -> tuple[dict[int, list[float]], dict[int, list[float]]]:
-	"""Sample and evaluate datasets for all K values in parallel."""
-	worker_args = [
-		(
-			num_classes,
-			args.num_datasets,
-			args.batch_size,
-			args.n_ensembles,
-			args.min_features,
-			args.max_features,
-			args.min_seq_len,
-			args.max_seq_len,
-			args.min_train_size,
-			args.max_train_size,
-			args.prior_type,
-			args.prior_device,
-			args.rf_jobs,
-			args.seed + num_classes * args.num_datasets,
-		)
-		for num_classes in range(2, 11)
-	]
-	with ProcessPoolExecutor(
-		max_workers=len(worker_args),
-		mp_context=mp.get_context("spawn"),
-	) as executor:
-		results = list(executor.map(_evaluate_class_count, *zip(*worker_args)))
-
-	scores_by_k = {num_classes: scores for num_classes, scores, _ in results}
-	base_frequencies_by_k = {
-		num_classes: base_frequencies for num_classes, _, base_frequencies in results
-	}
-	for num_classes in sorted(scores_by_k):
-		scores = scores_by_k[num_classes]
+	"""Evaluate each K sequentially and plot it as soon as it is available."""
+	scores_by_k: dict[int, list[float]] = {}
+	base_frequencies_by_k: dict[int, list[float]] = {}
+	batch_statistics_by_k: dict[int, list[tuple[float, float, float, float, float]]] = {}
+	for num_classes in range(10, 11):
+		scores, base_frequencies, batch_statistics = _evaluate_class_count(args, num_classes)
+		scores_by_k[num_classes] = scores
+		base_frequencies_by_k[num_classes] = base_frequencies
+		batch_statistics_by_k[num_classes] = batch_statistics
 		print(
 			f"K={num_classes}: n={len(scores)}, "
 			f"mean balanced accuracy={np.mean(scores):.4f}, "
 			f"std={np.std(scores):.4f}, "
-			f"mean base frequency={np.mean(base_frequencies_by_k[num_classes]):.4f}"
+			f"mean base frequency={np.mean(base_frequencies):.4f}"
 		)
+		plot_histograms({num_classes: scores}, args.output)
+		plot_base_frequency_histograms({num_classes: base_frequencies}, args.output)
+		plot_base_frequency_scatter(scores_by_k, base_frequencies_by_k, args.output)
+		plot_batch_accuracy_statistics({num_classes: batch_statistics}, args.output)
 	return scores_by_k, base_frequencies_by_k
+
+
+def plot_batch_accuracy_statistics(
+	batch_statistics_by_k: dict[int, list[tuple[float, float, float, float, float]]], output: Path
+) -> None:
+	"""Save batch-wise accuracy statistics with standard-deviation and range bands."""
+	output.parent.mkdir(parents=True, exist_ok=True)
+	for num_classes, statistics in batch_statistics_by_k.items():
+		if not statistics:
+			continue
+		means = np.asarray([mean for mean, _, _, _, _ in statistics])
+		stds = np.asarray([std for _, std, _, _, _ in statistics])
+		medians = np.asarray([median for _, _, median, _, _ in statistics])
+		minimums = np.asarray([minimum for _, _, _, minimum, _ in statistics])
+		maximums = np.asarray([maximum for _, _, _, _, maximum in statistics])
+		batch_indices = np.arange(len(statistics))
+
+		fig, ax = plt.subplots(figsize=(10, 6), dpi=150)
+		ax.fill_between(
+			batch_indices,
+			minimums,
+			maximums,
+			alpha=0.15,
+			color="tab:gray",
+			label="Min–max",
+		)
+		ax.errorbar(
+			batch_indices,
+			means,
+			yerr=stds,
+			fmt="o-",
+			capsize=3,
+			linewidth=1,
+			label="Mean ± std",
+		)
+		ax.plot(batch_indices, medians, "s--", linewidth=1, label="Median")
+		ax.set(
+			title=f"Batch-wise random-forest accuracy (K={num_classes})",
+			xlabel="Batch index",
+			ylabel="Balanced accuracy (mean ± std)",
+			xlim=(-0.5, len(statistics) - 0.5),
+			ylim=(0.0, 1.0),
+		)
+		ax.grid(alpha=0.25)
+		ax.legend()
+		fig.tight_layout()
+		output_path = output.with_name(f"{output.stem}_batch_accuracy_k{num_classes}{output.suffix}")
+		fig.savefig(output_path)
+		plt.close(fig)
 
 
 def plot_histograms(scores_by_k: dict[int, list[float]], output: Path) -> None:
@@ -262,10 +292,7 @@ def main() -> None:
 	np.random.seed(args.seed)
 	torch.manual_seed(args.seed)
 	started_at = time.perf_counter()
-	scores_by_k, base_frequencies_by_k = evaluate_prior(args)
-	plot_histograms(scores_by_k, args.output)
-	plot_base_frequency_histograms(base_frequencies_by_k, args.output)
-	plot_base_frequency_scatter(scores_by_k, base_frequencies_by_k, args.output)
+	evaluate_prior(args)
 	elapsed = time.perf_counter() - started_at
 	print(f"Saved evaluation plots with prefix {args.output}")
 	print(f"Total runtime: {elapsed:.2f} seconds ({elapsed / 60.0:.2f} minutes)")

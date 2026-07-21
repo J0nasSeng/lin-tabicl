@@ -326,8 +326,11 @@ def _evaluate_class_count(model, args: argparse.Namespace, num_classes: int, dev
 		args.seed,
 	)
 	processed = 0
+	batch_index = 0
 	while processed < args.num_datasets:
 		batch = _as_regular_tensors(prior.get_batch())
+		current_batch_index = batch_index
+		batch_index += 1
 		if args.normalize_features:
 			batch = _normalize_features(batch)
 		for index in range(int(batch[0].shape[0])):
@@ -365,17 +368,20 @@ def _evaluate_class_count(model, args: argparse.Namespace, num_classes: int, dev
 				else:
 					tabicl_scores = torch.softmax(sample.y_logits_test.float(), dim=-1).numpy()
 				tabicl_entropy = _mean_entropy(tabicl_scores)
-				_plot_umap(
-					sample,
-					num_classes,
-					processed,
-					args.output_dir / "umap",
-					args.seed + processed,
-					rf_accuracy,
-					tabicl_entropy,
-					args.umap_n_neighbors,
-					args.umap_n_epochs,
-				)
+				try:
+					_plot_umap(
+						sample,
+						num_classes,
+						processed,
+						args.output_dir / "umap",
+						args.seed + processed,
+						rf_accuracy,
+						tabicl_entropy,
+						args.umap_n_neighbors,
+						args.umap_n_epochs,
+					)
+				except Exception as exc:
+					print(f"Warning: UMAP plot failed for K={num_classes}, dataset={processed}: {exc}")
 				processed += 1
 				continue
 
@@ -422,6 +428,7 @@ def _evaluate_class_count(model, args: argparse.Namespace, num_classes: int, dev
 					rows.append({
 						"num_classes": num_classes,
 						"dataset": processed,
+						"batch": current_batch_index,
 						"n_features": n_features,
 						"model": model_name,
 						"score": score_name,
@@ -570,6 +577,78 @@ def _plot_results(rows: list[dict], output_dir: Path) -> None:
 				fig.savefig(output_dir / f"tabicl_accuracy_vs_cross_entropy_k{num_classes}.png")
 				plt.close(fig)
 
+		_plot_batch_statistics(class_rows, num_classes, output_dir)
+
+
+def _plot_batch_statistics(class_rows: list[dict], num_classes: int, output_dir: Path) -> None:
+	"""Plot per-batch summary statistics for accuracy and cross-entropy."""
+	import matplotlib
+	matplotlib.use("Agg", force=True)
+	import matplotlib.pyplot as plt
+
+	for score_name in ("balanced_accuracy", "cross_entropy"):
+		score_rows = [row for row in class_rows if row["score"] == score_name]
+		models = list(dict.fromkeys(row["model"] for row in score_rows))
+		fig, ax = plt.subplots(figsize=(10, 6))
+		colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+
+		for model_index, model in enumerate(models):
+			model_rows = [row for row in score_rows if row["model"] == model]
+			by_batch: dict[int, list[float]] = defaultdict(list)
+			for row in model_rows:
+				by_batch[int(row["batch"])].append(float(row["value"]))
+			if not by_batch:
+				continue
+
+			batch_indices = np.asarray(sorted(by_batch))
+			values = [np.asarray(by_batch[int(batch)]) for batch in batch_indices]
+			means = np.asarray([np.mean(batch_values) for batch_values in values])
+			stds = np.asarray([np.std(batch_values) for batch_values in values])
+			medians = np.asarray([np.median(batch_values) for batch_values in values])
+			minimums = np.asarray([np.min(batch_values) for batch_values in values])
+			maximums = np.asarray([np.max(batch_values) for batch_values in values])
+			color = colors[model_index % len(colors)]
+
+			ax.fill_between(
+				batch_indices,
+				minimums,
+				maximums,
+				color=color,
+				alpha=0.08,
+			)
+			ax.errorbar(
+				batch_indices,
+				means,
+				yerr=stds,
+				fmt="o-",
+				color=color,
+				capsize=3,
+				linewidth=1,
+				label=f"{model}: mean ± std",
+			)
+			ax.plot(
+				batch_indices,
+				medians,
+				"--",
+				color=color,
+				linewidth=1,
+				label=f"{model}: median",
+			)
+
+		ylabel = "Balanced accuracy" if score_name == "balanced_accuracy" else "Cross-entropy"
+		ax.set(
+			title=f"Batch-wise {ylabel} statistics (K={num_classes})",
+			xlabel="Batch index",
+			ylabel=ylabel,
+		)
+		if score_name == "balanced_accuracy":
+			ax.set_ylim(0.0, 1.0)
+		ax.grid(alpha=0.25)
+		ax.legend(ncol=2)
+		fig.tight_layout()
+		fig.savefig(output_dir / f"batch_{score_name}_k{num_classes}.png", dpi=150)
+		plt.close(fig)
+
 
 def main() -> None:
 	args = build_parser().parse_args()
@@ -605,7 +684,7 @@ def main() -> None:
 		raise ValueError("The checkpoint must contain a TabICL model with icl_backend='graph'.")
 
 	rows = []
-	for num_classes in range(2, 11):
+	for num_classes in range(10, 11):
 		print(f"Evaluating {args.num_datasets} datasets for K={num_classes}...")
 		rows.extend(_evaluate_class_count(model, args, num_classes, device))
 	if args.skip_baselines:

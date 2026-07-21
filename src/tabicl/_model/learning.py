@@ -99,6 +99,7 @@ class ICLearning(nn.Module):
         graph_share_across_batch: bool = False,
         graph_share_require_identical_labels: bool = True,
         graph_num_cls: int = 4,
+        learnable_residual: bool = False,
     ):
         super().__init__()
 
@@ -116,6 +117,7 @@ class ICLearning(nn.Module):
         self.graph_share_across_batch = graph_share_across_batch
         self.graph_share_require_identical_labels = graph_share_require_identical_labels
         self.graph_num_cls = graph_num_cls
+        self.learnable_residual = bool(learnable_residual)
 
         if self.icl_backend not in ("encoder", "graph"):
             raise ValueError(f"Unknown icl_backend={self.icl_backend}. Expected 'encoder' or 'graph'.")
@@ -164,6 +166,7 @@ class ICLearning(nn.Module):
                 recompute=recompute,
                 num_output_cls=self.graph_num_cls,
                 out_dim=d_model,
+                learnable_residual=self.learnable_residual,
             )
         if self.norm_first:
             self.ln = nn.LayerNorm(d_model, bias=not bias_free_ln)
@@ -257,8 +260,6 @@ class ICLearning(nn.Module):
         train_repr = src[:, :train_size, :]
         src_float = src.float()
         train_repr_float = train_repr.float()
-        src_float = F.normalize(src_float, p=2, dim=-1)
-        train_repr_float = F.normalize(train_repr_float, p=2, dim=-1)
         src_sq = torch.sum(src_float.square(), dim=-1, keepdim=True)
         train_sq = torch.sum(train_repr_float.square(), dim=-1, keepdim=True).transpose(1, 2)
         interaction = torch.matmul(src_float, train_repr_float.transpose(1, 2))
@@ -493,7 +494,7 @@ class ICLearning(nn.Module):
         if D != self.graph_col_dim:
             raise ValueError(f"Expected last dim {self.graph_col_dim}, got {D}")
 
-        x = col_embeddings
+        x = col_embeddings.clone()
         if pre_col_embeddings is not None:
             if pre_col_embeddings.shape != col_embeddings.shape:
                 raise ValueError("pre_col_embeddings must have the same shape as col_embeddings")
@@ -546,6 +547,9 @@ class ICLearning(nn.Module):
                     "Graph backend expects R with shape (B, T, C, D). "
                     "Use prepare_graph_input for graph-mode inputs."
                 )
+            Ry_train = self.y_encoder(y_train.unsqueeze(-1))
+
+            R[:, :train_size] = R[:, :train_size] + Ry_train
             src = self._run_graph_column_pipeline(R, y_train=y_train)
         else:
             if self.max_classes > 0:  # Classification
