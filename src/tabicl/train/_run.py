@@ -38,6 +38,7 @@ except ImportError:
 
 from tabicl._model.tabicl import TabICL
 from tabicl._model.nanotabicl import NanoTabICLv2
+from tabicl._model.graph import stack_graph_sets
 from tabicl.prior._dataset import PriorDataset
 from tabicl.prior._genload import LoadPriorDataset
 from tabicl.train._optim import get_scheduler
@@ -282,6 +283,7 @@ class Trainer:
             "graph_seed": self.config.graph_seed,
             "graph_share_across_batch": self.config.graph_share_across_batch,
             "graph_share_require_identical_labels": self.config.graph_share_require_identical_labels,
+            "graph_num_graphs": getattr(self.config, "graph_num_graphs", None) or self.config.icl_num_blocks,
             "learnable_residual": getattr(self.config, "learnable_residual", False),
             "ff_factor": self.config.ff_factor,
             "dropout": self.config.dropout,
@@ -382,6 +384,15 @@ class Trainer:
                 device=self.config.prior_device,
                 n_jobs=1,  # Set to 1 to avoid nested parallelism during DDP
                 normalization=getattr(self.config, "normalization", "none"),
+                graph_num_graphs=getattr(self.config, "graph_num_graphs", None) or self.config.icl_num_blocks,
+                graph_min_train_neighbors=self.config.graph_min_train_neighbors,
+                graph_max_train_neighbors=self.config.graph_max_train_neighbors,
+                graph_same_label_ratio=self.config.graph_same_label_ratio,
+                graph_cross_label_ratio=self.config.graph_cross_label_ratio,
+                graph_test_k_per_class=self.config.graph_test_k_per_class,
+                graph_seed=self.config.graph_seed,
+                graph_share_across_batch=self.config.graph_share_across_batch,
+                graph_share_require_identical_labels=self.config.graph_share_require_identical_labels,
             )
 
         val_start_offset = max(1, int(self.config.max_steps))
@@ -692,15 +703,24 @@ class Trainer:
         }
 
     def _prepare_padded_batch(self, batch):
-        return [t.to_padded_tensor(padding=0.0) if t.is_nested else t for t in batch]
+        return [
+            t.to_padded_tensor(padding=0.0) if hasattr(t, "is_nested") and t.is_nested else t
+            for t in batch
+        ]
 
     def _split_micro_batches(self, batch):
         num_micro_batches = math.ceil(self.config.batch_size / self.config.micro_batch_size)
-        micro_batches = [torch.split(t, self.config.micro_batch_size, dim=0) for t in batch]
-        return num_micro_batches, list(zip(*micro_batches))
+        tensor_splits = [torch.split(t, self.config.micro_batch_size, dim=0) for t in batch[:-1]]
+        graph_splits = [
+            batch[-1][start : start + self.config.micro_batch_size]
+            for start in range(0, len(batch[-1]), self.config.micro_batch_size)
+        ]
+        return num_micro_batches, [
+            tuple(parts[:-1]) + (parts[-1],) for parts in zip(*tensor_splits, graph_splits)
+        ]
 
     def _prepare_micro_batch_tensors(self, micro_batch):
-        micro_X, micro_y, micro_d, micro_seq_len, micro_train_size = micro_batch
+        micro_X, micro_y, micro_d, micro_seq_len, micro_train_size, graph_sets = micro_batch
         seq_len, train_size = self.validate_micro_batch(micro_seq_len, micro_train_size)
         micro_X, micro_y = self.align_micro_batch(micro_X, micro_y, micro_d, seq_len)
 
@@ -710,7 +730,7 @@ class Trainer:
 
         y_train = micro_y[:, :train_size]
         y_test = micro_y[:, train_size:]
-        return micro_X, micro_y, micro_d, y_train, y_test
+        return micro_X, micro_y, micro_d, y_train, y_test, graph_sets
 
     def _build_logging_payload(
         self,
@@ -954,7 +974,7 @@ class Trainer:
                 "Install with `uv sync --extra pretrain` or add sklearn to your environment."
             )
 
-        micro_X, micro_y, micro_d, micro_seq_len, micro_train_size = micro_batch
+        micro_X, micro_y, micro_d, micro_seq_len, micro_train_size, _graph_sets = micro_batch
         seq_len, train_size = self.validate_micro_batch(micro_seq_len, micro_train_size)
         micro_X, micro_y = self.align_micro_batch(micro_X, micro_y, micro_d, seq_len)
 
@@ -1020,7 +1040,8 @@ class Trainer:
         # debugging
         #self.fit_ensemble(micro_batch)
 
-        micro_X, _micro_y, micro_d, y_train, y_test = self._prepare_micro_batch_tensors(micro_batch)
+        micro_X, _micro_y, micro_d, y_train, y_test, graph_sets = self._prepare_micro_batch_tensors(micro_batch)
+        graph_set = stack_graph_sets(graph_sets)
 
         # Set DDP gradient sync for last micro batch only
         if do_backward and self.ddp:
@@ -1030,12 +1051,10 @@ class Trainer:
             supcon_weight = float(getattr(self.config, "supcon_weight", 0.0))
             entropy_weight = float(getattr(self.config, "entropy_weight", 0.0))
             capture_pre_decoder_repr = collect_artifacts or (supcon_weight > 0)
-            model_out = self.model(
-                micro_X,
-                y_train,
-                micro_d,
-                return_pre_decoder_repr=capture_pre_decoder_repr,
-            )
+            model_kwargs = {"return_pre_decoder_repr": capture_pre_decoder_repr}
+            if getattr(self.raw_model, "icl_backend", None) == "graph":
+                model_kwargs["graph_set"] = graph_set
+            model_out = self.model(micro_X, y_train, micro_d, **model_kwargs)
             pre_decoder_repr_test = None
             if capture_pre_decoder_repr:
                 # Some models/paths (e.g. TabICL in eval mode) may return only

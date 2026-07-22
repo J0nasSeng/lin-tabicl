@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from functools import partial
-from typing import Callable
+from typing import Callable, Sequence
 
 import torch
 from torch import nn, Tensor
@@ -225,6 +225,7 @@ class GraphAttentionTransformer(nn.Module):
         num_output_cls: int | None = None,
         out_dim: int | None = None,
         learnable_residual: bool = False,
+        num_graphs: int = 1,
     ):
         super().__init__()
         self.graph_blocks = nn.ModuleList(
@@ -268,12 +269,30 @@ class GraphAttentionTransformer(nn.Module):
             nn.init.zeros_(self.out_proj.bias)
 
         self.recompute = recompute
+        if num_blocks <= 0:
+            raise ValueError("num_blocks must be positive")
+        if num_graphs <= 0:
+            raise ValueError("num_graphs must be positive")
+        if num_blocks % num_graphs != 0:
+            raise ValueError("num_blocks must be divisible by num_graphs")
+        self.num_graphs = num_graphs
+        self.layers_per_graph = num_blocks // num_graphs
 
-    def forward(self, src: Tensor, edge_index_batch: list[Tensor]) -> Tensor:
+    def forward(self, src: Tensor, edge_index_batch: Sequence[list[Tensor]]) -> Tensor:
         if src.ndim != 4:
             raise ValueError("GraphAttentionTransformer expects src with shape (B, T, C, D)")
 
         B, T, C, D = src.shape
+        if len(edge_index_batch) != self.num_graphs:
+            raise ValueError(
+                f"Expected {self.num_graphs} graph batches, got {len(edge_index_batch)}"
+            )
+        for graph_idx, graph_edges in enumerate(edge_index_batch):
+            if len(graph_edges) != B:
+                raise ValueError(
+                    f"Graph {graph_idx} must contain one edge index per batch item; "
+                    f"got {len(graph_edges)} for batch size {B}"
+                )
         if self.num_output_cls is not None and C < self.num_output_cls:
             raise ValueError(
                 f"GraphAttentionTransformer expects at least {self.num_output_cls} columns for output CLS, got {C}."
@@ -281,10 +300,11 @@ class GraphAttentionTransformer(nn.Module):
 
         out = src
         for block_idx, block in enumerate(self.graph_blocks):
+            graph_edges = edge_index_batch[block_idx // self.layers_per_graph]
             if self.recompute:
-                out = checkpoint(partial(block, edge_index_batch=edge_index_batch), out, use_reentrant=False)
+                out = checkpoint(partial(block, edge_index_batch=graph_edges), out, use_reentrant=False)
             else:
-                out = block(out, edge_index_batch=edge_index_batch)
+                out = block(out, edge_index_batch=graph_edges)
 
             x_bt = out.reshape(B * T, C, D)
             attn_in = self.col_attn_ln[block_idx](x_bt)

@@ -7,6 +7,7 @@ from torch import nn, Tensor
 from .embedding import ColEmbedding
 from .interaction import RowInteraction
 from .learning import ICLearning
+from .graph import SparseGraphSet
 from .quantile_dist import QuantileToDistribution
 from .kv_cache import TabICLCache
 from .inference_config import InferenceConfig
@@ -183,6 +184,7 @@ class TabICL(nn.Module):
         graph_seed: Optional[int] = None,
         graph_share_across_batch: bool = False,
         graph_share_require_identical_labels: bool = True,
+        graph_num_graphs: int = 1,
         learnable_residual: bool = False,
         icl_ssmax: Union[
             bool,
@@ -242,6 +244,7 @@ class TabICL(nn.Module):
         self.graph_cross_label_ratio = graph_cross_label_ratio
         self.graph_test_k_per_class = graph_test_k_per_class
         self.graph_seed = graph_seed
+        self.graph_num_graphs = graph_num_graphs
         self.graph_share_across_batch = graph_share_across_batch
         self.graph_share_require_identical_labels = graph_share_require_identical_labels
         self.icl_ssmax = icl_ssmax
@@ -313,6 +316,7 @@ class TabICL(nn.Module):
             graph_share_across_batch=graph_share_across_batch,
             graph_share_require_identical_labels=graph_share_require_identical_labels,
             graph_num_cls=row_num_cls,
+            graph_num_graphs=graph_num_graphs,
             learnable_residual=learnable_residual,
         )
 
@@ -335,6 +339,7 @@ class TabICL(nn.Module):
         d: Optional[Tensor] = None,
         embed_with_test: bool = False,
         return_pre_decoder_repr: bool = False,
+        graph_set: Optional[SparseGraphSet] = None,
     ) -> Tensor | tuple[Tensor, Tensor]:
         """Column-wise embedding -> row-wise interaction -> dataset-wise in-context learning for training.
 
@@ -404,6 +409,7 @@ class TabICL(nn.Module):
             icl_input,
             y_train=y_train,
             return_pre_decoder_repr=return_pre_decoder_repr,
+            graph_set=graph_set,
         )
 
     def _inference_forward(
@@ -415,6 +421,7 @@ class TabICL(nn.Module):
         return_logits: bool = True,
         softmax_temperature: float = 0.9,
         inference_config: Optional[InferenceConfig] = None,
+        graph_set: Optional[SparseGraphSet] = None,
     ) -> Tensor:
         """Column-wise embedding -> row-wise interaction -> dataset-wise in-context learning.
 
@@ -491,6 +498,7 @@ class TabICL(nn.Module):
             return_logits=return_logits,
             softmax_temperature=softmax_temperature,
             mgr_config=inference_config.ICL_CONFIG,
+            graph_set=graph_set,
         )
 
         return out
@@ -506,6 +514,7 @@ class TabICL(nn.Module):
         softmax_temperature: float = 0.9,
         inference_config: Optional[InferenceConfig] = None,
         return_pre_decoder_repr: bool = False,
+        graph_set: Optional[SparseGraphSet] = None,
     ) -> Tensor | tuple[Tensor, Tensor]:
         """Column-wise embedding -> row-wise interaction -> dataset-wise in-context learning.
 
@@ -568,6 +577,7 @@ class TabICL(nn.Module):
                 d=d,
                 embed_with_test=embed_with_test,
                 return_pre_decoder_repr=return_pre_decoder_repr,
+                graph_set=graph_set,
             )
         else:
             out = self._inference_forward(
@@ -578,6 +588,7 @@ class TabICL(nn.Module):
                 return_logits=return_logits,
                 softmax_temperature=softmax_temperature,
                 inference_config=inference_config,
+                graph_set=graph_set,
             )
 
         return out

@@ -1,11 +1,12 @@
 import torch
 import pytest
 
-from src.tabicl._model.graph import build_class_conditioned_graph
-from src.tabicl._model.gat import GraphMultiheadAttention
+from src.tabicl._model.graph import build_class_conditioned_graph, build_class_conditioned_graphs, stack_graph_sets
+from src.tabicl._model.gat import GraphMultiheadAttention, GraphAttentionTransformer
 from src.tabicl._model.gat import GraphAttentionBlock
 from src.tabicl._model.learning import ICLearning
 from src.tabicl._model.tabicl import TabICL
+from src.tabicl.prior._dataset import PriorDataset
 from src.tabicl.train._losses import entropy_regularizer
 
 
@@ -73,6 +74,87 @@ def test_graph_builder_train_degree_and_test_class_coverage():
             incoming = (dst == test_node) & (src < train_size)
             class_incoming = incoming & class_mask
             assert int(class_incoming.sum().item()) >= 3
+
+
+def test_graph_builder_multiple_graphs_are_reproducible_and_independent():
+    y_train = _build_labels(batch_size=1, train_size=15, num_classes=3)
+
+    graph_set_a = build_class_conditioned_graphs(
+        y_train=y_train,
+        total_nodes=20,
+        num_graphs=3,
+        min_train_neighbors=1,
+        max_train_neighbors=3,
+        test_k_per_class=2,
+        seed=11,
+    )
+    graph_set_b = build_class_conditioned_graphs(
+        y_train=y_train,
+        total_nodes=20,
+        num_graphs=3,
+        min_train_neighbors=1,
+        max_train_neighbors=3,
+        test_k_per_class=2,
+        seed=11,
+    )
+
+    assert graph_set_a.num_graphs == 3
+    for graph_a, graph_b in zip(graph_set_a.graphs, graph_set_b.graphs):
+        assert torch.equal(graph_a.edge_index[0], graph_b.edge_index[0])
+    assert not torch.equal(
+        graph_set_a.graphs[0].edge_index[0], graph_set_a.graphs[1].edge_index[0]
+    )
+
+
+def test_graph_attention_transformer_routes_graphs_by_layer_group():
+    transformer = GraphAttentionTransformer(
+        num_blocks=4,
+        d_model=8,
+        nhead=2,
+        dim_feedforward=16,
+        num_graphs=2,
+    )
+    assert transformer.num_graphs == 2
+    assert transformer.layers_per_graph == 2
+
+    with pytest.raises(ValueError, match="divisible"):
+        GraphAttentionTransformer(
+            num_blocks=3,
+            d_model=8,
+            nhead=2,
+            dim_feedforward=16,
+            num_graphs=2,
+        )
+
+    with pytest.raises(ValueError, match="Expected 2 graph batches"):
+        transformer(torch.randn(1, 4, 2, 8), [[]])
+
+
+def test_prior_dataset_samples_graphs_with_each_dataset():
+    prior = PriorDataset(
+        batch_size=2,
+        batch_size_per_gp=2,
+        min_features=2,
+        max_features=2,
+        max_classes=3,
+        min_seq_len=8,
+        max_seq_len=9,
+        min_train_size=0.4,
+        max_train_size=0.6,
+        prior_type="dummy",
+        graph_num_graphs=2,
+        graph_min_train_neighbors=1,
+        graph_max_train_neighbors=2,
+        graph_test_k_per_class=1,
+    )
+
+    batch = prior.get_batch()
+    assert len(batch) == 6
+    graph_sets = batch[-1]
+    assert len(graph_sets) == 2
+    assert all(graph_set.num_graphs == 2 for graph_set in graph_sets)
+    stacked = stack_graph_sets(graph_sets)
+    assert len(stacked.graphs[0].edge_index) == 2
 
 
 def test_iclearning_graph_backend_forward_shape():

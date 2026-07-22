@@ -82,7 +82,11 @@ def _build_model_from_checkpoint(ckpt_path: str, device: str):
 
 
 def _prepare_single_dataset(batch: tuple[torch.Tensor, ...], idx: int):
-    x, y, d, seq_lens, train_sizes = batch
+    if len(batch) == 6:
+        x, y, d, seq_lens, train_sizes, graph_sets = batch
+    else:
+        x, y, d, seq_lens, train_sizes = batch
+        graph_sets = [None] * len(train_sizes)
 
     seq_len = int(seq_lens[idx].item())
     train_size = int(train_sizes[idx].item())
@@ -94,10 +98,10 @@ def _prepare_single_dataset(batch: tuple[torch.Tensor, ...], idx: int):
     y_train = y_i[:, :train_size]
     y_true_test = y_i[:, train_size:]
 
-    return x_i, y_i, d_i, y_train, y_true_test, train_size
+    return x_i, y_i, d_i, y_train, y_true_test, train_size, graph_sets[idx]
 
 
-def _forward_with_full_repr_tabicl(model: TabICL, x_i, y_train, d_i):
+def _forward_with_full_repr_tabicl(model: TabICL, x_i, y_train, d_i, graph_set):
     train_size = y_train.shape[1]
 
     d_eff = d_i
@@ -149,7 +153,7 @@ def _forward_with_full_repr_nano(model: NanoTabICLv2, x_i, y_train):
 
 
 def _evaluate_one_dataset(model, model_type: str, batch: tuple[torch.Tensor, ...], idx: int, device: str) -> EvalSample:
-    x_i, y_i, d_i, y_train, y_true_test, train_size = _prepare_single_dataset(batch, idx)
+    x_i, y_i, d_i, y_train, y_true_test, train_size, graph_set = _prepare_single_dataset(batch, idx)
 
     x_i = x_i.to(device)
     y_i = y_i.to(device)
@@ -159,7 +163,7 @@ def _evaluate_one_dataset(model, model_type: str, batch: tuple[torch.Tensor, ...
 
     with torch.no_grad():
         if model_type == "tabicl":
-            pred_test, repr_full = _forward_with_full_repr_tabicl(model, x_i, y_train, d_i)
+            pred_test, repr_full = _forward_with_full_repr_tabicl(model, x_i, y_train, d_i, graph_set)
         else:
             pred_test, repr_full = _forward_with_full_repr_nano(model, x_i, y_train)
 

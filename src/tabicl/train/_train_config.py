@@ -242,6 +242,12 @@ def build_parser():
 
     # ICL Config
     parser.add_argument("--icl_num_blocks", type=int, default=12, help="Number of transformer blocks in ICL predictor")
+    parser.add_argument(
+        "--graph_num_graphs",
+        type=int,
+        default=None,
+        help="Number of independently sampled graphs; defaults to one graph per ICL block",
+    )
     parser.add_argument("--icl_nhead", type=int, default=4, help="Number of attention heads in ICL predictor")
     parser.add_argument(
         "--icl_backend",

@@ -8,7 +8,7 @@ WAND_MODE=${WAND_MODE:-online}
 # GPU selection controls
 DEVICE=${DEVICE:-cuda}
 NUM_GPUS=${NUM_GPUS:-3}
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1,6,7}
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,3,5}
 # Confusion matrix logging interval
 LOG_CONF_MAT_EVERY=${LOG_CONF_MAT_EVERY:-2000}
 
@@ -63,7 +63,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --icl_backend ${ICL_BACKEND} \
             --ff_factor 2 \
             --norm_first True \
-            --checkpoint_dir /workspace/checkpoints_d=4_supcon=0.1/stage1/ \
+            --checkpoint_dir /workspace/checkpoints_dyngraph/stage1/ \
             --save_temp_every 1000 \
             --save_perm_every 5000 \
             --icl_soft_kmeans_temperature 0.5 \

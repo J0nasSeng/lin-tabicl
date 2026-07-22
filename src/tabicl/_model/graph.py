@@ -25,6 +25,48 @@ class SparseGraphBatch:
     num_nodes: int
 
 
+@dataclass
+class SparseGraphSet:
+    """A set of independently sampled sparse graph batches."""
+
+    graphs: list[SparseGraphBatch]
+
+    @property
+    def num_graphs(self) -> int:
+        return len(self.graphs)
+
+    @property
+    def num_nodes(self) -> int:
+        if not self.graphs:
+            raise ValueError("A graph set must contain at least one graph")
+        return self.graphs[0].num_nodes
+
+
+def stack_graph_sets(graph_sets: list[SparseGraphSet]) -> SparseGraphSet:
+    """Combine per-dataset graph sets into graph batches for model input."""
+
+    if not graph_sets:
+        raise ValueError("graph_sets must not be empty")
+    num_graphs = graph_sets[0].num_graphs
+    if any(graph_set.num_graphs != num_graphs for graph_set in graph_sets):
+        raise ValueError("All graph sets must contain the same number of graphs")
+
+    graphs = []
+    for graph_idx in range(num_graphs):
+        per_dataset = [graph_set.graphs[graph_idx] for graph_set in graph_sets]
+        num_nodes = per_dataset[0].num_nodes
+        if any(graph.num_nodes != num_nodes for graph in per_dataset):
+            raise ValueError("All graph batches must have the same number of nodes")
+        graphs.append(SparseGraphBatch(edge_index=[graph.edge_index[0] for graph in per_dataset], num_nodes=num_nodes))
+    return SparseGraphSet(graphs=graphs)
+
+
+def slice_graph_sets(graph_sets: list[SparseGraphSet], indices: slice) -> list[SparseGraphSet]:
+    """Slice per-dataset graph sets along the batch dimension."""
+
+    return graph_sets[indices]
+
+
 def _sample_indices(
     pool: Tensor,
     k: int,
@@ -265,3 +307,45 @@ def build_class_conditioned_graph(
         edge_index_batch.append(_build_single_graph(y_train[b].long()))
 
     return SparseGraphBatch(edge_index=edge_index_batch, num_nodes=total_nodes)
+
+
+def build_class_conditioned_graphs(
+    y_train: Tensor,
+    total_nodes: int,
+    num_graphs: int = 1,
+    min_train_neighbors: int = 8,
+    max_train_neighbors: int = 15,
+    same_label_ratio: float = 0.9,
+    cross_label_ratio: float = 0.1,
+    test_k_per_class: int = 3,
+    seed: Optional[int] = None,
+    share_graph_across_batch: bool = False,
+    share_graph_require_identical_labels: bool = True,
+) -> SparseGraphSet:
+    """Build multiple independently sampled class-conditioned graph batches.
+
+    Each graph uses the same sampling rules as
+    :func:`build_class_conditioned_graph`. When ``seed`` is supplied, graph
+    ``i`` uses ``seed + i`` so the complete graph set is reproducible while
+    individual graphs remain independently sampled.
+    """
+
+    if num_graphs <= 0:
+        raise ValueError("num_graphs must be positive")
+
+    graphs = [
+        build_class_conditioned_graph(
+            y_train=y_train,
+            total_nodes=total_nodes,
+            min_train_neighbors=min_train_neighbors,
+            max_train_neighbors=max_train_neighbors,
+            same_label_ratio=same_label_ratio,
+            cross_label_ratio=cross_label_ratio,
+            test_k_per_class=test_k_per_class,
+            seed=None if seed is None else seed + graph_idx,
+            share_graph_across_batch=share_graph_across_batch,
+            share_graph_require_identical_labels=share_graph_require_identical_labels,
+        )
+        for graph_idx in range(num_graphs)
+    ]
+    return SparseGraphSet(graphs=graphs)

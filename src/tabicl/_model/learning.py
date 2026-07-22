@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from .layers import ClassNode, OneHotAndLinear
 from .encoders import Encoder
 from .gat import GraphAttentionTransformer
-from .graph import build_class_conditioned_graph
+from .graph import SparseGraphSet, build_class_conditioned_graphs
 from .kv_cache import KVCache
 from .inference import InferenceManager
 from .inference_config import MgrConfig, InferenceConfig
@@ -99,6 +99,7 @@ class ICLearning(nn.Module):
         graph_share_across_batch: bool = False,
         graph_share_require_identical_labels: bool = True,
         graph_num_cls: int = 4,
+        graph_num_graphs: int = 1,
         learnable_residual: bool = False,
     ):
         super().__init__()
@@ -117,6 +118,7 @@ class ICLearning(nn.Module):
         self.graph_share_across_batch = graph_share_across_batch
         self.graph_share_require_identical_labels = graph_share_require_identical_labels
         self.graph_num_cls = graph_num_cls
+        self.graph_num_graphs = int(graph_num_graphs)
         self.learnable_residual = bool(learnable_residual)
 
         if self.icl_backend not in ("encoder", "graph"):
@@ -129,6 +131,9 @@ class ICLearning(nn.Module):
 
         if self.soft_kmeans_temperature <= 0:
             raise ValueError("soft_kmeans_temperature must be > 0")
+
+        if self.graph_num_graphs <= 0:
+            raise ValueError("graph_num_graphs must be positive")
 
         if self.icl_backend == "graph" and max_classes <= 0:
             raise ValueError("Graph ICL backend is currently supported for classification only (max_classes > 0).")
@@ -167,6 +172,7 @@ class ICLearning(nn.Module):
                 num_output_cls=self.graph_num_cls,
                 out_dim=d_model,
                 learnable_residual=self.learnable_residual,
+                num_graphs=self.graph_num_graphs,
             )
         if self.norm_first:
             self.ln = nn.LayerNorm(d_model, bias=not bias_free_ln)
@@ -402,6 +408,7 @@ class ICLearning(nn.Module):
         self,
         graph_input: Tensor,
         y_train: Tensor,
+        graph_set: Optional[SparseGraphSet] = None,
     ) -> Tensor:
         """Graph-only column pipeline.
 
@@ -433,31 +440,46 @@ class ICLearning(nn.Module):
                 f"Graph column pipeline expects at least {self.graph_num_cls} columns for CLS outputs, got {C}."
             )
 
-        graph = build_class_conditioned_graph(
-            y_train=y_train,
-            total_nodes=T,
-            min_train_neighbors=self.graph_min_train_neighbors,
-            max_train_neighbors=self.graph_max_train_neighbors,
-            same_label_ratio=self.graph_same_label_ratio,
-            cross_label_ratio=self.graph_cross_label_ratio,
-            test_k_per_class=self.graph_test_k_per_class,
-            seed=self.graph_seed,
-            share_graph_across_batch=self.graph_share_across_batch,
-            share_graph_require_identical_labels=self.graph_share_require_identical_labels,
-        )
+        if graph_set is None:
+            # Compatibility fallback for callers that have not yet adopted the
+            # prior batch graph field. New data pipelines should supply graphs.
+            graph_set = build_class_conditioned_graphs(
+                y_train=y_train,
+                total_nodes=T,
+                num_graphs=self.graph_num_graphs,
+                min_train_neighbors=self.graph_min_train_neighbors,
+                max_train_neighbors=self.graph_max_train_neighbors,
+                same_label_ratio=self.graph_same_label_ratio,
+                cross_label_ratio=self.graph_cross_label_ratio,
+                test_k_per_class=self.graph_test_k_per_class,
+                seed=self.graph_seed,
+                share_graph_across_batch=self.graph_share_across_batch,
+                share_graph_require_identical_labels=self.graph_share_require_identical_labels,
+            )
+
+        if graph_set.num_graphs != self.graph_num_graphs:
+            raise ValueError(
+                f"Expected {self.graph_num_graphs} graph batches, got {graph_set.num_graphs}"
+            )
+        if graph_set.num_nodes != T:
+            raise ValueError(f"Expected graph num_nodes={T}, got {graph_set.num_nodes}")
 
         x = graph_input
 
-        for b, edge_index in enumerate(graph.edge_index):
-            if edge_index.ndim != 2 or edge_index.shape[0] != 2:
-                raise ValueError("Each graph edge index must have shape (2, E)")
-            if edge_index.numel() > 0:
-                min_idx = int(edge_index.min().item())
-                max_idx = int(edge_index.max().item())
-                if min_idx < 0 or max_idx >= T:
-                    raise ValueError(f"edge_index out of bounds for dataset {b}: [{min_idx}, {max_idx}] vs T={T}")
+        for graph_idx, graph in enumerate(graph_set.graphs):
+            for b, edge_index in enumerate(graph.edge_index):
+                if edge_index.ndim != 2 or edge_index.shape[0] != 2:
+                    raise ValueError("Each graph edge index must have shape (2, E)")
+                if edge_index.numel() > 0:
+                    min_idx = int(edge_index.min().item())
+                    max_idx = int(edge_index.max().item())
+                    if min_idx < 0 or max_idx >= T:
+                        raise ValueError(
+                            f"edge_index out of bounds for graph {graph_idx}, dataset {b}: "
+                            f"[{min_idx}, {max_idx}] vs T={T}"
+                        )
 
-        return self.gat_icl(x, edge_index_batch=graph.edge_index)
+        return self.gat_icl(x, edge_index_batch=[graph.edge_index for graph in graph_set.graphs])
 
     def prepare_graph_input(
         self,
@@ -516,6 +538,7 @@ class ICLearning(nn.Module):
         return_pre_decoder_repr: bool = False,
         use_col_embeddings: bool = False,
         pre_col_embeddings: Optional[Tensor] = None,
+        graph_set: Optional[SparseGraphSet] = None,
     ) -> Tensor | tuple[Tensor, Tensor]:
         """In-context learning predictions.
 
@@ -547,10 +570,7 @@ class ICLearning(nn.Module):
                     "Graph backend expects R with shape (B, T, C, D). "
                     "Use prepare_graph_input for graph-mode inputs."
                 )
-            Ry_train = self.y_encoder(y_train.unsqueeze(-1))
-
-            R[:, :train_size] = R[:, :train_size] + Ry_train
-            src = self._run_graph_column_pipeline(R, y_train=y_train)
+            src = self._run_graph_column_pipeline(R, y_train=y_train, graph_set=graph_set)
         else:
             if self.max_classes > 0:  # Classification
                 Ry_train = self.y_encoder(y_train.float())
@@ -797,6 +817,7 @@ class ICLearning(nn.Module):
         return_pre_decoder_repr: bool = False,
         use_col_embeddings: bool = False,
         pre_col_embeddings: Optional[Tensor] = None,
+        graph_set: Optional[SparseGraphSet] = None,
     ) -> Tensor | tuple[Tensor, Tensor]:
         """In-context learning based on learned row representations.
 
@@ -846,12 +867,13 @@ class ICLearning(nn.Module):
                     R,
                     y_train,
                     return_pre_decoder_repr=True,
+                    graph_set=graph_set,
                 )
                 out = out[:, train_size:]
                 pre_decoder_repr = pre_decoder_repr[:, train_size:]
                 return out, pre_decoder_repr
 
-            out = self._icl_predictions(R, y_train)
+            out = self._icl_predictions(R, y_train, graph_set=graph_set)
             out = out[:, train_size:]
         else:
             if self.icl_backend == "graph":

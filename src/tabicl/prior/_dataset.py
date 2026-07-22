@@ -39,6 +39,7 @@ from ._hp_sampling import HpSamplerList
 from ._reg2cls import Reg2Cls
 from ._prior_config import DEFAULT_FIXED_HP, DEFAULT_SAMPLED_HP
 from tabicl._preprocessing.normalizer import normalize_batch
+from tabicl._model.graph import SparseGraphSet, build_class_conditioned_graphs
 
 
 warnings.filterwarnings(
@@ -938,6 +939,15 @@ class PriorDataset(IterableDataset):
         num_threads_per_generate: int = 1,
         device: str = "cpu",
         normalization: str = "none",
+        graph_num_graphs: int = 1,
+        graph_min_train_neighbors: int = 8,
+        graph_max_train_neighbors: int = 15,
+        graph_same_label_ratio: float = 0.9,
+        graph_cross_label_ratio: float = 0.1,
+        graph_test_k_per_class: int = 8,
+        graph_seed: Optional[int] = None,
+        graph_share_across_batch: bool = False,
+        graph_share_require_identical_labels: bool = True,
     ):
         super().__init__()
         if prior_type == "dummy":
@@ -997,6 +1007,15 @@ class PriorDataset(IterableDataset):
         if normalization not in ("none", "std", "robust"):
             raise ValueError("normalization must be one of: 'none', 'std', 'robust'")
         self.normalization = normalization
+        self.graph_num_graphs = int(graph_num_graphs)
+        self.graph_min_train_neighbors = graph_min_train_neighbors
+        self.graph_max_train_neighbors = graph_max_train_neighbors
+        self.graph_same_label_ratio = graph_same_label_ratio
+        self.graph_cross_label_ratio = graph_cross_label_ratio
+        self.graph_test_k_per_class = graph_test_k_per_class
+        self.graph_seed = graph_seed
+        self.graph_share_across_batch = graph_share_across_batch
+        self.graph_share_require_identical_labels = graph_share_require_identical_labels
 
     def get_batch(self, batch_size: Optional[int] = None) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Generate a new batch of datasets.
@@ -1035,7 +1054,29 @@ class PriorDataset(IterableDataset):
         batch = self.prior.get_batch(batch_size)
         X, y, d, seq_lens, train_sizes = batch
         X = normalize_batch(X, d, seq_lens, train_sizes, self.normalization)
-        return X, y, d, seq_lens, train_sizes
+        graph_sets: list[SparseGraphSet] = []
+        for dataset_idx in range(len(train_sizes)):
+            y_i = y[dataset_idx]
+            if y_i.is_nested:
+                y_i = y_i.to_padded_tensor(padding=0)
+            seq_len = int(seq_lens[dataset_idx].item())
+            train_size = int(train_sizes[dataset_idx].item())
+            graph_sets.append(
+                build_class_conditioned_graphs(
+                    y_train=y_i[:train_size].long().unsqueeze(0),
+                    total_nodes=seq_len,
+                    num_graphs=self.graph_num_graphs,
+                    min_train_neighbors=self.graph_min_train_neighbors,
+                    max_train_neighbors=self.graph_max_train_neighbors,
+                    same_label_ratio=self.graph_same_label_ratio,
+                    cross_label_ratio=self.graph_cross_label_ratio,
+                    test_k_per_class=self.graph_test_k_per_class,
+                    seed=None if self.graph_seed is None else self.graph_seed + dataset_idx,
+                    share_graph_across_batch=self.graph_share_across_batch,
+                    share_graph_require_identical_labels=self.graph_share_require_identical_labels,
+                )
+            )
+        return X, y, d, seq_lens, train_sizes, graph_sets
 
     def __iter__(self) -> "PriorDataset":
         """Return an iterator that yields batches indefinitely.
