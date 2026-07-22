@@ -17,6 +17,7 @@ import numpy as np
 import torch
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import log_loss, recall_score
+from sklearn.neighbors import KNeighborsClassifier
 
 from tabicl.eval._run import _build_model_from_checkpoint, _evaluate_one_dataset
 from tabicl._preprocessing.normalizer import RobustScaler, Standardizer, infer_feature_types
@@ -127,6 +128,13 @@ def build_parser() -> argparse.ArgumentParser:
 		help="Compatibility alias for enabling feature normalization.",
 	)
 	parser.add_argument(
+		"--knn",
+		type=int,
+		default=None,
+		metavar="K",
+		help="Use K-nearest-neighbor classification on GAT pre-decoder representations with K neighbors instead of the model decoder.",
+	)
+	parser.add_argument(
 		"--rf-n-estimators",
 		type=int,
 		default=50,
@@ -193,6 +201,18 @@ def _normalize_features(batch: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, 
 	return x, y, d, seq_lens, train_sizes
 
 
+def _knn_predictions(sample, n_neighbors: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+	"""Classify test representations using training representations and labels."""
+	train_size = sample.train_size
+	representations = np.nan_to_num(sample.repr_full.numpy(), nan=0.0, posinf=0.0, neginf=0.0)
+	labels = sample.y_full.numpy().astype(int)
+	classifier = KNeighborsClassifier(n_neighbors=min(n_neighbors, train_size), weights="uniform")
+	classifier.fit(representations[:train_size], labels[:train_size])
+	probabilities = classifier.predict_proba(representations[train_size:])
+	predictions = classifier.classes_[np.argmax(probabilities, axis=1)].astype(int)
+	return predictions, probabilities, classifier.classes_
+
+
 def _build_pretrained_tabicl(n_estimators: int, device: str, seed: int):
 	"""Build the pretrained sklearn-compatible TabICL baseline.
 
@@ -223,6 +243,7 @@ def _plot_umap(
 	tabicl_entropy: float,
 	umap_n_neighbors: int,
 	umap_n_epochs: int,
+	tabicl_prediction: np.ndarray | None = None,
 ) -> None:
 	"""Plot train and test representations before the soft-kNN layer side by side."""
 	try:
@@ -245,9 +266,9 @@ def _plot_umap(
 		representations[train_size:],
 	)
 	train_labels, test_labels = labels[:train_size], labels[train_size:]
-	tabicl_accuracy = _balanced_accuracy(
-		sample.y_true_test.numpy().astype(int), sample.y_pred_test.numpy().astype(int)
-	)
+	if tabicl_prediction is None:
+		tabicl_prediction = sample.y_pred_test.numpy().astype(int)
+	tabicl_accuracy = _balanced_accuracy(sample.y_true_test.numpy().astype(int), tabicl_prediction)
 	if train_representations.shape[0] < 3 or test_representations.shape[0] < 3:
 		return
 
@@ -369,7 +390,10 @@ def _evaluate_class_count(model, args: argparse.Namespace, num_classes: int, dev
 				)
 				rf_prediction = random_forest.predict(np.nan_to_num(x[train_size:])).astype(int)
 				rf_accuracy = _balanced_accuracy(y[train_size:], rf_prediction)
-				if getattr(model.icl_predictor, "decoder_type", None) in ("soft_kmeans", "rbf", "euclidean"):
+				knn_prediction = None
+				if args.knn is not None:
+					knn_prediction, tabicl_scores, _ = _knn_predictions(sample, args.knn)
+				elif getattr(model.icl_predictor, "decoder_type", None) in ("soft_kmeans", "rbf", "euclidean"):
 					tabicl_scores = sample.y_logits_test.float().exp().numpy()
 				else:
 					tabicl_scores = torch.softmax(sample.y_logits_test.float(), dim=-1).numpy()
@@ -385,6 +409,7 @@ def _evaluate_class_count(model, args: argparse.Namespace, num_classes: int, dev
 						tabicl_entropy,
 						args.umap_n_neighbors,
 						args.umap_n_epochs,
+						knn_prediction,
 					)
 				except Exception as exc:
 					print(f"Warning: UMAP plot failed for K={num_classes}, dataset={processed}: {exc}")
@@ -394,18 +419,25 @@ def _evaluate_class_count(model, args: argparse.Namespace, num_classes: int, dev
 			n_features = x.shape[1]
 			x_train, x_test = x[:train_size], x[train_size:]
 
-			if getattr(model.icl_predictor, "decoder_type", None) in ("soft_kmeans", "rbf", "euclidean"):
+			if args.knn is not None:
+				tabicl_prediction, tabicl_proba, tabicl_labels = _knn_predictions(sample, args.knn)
+			elif getattr(model.icl_predictor, "decoder_type", None) in ("soft_kmeans", "rbf", "euclidean"):
 				# Kernel decoders already return class masses; applying another
 				# softmax is incorrect.
 				tabicl_scores = sample.y_logits_test.float().exp().numpy()
+				tabicl_proba = _normalize_probabilities(tabicl_scores)
+				tabicl_prediction = sample.y_pred_test.numpy().astype(int)
+				tabicl_labels = np.arange(tabicl_proba.shape[1])
 			else:
 				tabicl_scores = torch.softmax(sample.y_logits_test.float(), dim=-1).numpy()
-			tabicl_proba = _normalize_probabilities(tabicl_scores)
+				tabicl_proba = _normalize_probabilities(tabicl_scores)
+			tabicl_prediction = sample.y_pred_test.numpy().astype(int)
+			tabicl_labels = np.arange(tabicl_proba.shape[1])
 			predictions = {
 				"tabicl": (
-					sample.y_pred_test.numpy().astype(int),
+					tabicl_prediction,
 					tabicl_proba,
-					np.arange(tabicl_proba.shape[1]),
+					tabicl_labels,
 				)
 			}
 			for name, factory in BASELINE_FACTORIES.items():
@@ -668,6 +700,8 @@ def main() -> None:
 		raise ValueError("--umap-n-neighbors must be at least 2")
 	if args.umap_n_epochs < 1:
 		raise ValueError("--umap-n-epochs must be positive")
+	if args.knn is not None and args.knn < 1:
+		raise ValueError("--knn must be positive")
 	if args.max_seq_len < 2:
 		raise ValueError("--max-seq-len must be at least 2")
 	if args.plot_results_only:
