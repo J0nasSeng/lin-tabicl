@@ -141,6 +141,6 @@ docs/tutorials/
 
 # logs
 wandb/
-checkpoints/
+checkpoints*
 gat_eval/
 prior_eval/
