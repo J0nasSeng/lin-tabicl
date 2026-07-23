@@ -116,6 +116,10 @@ def _forward_with_full_repr_tabicl(model: TabICL, x_i, y_train, d_i, graph_set):
         icl_input = model.row_interactor(col_embeddings, d=d_eff)
     else:
         pre_col_embeddings = model.col_embedder.project_input(x_i, d=d_eff)
+        # Some feature-embedding paths keep the projected input on the source
+        # device. Align it with the learned column embeddings before combining
+        # them, which is required for multi-GPU evaluation such as cuda:7.
+        pre_col_embeddings = pre_col_embeddings.to(device=col_embeddings.device)
         icl_input = model.icl_predictor.prepare_graph_input(
             col_embeddings=col_embeddings,
             y_train=y_train,
@@ -126,6 +130,7 @@ def _forward_with_full_repr_tabicl(model: TabICL, x_i, y_train, d_i, graph_set):
         icl_input,
         y_train,
         return_pre_decoder_repr=True,
+        graph_set=graph_set,
     )
 
     pred_test = out_full[:, train_size:]

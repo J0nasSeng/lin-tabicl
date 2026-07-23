@@ -298,6 +298,9 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
         n_jobs: Optional[int] = None,
         verbose: bool = False,
         inference_config: Optional[InferenceConfig | Dict] = None,
+        gat_mode: str = "ensemble",
+        gat_num_iterations: int = 1,
+        gat_entry_layer: int | str | None = None,
     ):
         self.n_estimators = n_estimators
         self.norm_methods = norm_methods
@@ -321,6 +324,9 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
         self.random_state = random_state
         self.verbose = verbose
         self.inference_config = inference_config
+        self.gat_mode = gat_mode
+        self.gat_num_iterations = gat_num_iterations
+        self.gat_entry_layer = gat_entry_layer
 
     def _load_model(self) -> None:
         """Load a model from a given path or download it if not available.
@@ -413,7 +419,13 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
         if checkpoint["config"].get("icl_backend", "encoder") == "graph":
             if self.kv_cache:
                 raise ValueError("KV caching is not currently supported for graph-backend inference.")
-            self.model_ = GATInferenceEngine(model_path_, device=self.device_)
+            self.model_ = GATInferenceEngine(
+                model_path_,
+                device=self.device_,
+                mode=self.gat_mode,
+                num_iterations=self.gat_num_iterations,
+                entry_layer=self.gat_entry_layer,
+            )
         else:
             self.model_ = TabICL(**checkpoint["config"], icl_backend="encoder")
         self.model_config_ = checkpoint["config"]
@@ -621,6 +633,58 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
 
         return np.concatenate(outputs, axis=0)
 
+    def _batch_forward_with_repr(
+        self, Xs: np.ndarray, ys: np.ndarray, feature_shuffles: Optional[np.ndarray] = None
+    ) -> np.ndarray:
+        """Return graph-backend representations for a batch of ensemble views."""
+        if not isinstance(self.model_, GATInferenceEngine):
+            raise ValueError("Representations are only exposed for graph-backend TabICL models.")
+
+        batch_size = self.batch_size or Xs.shape[0]
+        n_batches = int(np.ceil(Xs.shape[0] / batch_size))
+        Xs_split = np.array_split(Xs, n_batches)
+        ys_split = np.array_split(ys, n_batches)
+        if feature_shuffles is None:
+            feature_shuffles = [None] * n_batches
+        else:
+            feature_shuffles = np.array_split(feature_shuffles, n_batches)
+
+        representations = []
+        for X_batch, y_batch, shuffle_batch in zip(Xs_split, ys_split, feature_shuffles):
+            X_batch = torch.from_numpy(X_batch).float().to(self.device_)
+            y_batch = torch.from_numpy(y_batch).float().to(self.device_)
+            if shuffle_batch is not None:
+                shuffle_batch = shuffle_batch.tolist()
+            with torch.no_grad():
+                _, representation = self.model_(
+                    X=X_batch,
+                    y_train=y_batch,
+                    feature_shuffles=shuffle_batch,
+                    return_logits=True,
+                    inference_config=self.inference_config_,
+                    return_repr=True,
+                )
+            representations.append(representation.float().cpu().numpy())
+        return np.concatenate(representations, axis=0)
+
+    def predict_representation(self, X: np.ndarray) -> np.ndarray:
+        """Return the fitted graph TabICL representation for train and test rows.
+
+        The returned representation is produced by the same sklearn ensemble
+        views and GAT inference engine used by :meth:`predict_proba`.
+        """
+        check_is_fitted(self)
+        if not isinstance(self.model_, GATInferenceEngine):
+            raise ValueError("Representations are only exposed for graph-backend TabICL models.")
+
+        X = validate_data(self, X, reset=False, dtype=None, skip_check_array=True)
+        X = self.X_encoder_.transform(X)
+        data = self.ensemble_generator_.transform(X, mode="both")
+        outputs = []
+        for norm_method, (Xs, ys) in data.items():
+            feature_shuffles = self.ensemble_generator_.feature_shuffles_[norm_method]
+            outputs.append(self._batch_forward_with_repr(Xs, ys, feature_shuffles))
+        return np.mean(np.concatenate(outputs, axis=0), axis=0)
     def _batch_forward_with_cache(self, Xs: np.ndarray, kv_cache: TabICLCache) -> np.ndarray:
         """Process model forward passes using a pre-computed KV cache.
 

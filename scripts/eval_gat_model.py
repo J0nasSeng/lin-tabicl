@@ -22,6 +22,7 @@ from sklearn.neighbors import KNeighborsClassifier
 from tabicl.eval._run import _build_model_from_checkpoint, _evaluate_one_dataset
 from tabicl._preprocessing.normalizer import RobustScaler, Standardizer, infer_feature_types
 from tabicl.prior._dataset import PriorDataset
+from tabicl import TabICLClassifier
 
 
 # Registries make adding another baseline or score a local change rather than
@@ -49,9 +50,9 @@ def _balanced_accuracy(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 	classes, so explicitly supplying those labels gives the same value without
 	allowing a spurious prediction class to alter the class set.
 
-	This evaluation script calls the low-level TabICL model directly; it does not
-	construct the sklearn ensemble and therefore has no class-label permutation
-	setting to disable. The training labels are passed to the model unchanged.
+	The standard metrics use the sklearn estimators, whose class-label mapping is
+	restored before scoring. This helper is also used for optional direct-model
+	diagnostic predictions and therefore explicitly supplies the true test labels.
 	"""
 	labels = np.unique(y_true)
 	return float(
@@ -147,6 +148,23 @@ def build_parser() -> argparse.ArgumentParser:
 		help="Number of ensemble members for the pretrained TabICL baseline (default: 8)",
 	)
 	parser.add_argument(
+		"--gat-tabicl-n-estimators",
+		type=int,
+		default=None,
+		help="Number of sklearn ensemble members for the supplied GAT checkpoint (default: pretrained setting)",
+	)
+	parser.add_argument(
+		"--num-refinement-iter",
+		type=int,
+		default=1,
+		help="Number of repeated GAT refinement passes for the supplied checkpoint (default: 1)",
+	)
+	parser.add_argument(
+		"--entry-layer",
+		default="last",
+		help="GAT layer at which refinement starts; use 'last' for only the final layer (default: last)",
+	)
+	parser.add_argument(
 		"--umap-n-neighbors",
 		type=int,
 		default=10,
@@ -173,10 +191,12 @@ def build_parser() -> argparse.ArgumentParser:
 	return parser
 
 
-def _as_regular_tensors(batch: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
-	"""Convert variable-length prior batches to tensors usable by the loop."""
+def _as_regular_tensors(batch: tuple[object, ...]) -> tuple[object, ...]:
+	"""Convert variable-length prior tensors while preserving graph metadata."""
 	return tuple(
-		value.to_padded_tensor(padding=0.0) if value.is_nested else value
+		value.to_padded_tensor(padding=0.0)
+		if isinstance(value, torch.Tensor) and value.is_nested
+		else value
 		for value in batch
 	)
 
@@ -206,9 +226,29 @@ def _knn_predictions(sample, n_neighbors: int) -> tuple[np.ndarray, np.ndarray, 
 	train_size = sample.train_size
 	representations = np.nan_to_num(sample.repr_full.numpy(), nan=0.0, posinf=0.0, neginf=0.0)
 	labels = sample.y_full.numpy().astype(int)
-	classifier = KNeighborsClassifier(n_neighbors=min(n_neighbors, train_size), weights="uniform")
+	classifier = KNeighborsClassifier(
+		n_neighbors=min(n_neighbors, train_size), weights="uniform", metric="cosine"
+	)
 	classifier.fit(representations[:train_size], labels[:train_size])
 	probabilities = classifier.predict_proba(representations[train_size:])
+	predictions = classifier.classes_[np.argmax(probabilities, axis=1)].astype(int)
+	return predictions, probabilities, classifier.classes_
+
+
+def _knn_predictions_from_representation(
+	representations: np.ndarray,
+	y_train: np.ndarray,
+	n_neighbors: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+	"""Classify rows using representations returned by sklearn TabICL."""
+	representations = np.nan_to_num(representations, nan=0.0, posinf=0.0, neginf=0.0)
+	classifier = KNeighborsClassifier(
+		n_neighbors=min(n_neighbors, y_train.shape[0]),
+		weights="uniform",
+		metric="cosine",
+	)
+	classifier.fit(representations[: y_train.shape[0]], y_train)
+	probabilities = classifier.predict_proba(representations[y_train.shape[0] :])
 	predictions = classifier.classes_[np.argmax(probabilities, axis=1)].astype(int)
 	return predictions, probabilities, classifier.classes_
 
@@ -230,6 +270,30 @@ def _build_pretrained_tabicl(n_estimators: int, device: str, seed: int):
 		random_state=seed,
 		n_jobs=1,
 		verbose=False,
+		norm_methods="none"
+	)
+
+
+def _build_gat_tabicl(
+	checkpoint: Path,
+	n_estimators: int,
+	device: str,
+	seed: int,
+	num_refinement_iter: int,
+	entry_layer: int | str | None,
+):
+	"""Build the supplied graph checkpoint through the sklearn interface."""
+	return TabICLClassifier(
+		model_path=checkpoint,
+		n_estimators=n_estimators,
+		device=device,
+		random_state=seed,
+		n_jobs=1,
+		verbose=False,
+		gat_mode="reasoning" if num_refinement_iter > 1 else "ensemble",
+		gat_num_iterations=num_refinement_iter,
+		gat_entry_layer=entry_layer,
+		norm_methods="none",
 	)
 
 
@@ -332,7 +396,13 @@ def _plot_umap(
 	plt.close(fig)
 
 
-def _evaluate_class_count(model, args: argparse.Namespace, num_classes: int, device: str) -> list[dict]:
+def _evaluate_class_count(
+	model,
+	checkpoint: Path,
+	args: argparse.Namespace,
+	num_classes: int,
+	device: str,
+) -> list[dict]:
 	prior = PriorDataset(
 		batch_size=args.batch_size,
 		min_features=args.min_features,
@@ -349,11 +419,7 @@ def _evaluate_class_count(model, args: argparse.Namespace, num_classes: int, dev
 	)
 
 	rows: list[dict] = []
-	pretrained_tabicl = _build_pretrained_tabicl(
-		args.pretrained_tabicl_n_estimators,
-		device,
-		args.seed,
-	)
+	gat_n_estimators = args.gat_tabicl_n_estimators or args.pretrained_tabicl_n_estimators
 	processed = 0
 	batch_index = 0
 	while processed < args.num_datasets:
@@ -364,8 +430,6 @@ def _evaluate_class_count(model, args: argparse.Namespace, num_classes: int, dev
 			if processed >= args.num_datasets:
 				break
 
-			# The direct model path is intentional: it exercises the graph
-			# backend exactly as represented by the supplied checkpoint.
 			seq_len = int(batch[3][index].item())
 			train_size = int(batch[4][index].item())
 			y = batch[1][index, :seq_len].numpy().astype(int)
@@ -377,11 +441,25 @@ def _evaluate_class_count(model, args: argparse.Namespace, num_classes: int, dev
 				processed += 1
 				continue
 
-			sample = _evaluate_one_dataset(model, "tabicl", batch, index, device)
-			x = sample.x.numpy()
-			train_size = sample.train_size
+			x = batch[0][index, :seq_len, : int(batch[2][index].item())].numpy()
+			train_size = int(batch[4][index].item())
+			x_train, x_test = x[:train_size], x[train_size:]
+
+			gat_tabicl = _build_gat_tabicl(
+				checkpoint,
+				gat_n_estimators,
+				device,
+				args.seed + processed,
+				args.num_refinement_iter,
+				args.entry_layer,
+			)
+			gat_tabicl.fit(x_train, y_train)
+			gat_proba = gat_tabicl.predict_proba(x_test)
+			gat_prediction = gat_tabicl.classes_[np.argmax(gat_proba, axis=1)].astype(int)
+			gat_representation = gat_tabicl.predict_representation(x_test)
 
 			if args.skip_baselines:
+				sample = _evaluate_one_dataset(model, "tabicl", batch, index, device)
 				random_forest = BASELINE_FACTORIES["random_forest"](
 					args.seed + processed, args.rf_n_estimators
 				)
@@ -392,11 +470,11 @@ def _evaluate_class_count(model, args: argparse.Namespace, num_classes: int, dev
 				rf_accuracy = _balanced_accuracy(y[train_size:], rf_prediction)
 				knn_prediction = None
 				if args.knn is not None:
-					knn_prediction, tabicl_scores, _ = _knn_predictions(sample, args.knn)
-				elif getattr(model.icl_predictor, "decoder_type", None) in ("soft_kmeans", "rbf", "euclidean"):
-					tabicl_scores = sample.y_logits_test.float().exp().numpy()
+					knn_prediction, tabicl_scores, _ = _knn_predictions_from_representation(
+						gat_representation, y_train, args.knn
+					)
 				else:
-					tabicl_scores = torch.softmax(sample.y_logits_test.float(), dim=-1).numpy()
+					tabicl_scores = gat_proba
 				tabicl_entropy = _mean_entropy(tabicl_scores)
 				try:
 					_plot_umap(
@@ -409,7 +487,7 @@ def _evaluate_class_count(model, args: argparse.Namespace, num_classes: int, dev
 						tabicl_entropy,
 						args.umap_n_neighbors,
 						args.umap_n_epochs,
-						knn_prediction,
+						knn_prediction if knn_prediction is not None else gat_prediction,
 					)
 				except Exception as exc:
 					print(f"Warning: UMAP plot failed for K={num_classes}, dataset={processed}: {exc}")
@@ -417,29 +495,17 @@ def _evaluate_class_count(model, args: argparse.Namespace, num_classes: int, dev
 				continue
 
 			n_features = x.shape[1]
-			x_train, x_test = x[:train_size], x[train_size:]
-
 			if args.knn is not None:
-				tabicl_prediction, tabicl_proba, tabicl_labels = _knn_predictions(sample, args.knn)
-			elif getattr(model.icl_predictor, "decoder_type", None) in ("soft_kmeans", "rbf", "euclidean"):
-				# Kernel decoders already return class masses; applying another
-				# softmax is incorrect.
-				tabicl_scores = sample.y_logits_test.float().exp().numpy()
-				tabicl_proba = _normalize_probabilities(tabicl_scores)
-				tabicl_prediction = sample.y_pred_test.numpy().astype(int)
-				tabicl_labels = np.arange(tabicl_proba.shape[1])
-			else:
-				tabicl_scores = torch.softmax(sample.y_logits_test.float(), dim=-1).numpy()
-				tabicl_proba = _normalize_probabilities(tabicl_scores)
-			tabicl_prediction = sample.y_pred_test.numpy().astype(int)
-			tabicl_labels = np.arange(tabicl_proba.shape[1])
-			predictions = {
-				"tabicl": (
-					tabicl_prediction,
-					tabicl_proba,
-					tabicl_labels,
+				knn_prediction, knn_proba, knn_labels = _knn_predictions_from_representation(
+					gat_representation, y_train, args.knn
 				)
+			else:
+				knn_prediction = knn_proba = knn_labels = None
+			predictions = {
+				"gat_tabicl": (gat_prediction, gat_proba, gat_tabicl.classes_),
 			}
+			if knn_prediction is not None:
+				predictions["knn"] = (knn_prediction, knn_proba, knn_labels)
 			for name, factory in BASELINE_FACTORIES.items():
 				baseline = factory(args.seed + processed, args.rf_n_estimators)
 				# RF versions differ in NaN support; replacing non-finite
@@ -451,8 +517,13 @@ def _evaluate_class_count(model, args: argparse.Namespace, num_classes: int, dev
 					baseline.classes_,
 				)
 
-			# Use the public sklearn-compatible API so the pretrained model applies
-			# its own documented preprocessing, ensemble averaging, and label mapping.
+			# Use a fresh estimator and the public sklearn-compatible API for the
+			# pretrained encoder baseline too.
+			pretrained_tabicl = _build_pretrained_tabicl(
+				args.pretrained_tabicl_n_estimators,
+				device,
+				args.seed + processed,
+			)
 			pretrained_tabicl.fit(x_train, y_train)
 			pretrained_proba = pretrained_tabicl.predict_proba(x_test)
 			predictions["pretrained_tabicl"] = (
@@ -517,16 +588,17 @@ def _plot_results(rows: list[dict], output_dir: Path) -> None:
 			fig.savefig(output_dir / f"bar_{score_name}_k{num_classes}.png")
 			plt.close(fig)
 
-			tabicl = values["tabicl"]
+			primary_model = "gat_tabicl"
+			primary_values = values[primary_model]
 			fig, ax = plt.subplots(figsize=(6, 6))
 			print(f"Scatter Plots")
-			for baseline in (model for model in models if model != "tabicl"):
+			for baseline in (model for model in models if model != primary_model):
 				baseline_values = values[baseline]
-				ax.scatter(tabicl, baseline_values, s=18, alpha=0.45, label=baseline)
+				ax.scatter(primary_values, baseline_values, s=18, alpha=0.45, label=baseline)
 			ax.plot([0, 1], [0, 1], "k--", linewidth=1, alpha=0.6, label="equal performance")
 			ax.set(
-				title=f"K={num_classes}: TabICL vs baselines",
-				xlabel="TabICL",
+				title=f"K={num_classes}: GAT TabICL vs baselines",
+				xlabel="GAT TabICL",
 				ylabel="baseline",
 				xlim=(0, score_ylim),
 				ylim=(0, score_ylim),
@@ -569,12 +641,12 @@ def _plot_results(rows: list[dict], output_dir: Path) -> None:
 			tabicl_pairs = [
 				(uncertainty, accuracy[key])
 				for key, uncertainty in entropy.items()
-				if key[0] == "tabicl" and key in accuracy
+				if key[0] == "gat_tabicl" and key in accuracy
 			]
 			if tabicl_pairs:
 				entropy_values, accuracy_values = map(np.asarray, zip(*tabicl_pairs))
 				fig, ax = plt.subplots(figsize=(6, 5))
-				ax.scatter(entropy_values, accuracy_values, s=18, alpha=0.45, label="tabicl")
+				ax.scatter(entropy_values, accuracy_values, s=18, alpha=0.45, label="gat_tabicl")
 				ax.set(
 					title=f"K={num_classes}: TabICL accuracy versus entropy",
 					xlabel="Mean predictive entropy",
@@ -597,12 +669,12 @@ def _plot_results(rows: list[dict], output_dir: Path) -> None:
 			tabicl_pairs = [
 				(cross_entropy_value, accuracy[key])
 				for key, cross_entropy_value in cross_entropy.items()
-				if key[0] == "tabicl" and key in accuracy
+				if key[0] == "gat_tabicl" and key in accuracy
 			]
 			if tabicl_pairs:
 				cross_entropy_values, accuracy_values = map(np.asarray, zip(*tabicl_pairs))
 				fig, ax = plt.subplots(figsize=(6, 5))
-				ax.scatter(cross_entropy_values, accuracy_values, s=18, alpha=0.45, label="tabicl")
+				ax.scatter(cross_entropy_values, accuracy_values, s=18, alpha=0.45, label="gat_tabicl")
 				ax.set(
 					title=f"K={num_classes}: TabICL accuracy versus cross entropy",
 					xlabel="Cross entropy",
@@ -696,6 +768,17 @@ def main() -> None:
 		raise ValueError("--rf-n-estimators must be positive")
 	if args.pretrained_tabicl_n_estimators < 1:
 		raise ValueError("--pretrained-tabicl-n-estimators must be positive")
+	if args.gat_tabicl_n_estimators is not None and args.gat_tabicl_n_estimators < 1:
+		raise ValueError("--gat-tabicl-n-estimators must be positive")
+	if args.num_refinement_iter < 1:
+		raise ValueError("--num-refinement-iter must be positive")
+	if args.entry_layer != "last":
+		try:
+			if int(args.entry_layer) < 1:
+				raise ValueError
+			args.entry_layer = int(args.entry_layer)
+		except ValueError as exc:
+			raise ValueError("--entry-layer must be 'last' or a positive integer") from exc
 	if args.umap_n_neighbors < 2:
 		raise ValueError("--umap-n-neighbors must be at least 2")
 	if args.umap_n_epochs < 1:
@@ -723,10 +806,16 @@ def main() -> None:
 	if model_type != "tabicl" or getattr(model, "icl_backend", None) != "graph":
 		raise ValueError("The checkpoint must contain a TabICL model with icl_backend='graph'.")
 
+	checkpoint_config = torch.load(args.checkpoint, map_location="cpu", weights_only=True).get("config", {})
+	if str(checkpoint_config.get("model_type", "tabicl")).lower() != "tabicl":
+		raise ValueError("The supplied checkpoint must contain a TabICL model.")
+	if checkpoint_config.get("icl_backend") != "graph":
+		raise ValueError("The supplied checkpoint must contain a TabICL model with icl_backend='graph'.")
+
 	rows = []
 	for num_classes in range(10, 11):
 		print(f"Evaluating {args.num_datasets} datasets for K={num_classes}...")
-		rows.extend(_evaluate_class_count(model, args, num_classes, device))
+		rows.extend(_evaluate_class_count(model, args.checkpoint, args, num_classes, device))
 	if args.skip_baselines:
 		print(f"Generated UMAP plots for {args.num_datasets} datasets for each K=2,...,10")
 		print(f"Saved UMAP plots to {args.output_dir / 'umap'}")

@@ -43,7 +43,7 @@ class GATInferenceEngine(nn.Module):
 		device: str | torch.device | None = None,
 		mode: str = "ensemble",
 		num_iterations: int = 1,
-		entry_layer: int | None = None,
+		entry_layer: int | str | None = None,
 	) -> None:
 		super().__init__()
 		if mode not in {"ensemble", "reasoning"}:
@@ -53,6 +53,8 @@ class GATInferenceEngine(nn.Module):
 
 		self.mode = mode
 		self.num_iterations = int(num_iterations)
+		if entry_layer not in (None, "last") and not isinstance(entry_layer, int):
+			raise ValueError("entry_layer must be an integer, 'last', or None")
 		self.entry_layer = entry_layer
 		self.device_ = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
@@ -62,6 +64,16 @@ class GATInferenceEngine(nn.Module):
 			raise ValueError("The checkpoint must contain 'config' and 'state_dict'.")
 
 		config = dict(checkpoint["config"])
+		# Training checkpoints include this discriminator, while ``TabICL``
+		# accepts the architecture parameters directly.
+		config.pop("model_type", None)
+		# Older graph checkpoints may predate persisting this architecture flag;
+		# infer it from the learned residual parameters so their weights load with
+		# the same module structure.
+		if "learnable_residual" not in config:
+			config["learnable_residual"] = any(
+				key.endswith("attn.alpha") for key in checkpoint["state_dict"]
+			)
 		if config.get("icl_backend", "graph") != "graph":
 			raise ValueError("GATInferenceEngine requires a checkpoint with icl_backend='graph'.")
 
@@ -77,7 +89,9 @@ class GATInferenceEngine(nn.Module):
 
 		gat = self.model.icl_predictor.gat_icl
 		self.num_layers = len(gat.graph_blocks)
-		if entry_layer is not None and not 1 <= entry_layer <= self.num_layers:
+		if self.entry_layer == "last":
+			self.entry_layer = self.num_layers
+		if self.entry_layer is not None and not 1 <= self.entry_layer <= self.num_layers:
 			raise ValueError(f"entry_layer must be between 1 and {self.num_layers}")
 
 	@property
@@ -147,7 +161,17 @@ class GATInferenceEngine(nn.Module):
 				attn_in = gat.col_attn_ln[block_idx](flat)
 				attn_out, _ = gat.col_attn[block_idx](attn_in, attn_in, attn_in, need_weights=False)
 				out = (flat + attn_out).reshape(B, T, C, D)
-		return out
+
+		# ``GraphAttentionTransformer.forward`` projects the final CLS columns
+		# from 4D column representations to the 3D row representations consumed
+		# by the decoder. The manual suffix loop above must perform the same step.
+		num_output_cls = gat.num_output_cls
+		if num_output_cls is None:
+			return out
+		cls_out = out[:, :, -num_output_cls:, :].reshape(B, T, num_output_cls * D)
+		if gat.out_proj is not None:
+			cls_out = gat.out_proj(cls_out)
+		return cls_out
 
 	def _decode(self, representations: Tensor, y_train: Tensor) -> Tensor:
 		predictor = self.model.icl_predictor
@@ -182,6 +206,16 @@ class GATInferenceEngine(nn.Module):
 			graph_set = self._make_graph_set(y_train, X.shape[1])
 
 		if self.mode == "ensemble" or self.num_iterations == 1 and self.entry_layer is None:
+			if return_repr:
+				graph_input = self._graph_input(X, y_train, inference_config, feature_shuffles)
+				representation = self._run_refinement(graph_input, graph_set)
+				out = self._decode(representation, y_train)[:, y_train.shape[1] :]
+				if self.model.max_classes > 0:
+					num_classes = int(torch.unique(y_train[0]).numel())
+					out = out[..., :num_classes]
+				if not return_logits:
+					out = torch.softmax(out / softmax_temperature, dim=-1)
+				return out, representation
 			out = self.model._inference_forward(
 				X=X,
 				y_train=y_train,
@@ -197,6 +231,11 @@ class GATInferenceEngine(nn.Module):
 		graph_input = self._graph_input(X, y_train, inference_config, feature_shuffles)
 		refined = self._run_refinement(graph_input, graph_set)
 		out = self._decode(refined, y_train)[:, y_train.shape[1] :]
+		if self.model.max_classes > 0:
+			# Match ICLearning's inference path: ensemble label shuffles operate
+			# on the classes present in this dataset, not the checkpoint maximum.
+			num_classes = int(torch.unique(y_train[0]).numel())
+			out = out[..., :num_classes]
 		if not return_logits:
 			if self.model.icl_predictor.decoder_type in {"soft_kmeans", "rbf", "euclidean"}:
 				out = out.exp()

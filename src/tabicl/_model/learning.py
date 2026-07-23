@@ -870,7 +870,7 @@ class ICLearning(nn.Module):
             out = out[:, train_size:]
         else:
             if self.icl_backend == "graph":
-                out = self._icl_predictions(R, y_train)
+                out = self._icl_predictions(R, y_train, graph_set=graph_set)
                 train_size = y_train.shape[1]
                 out = out[:, train_size:]
                 if self.max_classes > 0:
