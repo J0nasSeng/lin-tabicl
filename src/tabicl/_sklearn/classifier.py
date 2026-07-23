@@ -24,6 +24,7 @@ from .sklearn_utils import validate_data, _num_samples
 from tabicl import InferenceConfig
 from tabicl._model.tabicl import TabICL
 from tabicl._model.kv_cache import TabICLCache
+from tabicl._model.gat_inference_engine import GATInferenceEngine
 
 
 class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
@@ -409,10 +410,16 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
         assert "state_dict" in checkpoint, "The checkpoint doesn't contain the model state."
 
         self.model_path_ = model_path_
-        self.model_ = TabICL(**checkpoint["config"], icl_backend='encoder')
+        if checkpoint["config"].get("icl_backend", "encoder") == "graph":
+            if self.kv_cache:
+                raise ValueError("KV caching is not currently supported for graph-backend inference.")
+            self.model_ = GATInferenceEngine(model_path_, device=self.device_)
+        else:
+            self.model_ = TabICL(**checkpoint["config"], icl_backend="encoder")
         self.model_config_ = checkpoint["config"]
-        self.model_.load_state_dict(checkpoint["state_dict"])
-        self.model_.eval()
+        if not isinstance(self.model_, GATInferenceEngine):
+            self.model_.load_state_dict(checkpoint["state_dict"])
+            self.model_.eval()
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> TabICLClassifier:
         """Fit the classifier to training data.

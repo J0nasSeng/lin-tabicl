@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from .layers import ClassNode, OneHotAndLinear
 from .encoders import Encoder
 from .gat import GraphAttentionTransformer
-from .graph import SparseGraphSet, build_class_conditioned_graphs
+from .graph import SparseGraphSet
 from .kv_cache import KVCache
 from .inference import InferenceManager
 from .inference_config import MgrConfig, InferenceConfig
@@ -441,21 +441,7 @@ class ICLearning(nn.Module):
             )
 
         if graph_set is None:
-            # Compatibility fallback for callers that have not yet adopted the
-            # prior batch graph field. New data pipelines should supply graphs.
-            graph_set = build_class_conditioned_graphs(
-                y_train=y_train,
-                total_nodes=T,
-                num_graphs=self.graph_num_graphs,
-                min_train_neighbors=self.graph_min_train_neighbors,
-                max_train_neighbors=self.graph_max_train_neighbors,
-                same_label_ratio=self.graph_same_label_ratio,
-                cross_label_ratio=self.graph_cross_label_ratio,
-                test_k_per_class=self.graph_test_k_per_class,
-                seed=self.graph_seed,
-                share_graph_across_batch=self.graph_share_across_batch,
-                share_graph_require_identical_labels=self.graph_share_require_identical_labels,
-            )
+            raise ValueError("Graph backend requires precomputed graph metadata")
 
         if graph_set.num_graphs != self.graph_num_graphs:
             raise ValueError(
@@ -465,9 +451,15 @@ class ICLearning(nn.Module):
             raise ValueError(f"Expected graph num_nodes={T}, got {graph_set.num_nodes}")
 
         x = graph_input
+        edge_index_batch: list[list[Tensor]] = []
 
         for graph_idx, graph in enumerate(graph_set.graphs):
+            graph_edges: list[Tensor] = []
             for b, edge_index in enumerate(graph.edge_index):
+                # Graph metadata is stored compactly as uint16; PyTorch's
+                # reductions and indexing paths require int64 here.
+                edge_index = edge_index.to(device=x.device, dtype=torch.long)
+                graph_edges.append(edge_index)
                 if edge_index.ndim != 2 or edge_index.shape[0] != 2:
                     raise ValueError("Each graph edge index must have shape (2, E)")
                 if edge_index.numel() > 0:
@@ -478,8 +470,9 @@ class ICLearning(nn.Module):
                             f"edge_index out of bounds for graph {graph_idx}, dataset {b}: "
                             f"[{min_idx}, {max_idx}] vs T={T}"
                         )
+            edge_index_batch.append(graph_edges)
 
-        return self.gat_icl(x, edge_index_batch=[graph.edge_index for graph in graph_set.graphs])
+        return self.gat_icl(x, edge_index_batch=edge_index_batch)
 
     def prepare_graph_input(
         self,

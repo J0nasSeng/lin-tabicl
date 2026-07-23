@@ -211,7 +211,6 @@ class Standardizer(Normalizer):
 
             normalized = scaled_active.clone()
             normalized[:, continuous] = (scaled_active[:, continuous] - mean[continuous]) / std[continuous]
-            print(f"normalized mean: {normalized.mean(dim=0)}, std: {normalized.std(dim=0)}")
             result[dataset_idx, :sequence_length, :feature_count] = torch.where(
                 torch.isfinite(normalized), normalized, torch.zeros_like(normalized)
             )

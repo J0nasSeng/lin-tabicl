@@ -277,6 +277,7 @@ class Prior:
         else:
             return 10
 
+
     @staticmethod
     def delete_unique_features(X: Tensor, d: Tensor) -> Tuple[Tensor, Tensor]:
         """Remove features that have only one unique value across all samples.
@@ -390,6 +391,24 @@ class Prior:
         return True
 
 
+def _build_prior_graph(params: Dict[str, Any], y: Tensor) -> SparseGraphSet:
+    """Build graph metadata for one valid dataset inside prior generation."""
+    train_size = int(params["train_size"])
+    return build_class_conditioned_graphs(
+        y_train=y[:train_size].long().unsqueeze(0),
+        total_nodes=int(params["seq_len"]),
+        num_graphs=int(params["graph_num_graphs"]),
+        min_train_neighbors=int(params["graph_min_train_neighbors"]),
+        max_train_neighbors=int(params["graph_max_train_neighbors"]),
+        same_label_ratio=float(params["graph_same_label_ratio"]),
+        cross_label_ratio=float(params["graph_cross_label_ratio"]),
+        test_k_per_class=int(params["graph_test_k_per_class"]),
+        seed=params.get("graph_seed"),
+        share_graph_across_batch=bool(params["graph_share_across_batch"]),
+        share_graph_require_identical_labels=bool(params["graph_share_require_identical_labels"]),
+    )
+
+
 class SCMPrior(Prior):
     """Generate synthetic datasets using Structural Causal Models (SCM).
 
@@ -487,6 +506,16 @@ class SCMPrior(Prior):
         num_threads_per_generate: int = 1,
         device: str = "cpu",
         normalization: str = "none",
+        graph_backend: bool = False,
+        graph_num_graphs: int = 1,
+        graph_min_train_neighbors: int = 8,
+        graph_max_train_neighbors: int = 15,
+        graph_same_label_ratio: float = 0.9,
+        graph_cross_label_ratio: float = 0.1,
+        graph_test_k_per_class: int = 8,
+        graph_seed: Optional[int] = None,
+        graph_share_across_batch: bool = False,
+        graph_share_require_identical_labels: bool = True,
     ):
         super().__init__(
             batch_size=batch_size,
@@ -510,6 +539,16 @@ class SCMPrior(Prior):
         self.n_jobs = n_jobs
         self.num_threads_per_generate = num_threads_per_generate
         self.device = device
+        self.graph_backend = graph_backend
+        self.graph_num_graphs = int(graph_num_graphs)
+        self.graph_min_train_neighbors = graph_min_train_neighbors
+        self.graph_max_train_neighbors = graph_max_train_neighbors
+        self.graph_same_label_ratio = graph_same_label_ratio
+        self.graph_cross_label_ratio = graph_cross_label_ratio
+        self.graph_test_k_per_class = graph_test_k_per_class
+        self.graph_seed = graph_seed
+        self.graph_share_across_batch = graph_share_across_batch
+        self.graph_share_require_identical_labels = graph_share_require_identical_labels
 
     def hp_sampling(self) -> Dict[str, Any]:
         """Sample hyperparameters for dataset generation.
@@ -523,7 +562,7 @@ class SCMPrior(Prior):
         return hp_sampler.sample()
 
     @torch.no_grad()
-    def generate_dataset(self, params: Dict[str, Any]) -> Tuple[Tensor, Tensor, Tensor]:
+    def generate_dataset(self, params: Dict[str, Any]) -> tuple:
         """Generate a single valid dataset based on the provided parameters.
 
         Parameters
@@ -564,7 +603,10 @@ class SCMPrior(Prior):
             # Only keep valid datasets with sufficient features and balanced classes
             X, d = self.delete_unique_features(X, d)
             if (d > 0).all() and self.sanity_check(X, y, params["train_size"]):
-                return X.squeeze(0), y.squeeze(0), d.squeeze(0)
+                X, y, d = X.squeeze(0), y.squeeze(0), d.squeeze(0)
+                if params.get("graph_backend", False):
+                    return X, y, d, _build_prior_graph(params, y)
+                return X, y, d
 
     @torch.no_grad()
     def get_batch(self, batch_size: Optional[int] = None) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
@@ -673,6 +715,16 @@ class SCMPrior(Prior):
                         "num_features": subgp_num_features,
                         "num_classes": ds_num_classes,
                         "device": self.device,
+                        "graph_backend": self.graph_backend,
+                        "graph_num_graphs": self.graph_num_graphs,
+                        "graph_min_train_neighbors": self.graph_min_train_neighbors,
+                        "graph_max_train_neighbors": self.graph_max_train_neighbors,
+                        "graph_same_label_ratio": self.graph_same_label_ratio,
+                        "graph_cross_label_ratio": self.graph_cross_label_ratio,
+                        "graph_test_k_per_class": self.graph_test_k_per_class,
+                        "graph_seed": None if self.graph_seed is None else self.graph_seed + len(param_list),
+                        "graph_share_across_batch": self.graph_share_across_batch,
+                        "graph_share_require_identical_labels": self.graph_share_require_identical_labels,
                     }
                     param_list.append(params)
 
@@ -690,7 +742,10 @@ class SCMPrior(Prior):
         else:
             results = [self.generate_dataset(params) for params in param_list]
 
-        X_list, y_list, d_list = zip(*results)
+        if self.graph_backend:
+            X_list, y_list, d_list, graph_sets = zip(*results)
+        else:
+            X_list, y_list, d_list = zip(*results)
 
         # Combine Results
         if self.seq_len_per_gp:
@@ -709,6 +764,8 @@ class SCMPrior(Prior):
             [params["train_size"] for params in param_list], device=self.device, dtype=torch.long
         )
 
+        if self.graph_backend:
+            return X, y, d, seq_lens, train_sizes, list(graph_sets)
         return X, y, d, seq_lens, train_sizes
 
     def get_prior(self) -> str:
@@ -781,6 +838,16 @@ class DummyPrior(Prior):
         min_train_size: Union[int, float] = 0.1,
         max_train_size: Union[int, float] = 0.9,
         device: str = "cpu",
+        graph_backend: bool = False,
+        graph_num_graphs: int = 1,
+        graph_min_train_neighbors: int = 8,
+        graph_max_train_neighbors: int = 15,
+        graph_same_label_ratio: float = 0.9,
+        graph_cross_label_ratio: float = 0.1,
+        graph_test_k_per_class: int = 8,
+        graph_seed: Optional[int] = None,
+        graph_share_across_batch: bool = False,
+        graph_share_require_identical_labels: bool = True,
     ):
         super().__init__(
             batch_size=batch_size,
@@ -794,9 +861,19 @@ class DummyPrior(Prior):
             max_train_size=max_train_size,
         )
         self.device = device
+        self.graph_backend = graph_backend
+        self.graph_num_graphs = graph_num_graphs
+        self.graph_min_train_neighbors = graph_min_train_neighbors
+        self.graph_max_train_neighbors = graph_max_train_neighbors
+        self.graph_same_label_ratio = graph_same_label_ratio
+        self.graph_cross_label_ratio = graph_cross_label_ratio
+        self.graph_test_k_per_class = graph_test_k_per_class
+        self.graph_seed = graph_seed
+        self.graph_share_across_batch = graph_share_across_batch
+        self.graph_share_require_identical_labels = graph_share_require_identical_labels
 
     @torch.no_grad()
-    def get_batch(self, batch_size: Optional[int] = None) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    def get_batch(self, batch_size: Optional[int] = None) -> tuple:
         """Generate a batch of random datasets for testing purposes.
 
         Parameters
@@ -840,6 +917,21 @@ class DummyPrior(Prior):
         seq_lens = torch.full((batch_size,), seq_len, device=self.device)
         train_sizes = torch.full((batch_size,), train_size, device=self.device)
 
+        if self.graph_backend:
+            params = {
+                "seq_len": seq_len,
+                "train_size": train_size,
+                "graph_num_graphs": self.graph_num_graphs,
+                "graph_min_train_neighbors": self.graph_min_train_neighbors,
+                "graph_max_train_neighbors": self.graph_max_train_neighbors,
+                "graph_same_label_ratio": self.graph_same_label_ratio,
+                "graph_cross_label_ratio": self.graph_cross_label_ratio,
+                "graph_test_k_per_class": self.graph_test_k_per_class,
+                "graph_seed": self.graph_seed,
+                "graph_share_across_batch": self.graph_share_across_batch,
+                "graph_share_require_identical_labels": self.graph_share_require_identical_labels,
+            }
+            return X, y, d, seq_lens, train_sizes, [_build_prior_graph(params, y_i) for y_i in y]
         return X, y, d, seq_lens, train_sizes
 
 
@@ -940,6 +1032,7 @@ class PriorDataset(IterableDataset):
         device: str = "cpu",
         normalization: str = "none",
         graph_num_graphs: int = 1,
+        graph_backend: Optional[bool] = None,
         graph_min_train_neighbors: int = 8,
         graph_max_train_neighbors: int = 15,
         graph_same_label_ratio: float = 0.9,
@@ -950,6 +1043,10 @@ class PriorDataset(IterableDataset):
         graph_share_require_identical_labels: bool = True,
     ):
         super().__init__()
+        # None preserves the historical direct-PriorDataset behavior. Training
+        # code passes an explicit backend flag, so non-graph backends stay on
+        # the original five-field path.
+        self.graph_backend = True if graph_backend is None else bool(graph_backend)
         if prior_type == "dummy":
             self.prior = DummyPrior(
                 batch_size=batch_size,
@@ -962,6 +1059,16 @@ class PriorDataset(IterableDataset):
                 min_train_size=min_train_size,
                 max_train_size=max_train_size,
                 device=device,
+                graph_backend=self.graph_backend,
+                graph_num_graphs=graph_num_graphs,
+                graph_min_train_neighbors=graph_min_train_neighbors,
+                graph_max_train_neighbors=graph_max_train_neighbors,
+                graph_same_label_ratio=graph_same_label_ratio,
+                graph_cross_label_ratio=graph_cross_label_ratio,
+                graph_test_k_per_class=graph_test_k_per_class,
+                graph_seed=graph_seed,
+                graph_share_across_batch=graph_share_across_batch,
+                graph_share_require_identical_labels=graph_share_require_identical_labels,
             )
         elif prior_type in ["mlp_scm", "tree_scm", "mix_scm", "nanotabicl"]:
             self.prior = SCMPrior(
@@ -984,6 +1091,16 @@ class PriorDataset(IterableDataset):
                 n_jobs=n_jobs,
                 num_threads_per_generate=num_threads_per_generate,
                 device=device,
+                graph_backend=self.graph_backend,
+                graph_num_graphs=graph_num_graphs,
+                graph_min_train_neighbors=graph_min_train_neighbors,
+                graph_max_train_neighbors=graph_max_train_neighbors,
+                graph_same_label_ratio=graph_same_label_ratio,
+                graph_cross_label_ratio=graph_cross_label_ratio,
+                graph_test_k_per_class=graph_test_k_per_class,
+                graph_seed=graph_seed,
+                graph_share_across_batch=graph_share_across_batch,
+                graph_share_require_identical_labels=graph_share_require_identical_labels,
             )
         else:
             raise ValueError(
@@ -1017,7 +1134,7 @@ class PriorDataset(IterableDataset):
         self.graph_share_across_batch = graph_share_across_batch
         self.graph_share_require_identical_labels = graph_share_require_identical_labels
 
-    def get_batch(self, batch_size: Optional[int] = None) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    def get_batch(self, batch_size: Optional[int] = None) -> tuple:
         """Generate a new batch of datasets.
 
         Parameters
@@ -1052,31 +1169,14 @@ class PriorDataset(IterableDataset):
             Position for train/test split for each dataset of shape ``(batch_size,)``.
         """
         batch = self.prior.get_batch(batch_size)
-        X, y, d, seq_lens, train_sizes = batch
+        if self.graph_backend:
+            X, y, d, seq_lens, train_sizes, graph_sets = batch
+        else:
+            X, y, d, seq_lens, train_sizes = batch
         X = normalize_batch(X, d, seq_lens, train_sizes, self.normalization)
-        graph_sets: list[SparseGraphSet] = []
-        for dataset_idx in range(len(train_sizes)):
-            y_i = y[dataset_idx]
-            if y_i.is_nested:
-                y_i = y_i.to_padded_tensor(padding=0)
-            seq_len = int(seq_lens[dataset_idx].item())
-            train_size = int(train_sizes[dataset_idx].item())
-            graph_sets.append(
-                build_class_conditioned_graphs(
-                    y_train=y_i[:train_size].long().unsqueeze(0),
-                    total_nodes=seq_len,
-                    num_graphs=self.graph_num_graphs,
-                    min_train_neighbors=self.graph_min_train_neighbors,
-                    max_train_neighbors=self.graph_max_train_neighbors,
-                    same_label_ratio=self.graph_same_label_ratio,
-                    cross_label_ratio=self.graph_cross_label_ratio,
-                    test_k_per_class=self.graph_test_k_per_class,
-                    seed=None if self.graph_seed is None else self.graph_seed + dataset_idx,
-                    share_graph_across_batch=self.graph_share_across_batch,
-                    share_graph_require_identical_labels=self.graph_share_require_identical_labels,
-                )
-            )
-        return X, y, d, seq_lens, train_sizes, graph_sets
+        if self.graph_backend:
+            return X, y, d, seq_lens, train_sizes, graph_sets
+        return X, y, d, seq_lens, train_sizes
 
     def __iter__(self) -> "PriorDataset":
         """Return an iterator that yields batches indefinitely.
@@ -1094,8 +1194,9 @@ class PriorDataset(IterableDataset):
         Since this is an infinite iterator, it never raises StopIteration
         and instead continuously generates new synthetic data batches.
         """
-        with DisablePrinting():
-            return self.get_batch()
+        #with DisablePrinting():
+        #    return self.get_batch()
+        return self.get_batch()
 
     def __repr__(self) -> str:
         """Return a string representation of the dataset.

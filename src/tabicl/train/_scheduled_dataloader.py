@@ -272,7 +272,10 @@ class ScheduledDataLoader:
         fields = list(batch)
         prepared_fields: list[torch.Tensor] = []
         for tensor in fields:
-            prepared_fields.append(tensor.to_padded_tensor(padding=0.0) if tensor.is_nested else tensor)
+            if isinstance(tensor, list):
+                prepared_fields.append(tensor)
+            else:
+                prepared_fields.append(tensor.to_padded_tensor(padding=0.0) if tensor.is_nested else tensor)
 
         batch_size = int(prepared_fields[0].shape[0])
         if batch_size % group_size != 0:
@@ -281,7 +284,9 @@ class ScheduledDataLoader:
         groups: list[tuple[torch.Tensor, ...]] = []
         for start in range(0, batch_size, group_size):
             end = start + group_size
-            groups.append(tuple(field[start:end] for field in prepared_fields))
+            groups.append(
+                tuple(field[start:end] if isinstance(field, list) else field[start:end] for field in prepared_fields)
+            )
         return groups
 
     @staticmethod
@@ -298,8 +303,14 @@ class ScheduledDataLoader:
         seq_parts: list[torch.Tensor] = []
         train_parts: list[torch.Tensor] = []
 
+        graph_parts = []
+        graph_mode = len(groups[0]) == 6
         for group in groups:
-            x, y, d, seq_len, train_size = group
+            if graph_mode:
+                x, y, d, seq_len, train_size, graphs = group
+                graph_parts.extend(graphs)
+            else:
+                x, y, d, seq_len, train_size = group
 
             if x.shape[1] < max_seq:
                 x = torch.nn.functional.pad(x, (0, 0, 0, max_seq - x.shape[1]))
@@ -313,10 +324,11 @@ class ScheduledDataLoader:
             seq_parts.append(seq_len)
             train_parts.append(train_size)
 
-        return (
+        result = (
             torch.cat(x_parts, dim=0),
             torch.cat(y_parts, dim=0),
             torch.cat(d_parts, dim=0),
             torch.cat(seq_parts, dim=0),
             torch.cat(train_parts, dim=0),
         )
+        return result + (graph_parts,) if graph_mode else result

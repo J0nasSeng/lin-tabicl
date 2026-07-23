@@ -289,7 +289,7 @@ class Trainer:
             "dropout": self.config.dropout,
             "activation": self.config.activation,
             "norm_first": self.config.norm_first,
-            "recompute": self.config.recompute,
+            "recompute": getattr(self.config, "recompute", False),
         }
 
         if model_type == "tabicl":
@@ -384,6 +384,7 @@ class Trainer:
                 device=self.config.prior_device,
                 n_jobs=1,  # Set to 1 to avoid nested parallelism during DDP
                 normalization=getattr(self.config, "normalization", "none"),
+                graph_backend=getattr(self.config, "icl_backend", None) == "graph",
                 graph_num_graphs=getattr(self.config, "graph_num_graphs", None) or self.config.icl_num_blocks,
                 graph_min_train_neighbors=self.config.graph_min_train_neighbors,
                 graph_max_train_neighbors=self.config.graph_max_train_neighbors,
@@ -406,6 +407,7 @@ class Trainer:
             delete_after_load=(self.config.delete_after_load if not is_validation else False),
             device=self.config.prior_device,
             normalization=getattr(self.config, "normalization", "none"),
+            graph_backend=getattr(self.config, "icl_backend", None) == "graph",
         )
 
     def _build_prior_dataloader(self, dataset):
@@ -417,6 +419,7 @@ class Trainer:
             prefetch_factor=4,
             pin_memory=True if self.config.prior_device == "cpu" else False,
             pin_memory_device=self.config.device if self.config.prior_device == "cpu" else "",
+            persistent_workers=True,
         )
 
     def configure_prior(self):
@@ -710,17 +713,20 @@ class Trainer:
 
     def _split_micro_batches(self, batch):
         num_micro_batches = math.ceil(self.config.batch_size / self.config.micro_batch_size)
-        tensor_splits = [torch.split(t, self.config.micro_batch_size, dim=0) for t in batch[:-1]]
-        graph_splits = [
-            batch[-1][start : start + self.config.micro_batch_size]
-            for start in range(0, len(batch[-1]), self.config.micro_batch_size)
-        ]
-        return num_micro_batches, [
-            tuple(parts[:-1]) + (parts[-1],) for parts in zip(*tensor_splits, graph_splits)
-        ]
+        graph_mode = len(batch) == 6
+        tensor_fields = batch[:-1] if graph_mode else batch
+        tensor_splits = [torch.split(t, self.config.micro_batch_size, dim=0) for t in tensor_fields]
+        micro_batches = [tuple(parts) for parts in zip(*tensor_splits)]
+        if graph_mode:
+            graph_splits = [
+                batch[-1][start : start + self.config.micro_batch_size]
+                for start in range(0, len(batch[-1]), self.config.micro_batch_size)
+            ]
+            micro_batches = [parts + (graphs,) for parts, graphs in zip(micro_batches, graph_splits)]
+        return num_micro_batches, micro_batches
 
     def _prepare_micro_batch_tensors(self, micro_batch):
-        micro_X, micro_y, micro_d, micro_seq_len, micro_train_size, graph_sets = micro_batch
+        micro_X, micro_y, micro_d, micro_seq_len, micro_train_size = micro_batch[:5]
         seq_len, train_size = self.validate_micro_batch(micro_seq_len, micro_train_size)
         micro_X, micro_y = self.align_micro_batch(micro_X, micro_y, micro_d, seq_len)
 
@@ -730,6 +736,7 @@ class Trainer:
 
         y_train = micro_y[:, :train_size]
         y_test = micro_y[:, train_size:]
+        graph_sets = micro_batch[5] if len(micro_batch) == 6 else None
         return micro_X, micro_y, micro_d, y_train, y_test, graph_sets
 
     def _build_logging_payload(
@@ -1041,7 +1048,7 @@ class Trainer:
         #self.fit_ensemble(micro_batch)
 
         micro_X, _micro_y, micro_d, y_train, y_test, graph_sets = self._prepare_micro_batch_tensors(micro_batch)
-        graph_set = stack_graph_sets(graph_sets)
+        graph_set = stack_graph_sets(graph_sets) if graph_sets is not None else None
 
         # Set DDP gradient sync for last micro batch only
         if do_backward and self.ddp:
@@ -1053,6 +1060,8 @@ class Trainer:
             capture_pre_decoder_repr = collect_artifacts or (supcon_weight > 0)
             model_kwargs = {"return_pre_decoder_repr": capture_pre_decoder_repr}
             if getattr(self.raw_model, "icl_backend", None) == "graph":
+                if graph_set is None:
+                    raise ValueError("Graph backend requires precomputed graph metadata in the prior batch")
                 model_kwargs["graph_set"] = graph_set
             model_out = self.model(micro_X, y_train, micro_d, **model_kwargs)
             pre_decoder_repr_test = None

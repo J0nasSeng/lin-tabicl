@@ -161,6 +161,8 @@ def build_class_conditioned_graph(
     batch_size, train_size = y_train.shape
     if total_nodes < train_size:
         raise ValueError("total_nodes must be >= train_size")
+    if total_nodes > torch.iinfo(torch.uint16).max:
+        raise ValueError("total_nodes must fit in an unsigned 16-bit integer")
 
     gen = torch.Generator(device=y_train.device)
     if seed is not None:
@@ -293,7 +295,7 @@ def build_class_conditioned_graph(
         edge_src = torch.cat(src_edges, dim=0)
         edge_dst = torch.cat(dst_edges, dim=0)
         edge_index = torch.stack([edge_src, edge_dst], dim=0)
-        return torch.unique(edge_index, dim=1)
+        return torch.unique(edge_index, dim=1).to(dtype=torch.uint16)
 
     if share_graph_across_batch:
         labels_identical = bool((y_train == y_train[0]).all().item()) if batch_size > 1 else True
