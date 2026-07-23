@@ -685,6 +685,7 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
             feature_shuffles = self.ensemble_generator_.feature_shuffles_[norm_method]
             outputs.append(self._batch_forward_with_repr(Xs, ys, feature_shuffles))
         return np.mean(np.concatenate(outputs, axis=0), axis=0)
+    
     def _batch_forward_with_cache(self, Xs: np.ndarray, kv_cache: TabICLCache) -> np.ndarray:
         """Process model forward passes using a pre-computed KV cache.
 

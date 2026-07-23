@@ -214,7 +214,10 @@ class GATInferenceEngine(nn.Module):
 					num_classes = int(torch.unique(y_train[0]).numel())
 					out = out[..., :num_classes]
 				if not return_logits:
-					out = torch.softmax(out / softmax_temperature, dim=-1)
+					if self.model.icl_predictor.decoder_type in {"soft_kmeans", "rbf", "euclidean"}:
+						out = out.exp()
+					else:
+						out = torch.softmax(out / softmax_temperature, dim=-1)
 				return out, representation
 			out = self.model._inference_forward(
 				X=X,
