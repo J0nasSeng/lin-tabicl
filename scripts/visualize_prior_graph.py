@@ -17,7 +17,6 @@ except ImportError as exc:
     raise ImportError("networkx is required for graph visualization. Install with `uv pip install networkx`.") from exc
 
 from tabicl.prior._dataset import PriorDataset
-from tabicl._model.graph import build_class_conditioned_graph
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -42,7 +41,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--graph_max_train_neighbors", type=int, default=15)
     parser.add_argument("--graph_same_label_ratio", type=float, default=0.9)
     parser.add_argument("--graph_cross_label_ratio", type=float, default=0.1)
-    parser.add_argument("--graph_test_k_per_class", type=int, default=3)
+    parser.add_argument("--graph_test_k_per_class", type=int, default=8)
+    parser.add_argument("--c", type=int, default=3)
     parser.add_argument(
         "--plot_test_fraction",
         type=float,
@@ -146,27 +146,27 @@ def main() -> None:
         prior_type=args.prior_type,
         device=args.prior_device,
         n_jobs=1,
+        graph_backend=True,
+        graph_min_train_neighbors=args.graph_min_train_neighbors,
+        graph_max_train_neighbors=args.graph_max_train_neighbors,
+        graph_same_label_ratio=args.graph_same_label_ratio,
+        graph_cross_label_ratio=args.graph_cross_label_ratio,
+        graph_test_k_per_class=args.graph_test_k_per_class,
+        graph_seed=args.seed,
     )
 
-    _, y, _, seq_lens, train_sizes = dataset.get_batch(batch_size=args.batch_size)
+    _, y, _, seq_lens, train_sizes, graph_sets = dataset.get_batch(batch_size=args.batch_size)
 
     seq_len = int(seq_lens[0].item())
     train_size = int(train_sizes[0].item())
     y0 = y[0, :seq_len].long()
     y_train = y0[:train_size].unsqueeze(0)
 
-    graph = build_class_conditioned_graph(
-        y_train=y_train,
-        total_nodes=seq_len,
-        min_train_neighbors=args.graph_min_train_neighbors,
-        max_train_neighbors=args.graph_max_train_neighbors,
-        same_label_ratio=args.graph_same_label_ratio,
-        cross_label_ratio=args.graph_cross_label_ratio,
-        test_k_per_class=args.graph_test_k_per_class,
-        seed=args.seed,
-    )
+    # Use the graph generated together with the sampled prior dataset so the
+    # visualization reflects the exact graph configuration and random draw.
+    graph = graph_sets[0]
 
-    edge_index = graph.edge_index[0].cpu()
+    edge_index = graph.graphs[0].edge_index[0].cpu()
     src = edge_index[0].tolist()
     dst = edge_index[1].tolist()
 
@@ -192,8 +192,17 @@ def main() -> None:
     plot_node_count = g_plot.number_of_nodes()
     pos = _label_group_layout(g_plot=g_plot, label_colors=label_colors, train_size=train_size, seed=args.seed)
 
+    edge_colors = []
+    for source, target in g_plot.edges:
+        same_class = (
+            source < train_size
+            and target < train_size
+            and label_colors[source] == label_colors[target]
+        )
+        edge_colors.append("#D62728" if same_class else "#3A3A3A")
+
     plt.figure(figsize=(16, 12), dpi=180)
-    nx.draw_networkx_edges(g_plot, pos, alpha=0.45, width=1.3, edge_color="#3A3A3A", arrows=False)
+    nx.draw_networkx_edges(g_plot, pos, alpha=0.45, width=1.3, edge_color=edge_colors, arrows=False)
     nx.draw_networkx_nodes(g_plot, pos, node_color=node_colors, node_size=220)
 
     # Label a subset of nodes for readability

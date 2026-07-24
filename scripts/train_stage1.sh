@@ -63,7 +63,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --icl_backend ${ICL_BACKEND} \
             --ff_factor 2 \
             --norm_first True \
-            --checkpoint_dir /workspace/checkpoints_dyngraph/stage1/ \
+            --checkpoint_dir /workspace/checkpoints_dyngraph_intraclass=0.5/stage1/ \
             --save_temp_every 1000 \
             --save_perm_every 5000 \
             --icl_soft_kmeans_temperature 0.5 \
@@ -71,6 +71,8 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --graph_min_train_neighbors 3 \
             --graph_max_train_neighbors 6 \
             --graph_test_k_per_class 2 \
+            --graph_same_label_ratio 0.5 \
+            --graph_cross_label_ratio 0.5 \
             #--recompute True \
             #--scheduled_loader_steps 0,300,600,1000,2000 \
             #--scheduled_loader_sizes 64,256,1024,2048,inf
