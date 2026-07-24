@@ -128,6 +128,69 @@ def _label_group_layout(g_plot: nx.DiGraph, label_colors: np.ndarray, train_size
     return pos
 
 
+def _log_graph_metrics(
+    g: nx.DiGraph,
+    labels: np.ndarray,
+    train_size: int,
+    same_label_ratio: float,
+    cross_label_ratio: float,
+) -> None:
+    """Log degree summaries and label-conditioned edge counts for the full graph."""
+    train_nodes = list(range(train_size))
+    test_nodes = list(range(train_size, len(labels)))
+
+    def _average_degree(nodes: list[int], degree: str) -> float:
+        if not nodes:
+            return 0.0
+        values = g.in_degree(nodes) if degree == "in" else g.out_degree(nodes)
+        return float(np.mean([value for _, value in values]))
+
+    intra_label_edges = 0
+    cross_label_edges = 0
+    train_train_intra_edges = 0
+    train_train_cross_edges = 0
+    for source, target in g.edges:
+        same_label = labels[source] == labels[target]
+        if same_label:
+            intra_label_edges += 1
+        else:
+            cross_label_edges += 1
+
+        if source < train_size and target < train_size:
+            if same_label:
+                train_train_intra_edges += 1
+            else:
+                train_train_cross_edges += 1
+
+    print("Graph metrics (full generated graph):")
+    print(
+        f"  train degree: in={_average_degree(train_nodes, 'in'):.2f}, "
+        f"out={_average_degree(train_nodes, 'out'):.2f}"
+    )
+    print(
+        f"  test degree:  in={_average_degree(test_nodes, 'in'):.2f}, "
+        f"out={_average_degree(test_nodes, 'out'):.2f}"
+    )
+    print(
+        f"  all sample edges: intra-label={intra_label_edges}, "
+        f"cross-label={cross_label_edges}"
+    )
+    print(
+        f"  train-train sample edges: intra-label={train_train_intra_edges}, "
+        f"cross-label={train_train_cross_edges}"
+    )
+    train_train_total = train_train_intra_edges + train_train_cross_edges
+    requested_total = same_label_ratio + cross_label_ratio
+    requested_cross_fraction = cross_label_ratio / requested_total
+    realized_cross_fraction = (
+        train_train_cross_edges / train_train_total if train_train_total else 0.0
+    )
+    print(
+        f"  train-train cross-label fraction: requested={requested_cross_fraction:.3f}, "
+        f"realized={realized_cross_fraction:.3f}"
+    )
+
+
 def main() -> None:
     args = build_parser().parse_args()
 
@@ -174,10 +237,17 @@ def main() -> None:
     g.add_nodes_from(range(seq_len))
     g.add_edges_from(zip(src, dst))
 
+    label_colors = _to_numpy_color_labels(y0, train_size, seq_len)
+    _log_graph_metrics(
+        g=g,
+        labels=label_colors,
+        train_size=train_size,
+        same_label_ratio=args.graph_same_label_ratio,
+        cross_label_ratio=args.graph_cross_label_ratio,
+    )
+
     plot_nodes = _select_plot_nodes(seq_len=seq_len, train_size=train_size, test_fraction=args.plot_test_fraction, seed=args.seed)
     g_plot = g.subgraph(plot_nodes.tolist()).copy()
-
-    label_colors = _to_numpy_color_labels(y0, train_size, seq_len)
 
     # Train nodes by label colormap, test nodes in grey
     cmap = plt.get_cmap("tab20")

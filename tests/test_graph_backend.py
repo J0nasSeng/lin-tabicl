@@ -106,6 +106,36 @@ def test_graph_builder_multiple_graphs_are_reproducible_and_independent():
     )
 
 
+def test_graph_builder_ratios_control_unique_train_train_edges():
+    y_train = _build_labels(batch_size=1, train_size=12, num_classes=3)
+
+    def count_train_edges(same_label_ratio: float, cross_label_ratio: float) -> tuple[int, int]:
+        graph = build_class_conditioned_graph(
+            y_train=y_train,
+            total_nodes=12,
+            min_train_neighbors=1,
+            max_train_neighbors=1,
+            same_label_ratio=same_label_ratio,
+            cross_label_ratio=cross_label_ratio,
+            test_k_per_class=1,
+            seed=17,
+        )
+        edge_index = graph.edge_index[0]
+        src, dst = edge_index.long()
+        labels = y_train[0]
+        train_edges = (src < 12) & (dst < 12)
+        same = train_edges & (labels[src.long()] == labels[dst.long()])
+        return int(same.sum().item()), int((train_edges & ~same).sum().item())
+
+    same_only = count_train_edges(1.0, 0.0)
+    cross_only = count_train_edges(0.0, 1.0)
+    balanced = count_train_edges(0.5, 0.5)
+
+    assert same_only[0] > 0 and same_only[1] == 0
+    assert cross_only[0] == 0 and cross_only[1] > 0
+    assert balanced[0] == balanced[1]
+
+
 def test_graph_attention_transformer_routes_graphs_by_layer_group():
     transformer = GraphAttentionTransformer(
         num_blocks=4,

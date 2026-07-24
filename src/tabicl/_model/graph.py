@@ -109,19 +109,20 @@ def build_class_conditioned_graph(
         Total number of nodes in the graph (train + test).
 
     min_train_neighbors : int, default=8
-        Lower bound multiplier for same-label train-train sampling per class.
-        For class size ``n_c``, the number of sampled same-label pairs is in
-        ``[n_c * min_train_neighbors, n_c * max_train_neighbors]`` before adding
-        mirrored pairs.
+        Lower bound for the total train-train pair budget, expressed as a
+        multiplier of the training-set size.
 
     max_train_neighbors : int, default=15
-        Upper bound multiplier for same-label train-train sampling per class.
+        Upper bound for the total train-train pair budget, expressed as a
+        multiplier of the training-set size.
 
     same_label_ratio : float, default=0.9
-        Target same-label component used to determine cross-label edge budget.
+        Relative weight of same-label train-train pairs.
 
     cross_label_ratio : float, default=0.1
-        Target cross-label component used to determine cross-label edge budget.
+        Relative weight of cross-label train-train pairs. The two ratio
+        arguments control the realized composition of unique train-train
+        pairs, subject to candidate-pool availability.
 
     test_k_per_class : int, default=3
         Number of sampled train connections per class for each test node before
@@ -168,35 +169,6 @@ def build_class_conditioned_graph(
     if seed is not None:
         gen.manual_seed(seed)
 
-    def _sample_pairs_within_pool(pool: Tensor, num_pairs: int) -> tuple[Tensor, Tensor]:
-        if num_pairs <= 0 or pool.numel() == 0:
-            empty = pool.new_empty((0,), dtype=torch.long)
-            return empty, empty
-
-        # Prevent self-connections in random graph generation.
-        if pool.numel() == 1:
-            empty = pool.new_empty((0,), dtype=torch.long)
-            return empty, empty
-
-        src_pos = torch.randint(0, pool.numel(), (num_pairs,), generator=gen, device=pool.device)
-        if pool.numel() == 1:
-            dst_pos = src_pos.clone()
-        else:
-            dst_pos = torch.randint(0, pool.numel(), (num_pairs,), generator=gen, device=pool.device)
-            # Avoid self-pairs when possible.
-            mask_same = src_pos == dst_pos
-            while mask_same.any():
-                dst_pos[mask_same] = torch.randint(
-                    0,
-                    pool.numel(),
-                    (int(mask_same.sum().item()),),
-                    generator=gen,
-                    device=pool.device,
-                )
-                mask_same = src_pos == dst_pos
-
-        return pool[src_pos], pool[dst_pos]
-
     def _build_single_graph(labels: Tensor) -> Tensor:
         train_indices = torch.arange(train_size, device=labels.device, dtype=torch.long)
         classes = torch.unique(labels)
@@ -207,71 +179,79 @@ def build_class_conditioned_graph(
 
         src_edges: list[Tensor] = []
         dst_edges: list[Tensor] = []
-        same_pairs_total = 0
 
-        # 1) Same-label train/train edges: class-level budgets, then mirror.
+        # Build finite unordered candidate pools. Sampling without replacement
+        # makes the ratio describe the final unique train-train edges rather
+        # than a replacement-based request that is later collapsed by unique().
+        same_candidate_parts: list[Tensor] = []
+        cross_candidate_parts: list[Tensor] = []
         for class_pool in class_pools:
-            n_c = int(class_pool.numel())
-            if n_c == 0:
-                continue
+            if class_pool.numel() >= 2:
+                same_candidate_parts.append(torch.combinations(class_pool, r=2).T)
 
-            min_pairs = n_c * min_train_neighbors
-            max_pairs = n_c * max_train_neighbors
-            num_pairs = int(
-                torch.randint(min_pairs, max_pairs + 1, (1,), generator=gen, device=labels.device).item()
-            )
-            same_pairs_total += num_pairs
+        for i in range(num_classes):
+            for j in range(i + 1, num_classes):
+                left_pool = class_pools[i]
+                right_pool = class_pools[j]
+                if left_pool.numel() == 0 or right_pool.numel() == 0:
+                    continue
+                cross_candidate_parts.append(
+                    torch.stack(
+                        [
+                            left_pool.repeat_interleave(right_pool.numel()),
+                            right_pool.repeat(left_pool.numel()),
+                        ],
+                        dim=0,
+                    )
+                )
 
-            src_same, dst_same = _sample_pairs_within_pool(class_pool, num_pairs)
-            if src_same.numel() == 0:
-                continue
+        def _concat_candidates(parts: list[Tensor]) -> Tensor:
+            if not parts:
+                return torch.empty((2, 0), dtype=torch.long, device=labels.device)
+            return torch.cat(parts, dim=1)
 
-            src_edges.extend([src_same, dst_same])
-            dst_edges.extend([dst_same, src_same])
+        same_candidates = _concat_candidates(same_candidate_parts)
+        cross_candidates = _concat_candidates(cross_candidate_parts)
 
-        # 2) Cross-label train/train edges: infer budget from same/cross ratio, then mirror.
-        if cross_label_ratio > 0:
-            if same_label_ratio > 0:
-                cross_pairs_total = int(round(same_pairs_total * (cross_label_ratio / same_label_ratio)))
-            else:
-                cross_pairs_total = same_pairs_total
+        ratio_sum = same_label_ratio + cross_label_ratio
+        total_pair_budget = int(
+            torch.randint(
+                train_size * min_train_neighbors,
+                train_size * max_train_neighbors + 1,
+                (1,),
+                generator=gen,
+                device=labels.device,
+            ).item()
+        )
+        requested_same = int(round(total_pair_budget * same_label_ratio / ratio_sum))
+        requested_cross = total_pair_budget - requested_same
 
-            if cross_pairs_total > 0 and num_classes >= 2:
-                pair_i: list[int] = []
-                pair_j: list[int] = []
-                pair_w: list[float] = []
-                for i in range(num_classes):
-                    for j in range(i + 1, num_classes):
-                        w = float(class_pools[i].numel() * class_pools[j].numel())
-                        if w > 0:
-                            pair_i.append(i)
-                            pair_j.append(j)
-                            pair_w.append(w)
+        # If one candidate pool is exhausted, use any remaining budget from
+        # the other pool rather than fabricating duplicate edges.
+        same_count = min(requested_same, same_candidates.shape[1])
+        cross_count = min(requested_cross, cross_candidates.shape[1])
+        remaining = total_pair_budget - same_count - cross_count
+        if remaining > 0:
+            extra_same = min(remaining, same_candidates.shape[1] - same_count)
+            same_count += extra_same
+            remaining -= extra_same
+        if remaining > 0:
+            extra_cross = min(remaining, cross_candidates.shape[1] - cross_count)
+            cross_count += extra_cross
 
-                if pair_w:
-                    weights = torch.tensor(pair_w, dtype=torch.float32, device=labels.device)
-                    sampled_pair_ids = torch.multinomial(weights, cross_pairs_total, replacement=True, generator=gen)
+        same_candidate_indices = torch.arange(same_candidates.shape[1], device=labels.device)
+        cross_candidate_indices = torch.arange(cross_candidates.shape[1], device=labels.device)
+        same_sample = _sample_indices(same_candidate_indices, same_count, generator=gen)
+        cross_sample = _sample_indices(cross_candidate_indices, cross_count, generator=gen)
 
-                    sampled_src_parts: list[Tensor] = []
-                    sampled_dst_parts: list[Tensor] = []
-                    unique_pair_ids = torch.unique(sampled_pair_ids)
-                    for pid in unique_pair_ids.tolist():
-                        count = int((sampled_pair_ids == pid).sum().item())
-                        if count == 0:
-                            continue
-                        left_pool = class_pools[pair_i[pid]]
-                        right_pool = class_pools[pair_j[pid]]
-
-                        left = _sample_indices(left_pool, count, generator=gen, allow_replacement=True)
-                        right = _sample_indices(right_pool, count, generator=gen, allow_replacement=True)
-                        sampled_src_parts.append(left)
-                        sampled_dst_parts.append(right)
-
-                    if sampled_src_parts:
-                        src_cross = torch.cat(sampled_src_parts, dim=0)
-                        dst_cross = torch.cat(sampled_dst_parts, dim=0)
-                        src_edges.extend([src_cross, dst_cross])
-                        dst_edges.extend([dst_cross, src_cross])
+        if same_count > 0:
+            same_edges = same_candidates[:, same_sample]
+            src_edges.extend([same_edges[0], same_edges[1]])
+            dst_edges.extend([same_edges[1], same_edges[0]])
+        if cross_count > 0:
+            cross_edges = cross_candidates[:, cross_sample]
+            src_edges.extend([cross_edges[0], cross_edges[1]])
+            dst_edges.extend([cross_edges[1], cross_edges[0]])
 
         # 3) Train->test edges only: test nodes are consumers and do not send to train nodes.
         if num_test > 0 and num_classes > 0:
