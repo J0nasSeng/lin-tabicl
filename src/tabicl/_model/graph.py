@@ -91,12 +91,9 @@ def build_class_conditioned_graph(
     total_nodes: int,
     min_train_neighbors: int = 8,
     max_train_neighbors: int = 15,
-    same_label_ratio: float = 0.9,
-    cross_label_ratio: float = 0.1,
-    test_k_per_class: int = 3,
-    seed: Optional[int] = None,
-    share_graph_across_batch: bool = False,
-    share_graph_require_identical_labels: bool = True,
+    cross_label_fraction: float = 0.1,
+    train_neighbors_per_test: int = 3,
+    seed: int | None = None,
 ) -> SparseGraphBatch:
     """Build sparse directed graphs for graph-based in-context learning.
 
@@ -116,27 +113,15 @@ def build_class_conditioned_graph(
         Upper bound for the total train-train pair budget, expressed as a
         multiplier of the training-set size.
 
-    same_label_ratio : float, default=0.9
-        Relative weight of same-label train-train pairs.
+    cross_label_fraction : float, default=0.1
+        Fraction of train-train pairs that should connect different labels.
 
-    cross_label_ratio : float, default=0.1
-        Relative weight of cross-label train-train pairs. The two ratio
-        arguments control the realized composition of unique train-train
-        pairs, subject to candidate-pool availability.
-
-    test_k_per_class : int, default=3
+    train_neighbors_per_test : int, default=3
         Number of sampled train connections per class for each test node before
         adding mirrored pairs.
 
     seed : Optional[int], default=None
         Optional random seed for deterministic graph sampling.
-
-    share_graph_across_batch : bool, default=False
-        If True, build a single graph and reuse it for all batch elements.
-
-    share_graph_require_identical_labels : bool, default=True
-        Only used when ``share_graph_across_batch=True``. If True, shared-graph
-        mode is activated only when all rows in ``y_train`` are identical.
 
     Returns
     -------
@@ -150,14 +135,10 @@ def build_class_conditioned_graph(
         raise ValueError("min_train_neighbors and max_train_neighbors must be positive")
     if min_train_neighbors > max_train_neighbors:
         raise ValueError("min_train_neighbors must be <= max_train_neighbors")
-    if test_k_per_class <= 0:
-        raise ValueError("test_k_per_class must be positive")
-    if same_label_ratio < 0.0 or cross_label_ratio < 0.0:
-        raise ValueError("same_label_ratio and cross_label_ratio must be non-negative")
-
-    ratio_sum = same_label_ratio + cross_label_ratio
-    if ratio_sum == 0.0:
-        raise ValueError("same_label_ratio + cross_label_ratio must be > 0")
+    if train_neighbors_per_test <= 0:
+        raise ValueError("train_neighbors_per_test must be positive")
+    if not 0.0 <= cross_label_fraction <= 1.0:
+        raise ValueError("cross_label_fraction must be between 0 and 1")
 
     batch_size, train_size = y_train.shape
     if total_nodes < train_size:
@@ -213,7 +194,6 @@ def build_class_conditioned_graph(
         same_candidates = _concat_candidates(same_candidate_parts)
         cross_candidates = _concat_candidates(cross_candidate_parts)
 
-        ratio_sum = same_label_ratio + cross_label_ratio
         total_pair_budget = int(
             torch.randint(
                 train_size * min_train_neighbors,
@@ -223,8 +203,8 @@ def build_class_conditioned_graph(
                 device=labels.device,
             ).item()
         )
-        requested_same = int(round(total_pair_budget * same_label_ratio / ratio_sum))
-        requested_cross = total_pair_budget - requested_same
+        requested_cross = int(round(total_pair_budget * cross_label_fraction))
+        requested_same = total_pair_budget - requested_cross
 
         # If one candidate pool is exhausted, use any remaining budget from
         # the other pool rather than fabricating duplicate edges.
@@ -255,17 +235,23 @@ def build_class_conditioned_graph(
 
         # 3) Train->test edges only: test nodes are consumers and do not send to train nodes.
         if num_test > 0 and num_classes > 0:
-            per_class_count = test_k_per_class * num_test
             dst_template = torch.arange(train_size, total_nodes, device=labels.device, dtype=torch.long).repeat_interleave(
-                test_k_per_class
+                train_neighbors_per_test
             )
 
             src_test_parts: list[Tensor] = []
             dst_test_parts: list[Tensor] = []
+            test_nodes = torch.arange(train_size, total_nodes, device=labels.device, dtype=torch.long)
             for class_pool in class_pools:
-                src_c = _sample_indices(class_pool, per_class_count, generator=gen, allow_replacement=True)
-                src_test_parts.append(src_c)
-                dst_test_parts.append(dst_template)
+                for test_node in test_nodes:
+                    src_c = _sample_indices(
+                        class_pool,
+                        train_neighbors_per_test,
+                        generator=gen,
+                        allow_replacement=class_pool.numel() < train_neighbors_per_test,
+                    )
+                    src_test_parts.append(src_c)
+                    dst_test_parts.append(test_node.expand(src_c.shape[0]))
 
             src_test = torch.cat(src_test_parts, dim=0)
             dst_test = torch.cat(dst_test_parts, dim=0)
@@ -276,13 +262,6 @@ def build_class_conditioned_graph(
         edge_dst = torch.cat(dst_edges, dim=0)
         edge_index = torch.stack([edge_src, edge_dst], dim=0)
         return torch.unique(edge_index, dim=1).to(dtype=torch.uint16)
-
-    if share_graph_across_batch:
-        labels_identical = bool((y_train == y_train[0]).all().item()) if batch_size > 1 else True
-        if (not share_graph_require_identical_labels) or labels_identical:
-            shared_edge_index = _build_single_graph(y_train[0].long())
-            edge_index_batch = [shared_edge_index] * batch_size
-            return SparseGraphBatch(edge_index=edge_index_batch, num_nodes=total_nodes)
 
     edge_index_batch: list[Tensor] = []
     for b in range(batch_size):
@@ -297,12 +276,10 @@ def build_class_conditioned_graphs(
     num_graphs: int = 1,
     min_train_neighbors: int = 8,
     max_train_neighbors: int = 15,
-    same_label_ratio: float = 0.9,
-    cross_label_ratio: float = 0.1,
-    test_k_per_class: int = 3,
+    cross_label_fraction: float = 0.1,
+    train_neighbors_per_test: int = 3,
     seed: Optional[int] = None,
     share_graph_across_batch: bool = False,
-    share_graph_require_identical_labels: bool = True,
 ) -> SparseGraphSet:
     """Build multiple independently sampled class-conditioned graph batches.
 
@@ -315,18 +292,37 @@ def build_class_conditioned_graphs(
     if num_graphs <= 0:
         raise ValueError("num_graphs must be positive")
 
+    if share_graph_across_batch:
+        labels_identical = y_train.shape[0] <= 1 or bool((y_train == y_train[0]).all().item())
+        if labels_identical:
+            shared = [
+                build_class_conditioned_graph(
+                    y_train=y_train[:1],
+                    total_nodes=total_nodes,
+                    min_train_neighbors=min_train_neighbors,
+                    max_train_neighbors=max_train_neighbors,
+                    cross_label_fraction=cross_label_fraction,
+                    train_neighbors_per_test=train_neighbors_per_test,
+                    seed=None if seed is None else seed + graph_idx,
+                )
+                for graph_idx in range(num_graphs)
+            ]
+            return SparseGraphSet(
+                graphs=[
+                    SparseGraphBatch(edge_index=[graph.edge_index[0]] * y_train.shape[0], num_nodes=total_nodes)
+                    for graph in shared
+                ]
+            )
+
     graphs = [
         build_class_conditioned_graph(
             y_train=y_train,
             total_nodes=total_nodes,
             min_train_neighbors=min_train_neighbors,
             max_train_neighbors=max_train_neighbors,
-            same_label_ratio=same_label_ratio,
-            cross_label_ratio=cross_label_ratio,
-            test_k_per_class=test_k_per_class,
+            cross_label_fraction=cross_label_fraction,
+            train_neighbors_per_test=train_neighbors_per_test,
             seed=None if seed is None else seed + graph_idx,
-            share_graph_across_batch=share_graph_across_batch,
-            share_graph_require_identical_labels=share_graph_require_identical_labels,
         )
         for graph_idx in range(num_graphs)
     ]

@@ -544,7 +544,8 @@ class SavePriorDataset:
             graph_num_graphs=getattr(self.args, "graph_num_graphs", 1),
             graph_min_train_neighbors=getattr(self.args, "graph_min_train_neighbors", 8),
             graph_max_train_neighbors=getattr(self.args, "graph_max_train_neighbors", 15),
-            graph_test_k_per_class=getattr(self.args, "graph_test_k_per_class", 8),
+            graph_cross_label_fraction=getattr(self.args, "graph_cross_label_fraction", 0.1),
+            graph_train_neighbors_per_test=getattr(self.args, "graph_train_neighbors_per_test", 8),
         )
         print(self.prior)
 
@@ -719,7 +720,8 @@ if __name__ == "__main__":
     parser.add_argument("--graph_num_graphs", type=int, default=1)
     parser.add_argument("--graph_min_train_neighbors", type=int, default=3)
     parser.add_argument("--graph_max_train_neighbors", type=int, default=6)
-    parser.add_argument("--graph_test_k_per_class", type=int, default=2)
+    parser.add_argument("--graph_cross_label_fraction", type=float, default=0.1)
+    parser.add_argument("--graph_train_neighbors_per_test", type=int, default=2)
 
     args = parser.parse_args()
     np.random.seed(args.np_seed)

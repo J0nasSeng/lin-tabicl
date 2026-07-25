@@ -39,10 +39,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--graph_min_train_neighbors", type=int, default=8)
     parser.add_argument("--graph_max_train_neighbors", type=int, default=15)
-    parser.add_argument("--graph_same_label_ratio", type=float, default=0.9)
-    parser.add_argument("--graph_cross_label_ratio", type=float, default=0.1)
-    parser.add_argument("--graph_test_k_per_class", type=int, default=8)
-    parser.add_argument("--c", type=int, default=3)
+    parser.add_argument("--graph_cross_label_fraction", type=float, default=0.1)
+    parser.add_argument("--graph_train_neighbors_per_test", type=int, default=8)
     parser.add_argument(
         "--plot_test_fraction",
         type=float,
@@ -132,8 +130,7 @@ def _log_graph_metrics(
     g: nx.DiGraph,
     labels: np.ndarray,
     train_size: int,
-    same_label_ratio: float,
-    cross_label_ratio: float,
+    cross_label_fraction: float,
 ) -> None:
     """Log degree summaries and label-conditioned edge counts for the full graph."""
     train_nodes = list(range(train_size))
@@ -180,8 +177,7 @@ def _log_graph_metrics(
         f"cross-label={train_train_cross_edges}"
     )
     train_train_total = train_train_intra_edges + train_train_cross_edges
-    requested_total = same_label_ratio + cross_label_ratio
-    requested_cross_fraction = cross_label_ratio / requested_total
+    requested_cross_fraction = cross_label_fraction
     realized_cross_fraction = (
         train_train_cross_edges / train_train_total if train_train_total else 0.0
     )
@@ -212,9 +208,8 @@ def main() -> None:
         graph_backend=True,
         graph_min_train_neighbors=args.graph_min_train_neighbors,
         graph_max_train_neighbors=args.graph_max_train_neighbors,
-        graph_same_label_ratio=args.graph_same_label_ratio,
-        graph_cross_label_ratio=args.graph_cross_label_ratio,
-        graph_test_k_per_class=args.graph_test_k_per_class,
+        graph_cross_label_fraction=args.graph_cross_label_fraction,
+        graph_train_neighbors_per_test=args.graph_train_neighbors_per_test,
         graph_seed=args.seed,
     )
 
@@ -223,7 +218,6 @@ def main() -> None:
     seq_len = int(seq_lens[0].item())
     train_size = int(train_sizes[0].item())
     y0 = y[0, :seq_len].long()
-    y_train = y0[:train_size].unsqueeze(0)
 
     # Use the graph generated together with the sampled prior dataset so the
     # visualization reflects the exact graph configuration and random draw.
@@ -242,8 +236,7 @@ def main() -> None:
         g=g,
         labels=label_colors,
         train_size=train_size,
-        same_label_ratio=args.graph_same_label_ratio,
-        cross_label_ratio=args.graph_cross_label_ratio,
+        cross_label_fraction=args.graph_cross_label_fraction,
     )
 
     plot_nodes = _select_plot_nodes(seq_len=seq_len, train_size=train_size, test_fraction=args.plot_test_fraction, seed=args.seed)

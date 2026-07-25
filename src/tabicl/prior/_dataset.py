@@ -400,12 +400,10 @@ def _build_prior_graph(params: Dict[str, Any], y: Tensor) -> SparseGraphSet:
         num_graphs=int(params["graph_num_graphs"]),
         min_train_neighbors=int(params["graph_min_train_neighbors"]),
         max_train_neighbors=int(params["graph_max_train_neighbors"]),
-        same_label_ratio=float(params["graph_same_label_ratio"]),
-        cross_label_ratio=float(params["graph_cross_label_ratio"]),
-        test_k_per_class=int(params["graph_test_k_per_class"]),
+        cross_label_fraction=float(params["graph_cross_label_fraction"]),
+        train_neighbors_per_test=int(params["graph_train_neighbors_per_test"]),
         seed=params.get("graph_seed"),
         share_graph_across_batch=bool(params["graph_share_across_batch"]),
-        share_graph_require_identical_labels=bool(params["graph_share_require_identical_labels"]),
     )
 
 
@@ -510,12 +508,10 @@ class SCMPrior(Prior):
         graph_num_graphs: int = 1,
         graph_min_train_neighbors: int = 8,
         graph_max_train_neighbors: int = 15,
-        graph_same_label_ratio: float = 0.9,
-        graph_cross_label_ratio: float = 0.1,
-        graph_test_k_per_class: int = 8,
+        graph_cross_label_fraction: float = 0.1,
+        graph_train_neighbors_per_test: int = 8,
         graph_seed: Optional[int] = None,
         graph_share_across_batch: bool = False,
-        graph_share_require_identical_labels: bool = True,
     ):
         super().__init__(
             batch_size=batch_size,
@@ -543,12 +539,10 @@ class SCMPrior(Prior):
         self.graph_num_graphs = int(graph_num_graphs)
         self.graph_min_train_neighbors = graph_min_train_neighbors
         self.graph_max_train_neighbors = graph_max_train_neighbors
-        self.graph_same_label_ratio = graph_same_label_ratio
-        self.graph_cross_label_ratio = graph_cross_label_ratio
-        self.graph_test_k_per_class = graph_test_k_per_class
+        self.graph_cross_label_fraction = graph_cross_label_fraction
+        self.graph_train_neighbors_per_test = graph_train_neighbors_per_test
         self.graph_seed = graph_seed
         self.graph_share_across_batch = graph_share_across_batch
-        self.graph_share_require_identical_labels = graph_share_require_identical_labels
 
     def hp_sampling(self) -> Dict[str, Any]:
         """Sample hyperparameters for dataset generation.
@@ -719,12 +713,10 @@ class SCMPrior(Prior):
                         "graph_num_graphs": self.graph_num_graphs,
                         "graph_min_train_neighbors": self.graph_min_train_neighbors,
                         "graph_max_train_neighbors": self.graph_max_train_neighbors,
-                        "graph_same_label_ratio": self.graph_same_label_ratio,
-                        "graph_cross_label_ratio": self.graph_cross_label_ratio,
-                        "graph_test_k_per_class": self.graph_test_k_per_class,
+                        "graph_cross_label_fraction": self.graph_cross_label_fraction,
+                        "graph_train_neighbors_per_test": self.graph_train_neighbors_per_test,
                         "graph_seed": None if self.graph_seed is None else self.graph_seed + len(param_list),
                         "graph_share_across_batch": self.graph_share_across_batch,
-                        "graph_share_require_identical_labels": self.graph_share_require_identical_labels,
                     }
                     param_list.append(params)
 
@@ -842,12 +834,10 @@ class DummyPrior(Prior):
         graph_num_graphs: int = 1,
         graph_min_train_neighbors: int = 8,
         graph_max_train_neighbors: int = 15,
-        graph_same_label_ratio: float = 0.9,
-        graph_cross_label_ratio: float = 0.1,
-        graph_test_k_per_class: int = 8,
+        graph_cross_label_fraction: float = 0.1,
+        graph_train_neighbors_per_test: int = 8,
         graph_seed: Optional[int] = None,
         graph_share_across_batch: bool = False,
-        graph_share_require_identical_labels: bool = True,
     ):
         super().__init__(
             batch_size=batch_size,
@@ -865,12 +855,10 @@ class DummyPrior(Prior):
         self.graph_num_graphs = graph_num_graphs
         self.graph_min_train_neighbors = graph_min_train_neighbors
         self.graph_max_train_neighbors = graph_max_train_neighbors
-        self.graph_same_label_ratio = graph_same_label_ratio
-        self.graph_cross_label_ratio = graph_cross_label_ratio
-        self.graph_test_k_per_class = graph_test_k_per_class
+        self.graph_cross_label_fraction = graph_cross_label_fraction
+        self.graph_train_neighbors_per_test = graph_train_neighbors_per_test
         self.graph_seed = graph_seed
         self.graph_share_across_batch = graph_share_across_batch
-        self.graph_share_require_identical_labels = graph_share_require_identical_labels
 
     @torch.no_grad()
     def get_batch(self, batch_size: Optional[int] = None) -> tuple:
@@ -924,12 +912,10 @@ class DummyPrior(Prior):
                 "graph_num_graphs": self.graph_num_graphs,
                 "graph_min_train_neighbors": self.graph_min_train_neighbors,
                 "graph_max_train_neighbors": self.graph_max_train_neighbors,
-                "graph_same_label_ratio": self.graph_same_label_ratio,
-                "graph_cross_label_ratio": self.graph_cross_label_ratio,
-                "graph_test_k_per_class": self.graph_test_k_per_class,
+                "graph_cross_label_fraction": self.graph_cross_label_fraction,
+                "graph_train_neighbors_per_test": self.graph_train_neighbors_per_test,
                 "graph_seed": self.graph_seed,
                 "graph_share_across_batch": self.graph_share_across_batch,
-                "graph_share_require_identical_labels": self.graph_share_require_identical_labels,
             }
             return X, y, d, seq_lens, train_sizes, [_build_prior_graph(params, y_i) for y_i in y]
         return X, y, d, seq_lens, train_sizes
@@ -1035,12 +1021,10 @@ class PriorDataset(IterableDataset):
         graph_backend: Optional[bool] = None,
         graph_min_train_neighbors: int = 8,
         graph_max_train_neighbors: int = 15,
-        graph_same_label_ratio: float = 0.9,
-        graph_cross_label_ratio: float = 0.1,
-        graph_test_k_per_class: int = 8,
+        graph_cross_label_fraction: float = 0.1,
+        graph_train_neighbors_per_test: int = 8,
         graph_seed: Optional[int] = None,
         graph_share_across_batch: bool = False,
-        graph_share_require_identical_labels: bool = True,
     ):
         super().__init__()
         # None preserves the historical direct-PriorDataset behavior. Training
@@ -1063,12 +1047,10 @@ class PriorDataset(IterableDataset):
                 graph_num_graphs=graph_num_graphs,
                 graph_min_train_neighbors=graph_min_train_neighbors,
                 graph_max_train_neighbors=graph_max_train_neighbors,
-                graph_same_label_ratio=graph_same_label_ratio,
-                graph_cross_label_ratio=graph_cross_label_ratio,
-                graph_test_k_per_class=graph_test_k_per_class,
+                graph_cross_label_fraction=graph_cross_label_fraction,
+                graph_train_neighbors_per_test=graph_train_neighbors_per_test,
                 graph_seed=graph_seed,
                 graph_share_across_batch=graph_share_across_batch,
-                graph_share_require_identical_labels=graph_share_require_identical_labels,
             )
         elif prior_type in ["mlp_scm", "tree_scm", "mix_scm", "nanotabicl"]:
             self.prior = SCMPrior(
@@ -1095,12 +1077,10 @@ class PriorDataset(IterableDataset):
                 graph_num_graphs=graph_num_graphs,
                 graph_min_train_neighbors=graph_min_train_neighbors,
                 graph_max_train_neighbors=graph_max_train_neighbors,
-                graph_same_label_ratio=graph_same_label_ratio,
-                graph_cross_label_ratio=graph_cross_label_ratio,
-                graph_test_k_per_class=graph_test_k_per_class,
+                graph_cross_label_fraction=graph_cross_label_fraction,
+                graph_train_neighbors_per_test=graph_train_neighbors_per_test,
                 graph_seed=graph_seed,
                 graph_share_across_batch=graph_share_across_batch,
-                graph_share_require_identical_labels=graph_share_require_identical_labels,
             )
         else:
             raise ValueError(
@@ -1127,12 +1107,10 @@ class PriorDataset(IterableDataset):
         self.graph_num_graphs = int(graph_num_graphs)
         self.graph_min_train_neighbors = graph_min_train_neighbors
         self.graph_max_train_neighbors = graph_max_train_neighbors
-        self.graph_same_label_ratio = graph_same_label_ratio
-        self.graph_cross_label_ratio = graph_cross_label_ratio
-        self.graph_test_k_per_class = graph_test_k_per_class
+        self.graph_cross_label_fraction = graph_cross_label_fraction
+        self.graph_train_neighbors_per_test = graph_train_neighbors_per_test
         self.graph_seed = graph_seed
         self.graph_share_across_batch = graph_share_across_batch
-        self.graph_share_require_identical_labels = graph_share_require_identical_labels
 
     def get_batch(self, batch_size: Optional[int] = None) -> tuple:
         """Generate a new batch of datasets.

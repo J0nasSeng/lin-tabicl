@@ -178,12 +178,10 @@ class TabICL(nn.Module):
         icl_soft_kmeans_temperature: float = 0.1,
         graph_min_train_neighbors: int = 8,
         graph_max_train_neighbors: int = 15,
-        graph_same_label_ratio: float = 0.9,
-        graph_cross_label_ratio: float = 0.1,
-        graph_test_k_per_class: int = 8,
+        graph_cross_label_fraction: float = 0.1,
+        graph_train_neighbors_per_test: int = 8,
         graph_seed: Optional[int] = None,
         graph_share_across_batch: bool = False,
-        graph_share_require_identical_labels: bool = True,
         graph_num_graphs: int = 1,
         learnable_residual: bool = False,
         icl_ssmax: Union[
@@ -240,13 +238,11 @@ class TabICL(nn.Module):
         self.icl_soft_kmeans_temperature = icl_soft_kmeans_temperature
         self.graph_min_train_neighbors = graph_min_train_neighbors
         self.graph_max_train_neighbors = graph_max_train_neighbors
-        self.graph_same_label_ratio = graph_same_label_ratio
-        self.graph_cross_label_ratio = graph_cross_label_ratio
-        self.graph_test_k_per_class = graph_test_k_per_class
+        self.graph_cross_label_fraction = graph_cross_label_fraction
+        self.graph_train_neighbors_per_test = graph_train_neighbors_per_test
         self.graph_seed = graph_seed
         self.graph_num_graphs = graph_num_graphs
         self.graph_share_across_batch = graph_share_across_batch
-        self.graph_share_require_identical_labels = graph_share_require_identical_labels
         self.icl_ssmax = icl_ssmax
         self.ff_factor = ff_factor
         self.dropout = dropout
@@ -309,12 +305,10 @@ class TabICL(nn.Module):
             soft_kmeans_temperature=icl_soft_kmeans_temperature,
             graph_min_train_neighbors=graph_min_train_neighbors,
             graph_max_train_neighbors=graph_max_train_neighbors,
-            graph_same_label_ratio=graph_same_label_ratio,
-            graph_cross_label_ratio=graph_cross_label_ratio,
-            graph_test_k_per_class=graph_test_k_per_class,
+            graph_cross_label_fraction=graph_cross_label_fraction,
+            graph_train_neighbors_per_test=graph_train_neighbors_per_test,
             graph_seed=graph_seed,
             graph_share_across_batch=graph_share_across_batch,
-            graph_share_require_identical_labels=graph_share_require_identical_labels,
             graph_num_cls=row_num_cls,
             graph_num_graphs=graph_num_graphs,
             learnable_residual=learnable_residual,

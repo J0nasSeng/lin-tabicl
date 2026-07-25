@@ -296,19 +296,13 @@ def build_parser():
         help="Maximum train-train incoming neighbors per train node for graph ICL backend",
     )
     parser.add_argument(
-        "--graph_same_label_ratio",
-        type=float,
-        default=0.9,
-        help="Sampling ratio for same-label neighbors when building graph edges",
-    )
-    parser.add_argument(
-        "--graph_cross_label_ratio",
+        "--graph_cross_label_fraction",
         type=float,
         default=0.1,
-        help="Sampling ratio for cross-label neighbors when building graph edges",
+        help="Fraction of train-train edges connecting different labels",
     )
     parser.add_argument(
-        "--graph_test_k_per_class",
+        "--graph_train_neighbors_per_test",
         type=int,
         default=8,
         help="Minimum number of train neighbors per class for each test node",
@@ -324,12 +318,6 @@ def build_parser():
         default=False,
         type=str2bool,
         help="If True, reuse one graph for all items in a batch",
-    )
-    parser.add_argument(
-        "--graph_share_require_identical_labels",
-        default=True,
-        type=str2bool,
-        help="If True, only share graph when all y_train rows are identical",
     )
     parser.add_argument("--freeze_icl", default=False, type=str2bool, help="Whether to freeze the ICL predictor")
 

@@ -107,12 +107,10 @@ class GATInferenceEngine(nn.Module):
 			num_graphs=predictor.graph_num_graphs,
 			min_train_neighbors=predictor.graph_min_train_neighbors,
 			max_train_neighbors=predictor.graph_max_train_neighbors,
-			same_label_ratio=predictor.graph_same_label_ratio,
-			cross_label_ratio=predictor.graph_cross_label_ratio,
-			test_k_per_class=predictor.graph_test_k_per_class,
+			cross_label_fraction=predictor.graph_cross_label_fraction,
+			train_neighbors_per_test=predictor.graph_train_neighbors_per_test,
 			seed=predictor.graph_seed,
 			share_graph_across_batch=predictor.graph_share_across_batch,
-			share_graph_require_identical_labels=predictor.graph_share_require_identical_labels,
 		)
 
 	def _graph_input(

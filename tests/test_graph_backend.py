@@ -35,15 +35,14 @@ def test_graph_builder_train_degree_and_test_class_coverage():
         total_nodes=total_nodes,
         min_train_neighbors=8,
         max_train_neighbors=15,
-        same_label_ratio=0.9,
-        cross_label_ratio=0.1,
-        test_k_per_class=3,
+        cross_label_fraction=0.1,
+        train_neighbors_per_test=3,
         seed=7,
     )
 
     edge_index = graph.edge_index[0]
-    src = edge_index[0]
-    dst = edge_index[1]
+    src = edge_index[0].long()
+    dst = edge_index[1].long()
 
     # Graph generation should not include self-connections.
     assert int((src == dst).sum().item()) == 0
@@ -85,7 +84,7 @@ def test_graph_builder_multiple_graphs_are_reproducible_and_independent():
         num_graphs=3,
         min_train_neighbors=1,
         max_train_neighbors=3,
-        test_k_per_class=2,
+        train_neighbors_per_test=2,
         seed=11,
     )
     graph_set_b = build_class_conditioned_graphs(
@@ -94,7 +93,7 @@ def test_graph_builder_multiple_graphs_are_reproducible_and_independent():
         num_graphs=3,
         min_train_neighbors=1,
         max_train_neighbors=3,
-        test_k_per_class=2,
+        train_neighbors_per_test=2,
         seed=11,
     )
 
@@ -106,18 +105,17 @@ def test_graph_builder_multiple_graphs_are_reproducible_and_independent():
     )
 
 
-def test_graph_builder_ratios_control_unique_train_train_edges():
+def test_graph_builder_fraction_controls_unique_train_train_edges():
     y_train = _build_labels(batch_size=1, train_size=12, num_classes=3)
 
-    def count_train_edges(same_label_ratio: float, cross_label_ratio: float) -> tuple[int, int]:
+    def count_train_edges(cross_label_fraction: float) -> tuple[int, int]:
         graph = build_class_conditioned_graph(
             y_train=y_train,
             total_nodes=12,
             min_train_neighbors=1,
             max_train_neighbors=1,
-            same_label_ratio=same_label_ratio,
-            cross_label_ratio=cross_label_ratio,
-            test_k_per_class=1,
+            cross_label_fraction=cross_label_fraction,
+            train_neighbors_per_test=1,
             seed=17,
         )
         edge_index = graph.edge_index[0]
@@ -127,9 +125,9 @@ def test_graph_builder_ratios_control_unique_train_train_edges():
         same = train_edges & (labels[src.long()] == labels[dst.long()])
         return int(same.sum().item()), int((train_edges & ~same).sum().item())
 
-    same_only = count_train_edges(1.0, 0.0)
-    cross_only = count_train_edges(0.0, 1.0)
-    balanced = count_train_edges(0.5, 0.5)
+    same_only = count_train_edges(0.0)
+    cross_only = count_train_edges(1.0)
+    balanced = count_train_edges(0.5)
 
     assert same_only[0] > 0 and same_only[1] == 0
     assert cross_only[0] == 0 and cross_only[1] > 0
@@ -175,7 +173,7 @@ def test_prior_dataset_samples_graphs_with_each_dataset():
         graph_num_graphs=2,
         graph_min_train_neighbors=1,
         graph_max_train_neighbors=2,
-        graph_test_k_per_class=1,
+        graph_train_neighbors_per_test=1,
     )
 
     batch = prior.get_batch()
@@ -205,16 +203,25 @@ def test_iclearning_graph_backend_forward_shape():
         icl_backend="graph",
         graph_min_train_neighbors=8,
         graph_max_train_neighbors=10,
-        graph_same_label_ratio=0.9,
-        graph_cross_label_ratio=0.1,
-        graph_test_k_per_class=3,
+        graph_cross_label_fraction=0.1,
+        graph_train_neighbors_per_test=3,
         graph_seed=0,
     )
     model.train()
 
     col_embeddings = torch.randn(batch_size, total_nodes, model.graph_num_cls, model.graph_col_dim)
     graph_input = model.prepare_graph_input(col_embeddings=col_embeddings, y_train=y_train)
-    out = model(graph_input, y_train)
+    graph_set = build_class_conditioned_graphs(
+        y_train=y_train.long(),
+        total_nodes=total_nodes,
+        num_graphs=model.graph_num_graphs,
+        min_train_neighbors=model.graph_min_train_neighbors,
+        max_train_neighbors=model.graph_max_train_neighbors,
+        cross_label_fraction=model.graph_cross_label_fraction,
+        train_neighbors_per_test=model.graph_train_neighbors_per_test,
+        seed=model.graph_seed,
+    )
+    out = model(graph_input, y_train, graph_set=graph_set)
     assert out.shape == (batch_size, total_nodes - train_size, 5)
     assert torch.isfinite(out).all()
 
@@ -427,13 +434,14 @@ def test_graph_builder_shared_graph_when_labels_identical():
     y_one = _build_labels(batch_size=1, train_size=train_size, num_classes=3)
     y_train = y_one.expand(batch_size, -1).clone()
 
-    graph = build_class_conditioned_graph(
+    graph_set = build_class_conditioned_graphs(
         y_train=y_train,
         total_nodes=total_nodes,
+        num_graphs=1,
         seed=17,
         share_graph_across_batch=True,
-        share_graph_require_identical_labels=True,
     )
+    graph = graph_set.graphs[0]
 
     assert len(graph.edge_index) == batch_size
     for idx in range(1, batch_size):
@@ -450,13 +458,14 @@ def test_graph_builder_shared_graph_fallback_for_non_identical_labels():
     )
     total_nodes = 10
 
-    graph = build_class_conditioned_graph(
+    graph_set = build_class_conditioned_graphs(
         y_train=y_train,
         total_nodes=total_nodes,
+        num_graphs=1,
         seed=3,
         share_graph_across_batch=True,
-        share_graph_require_identical_labels=True,
     )
+    graph = graph_set.graphs[0]
 
     assert len(graph.edge_index) == y_train.shape[0]
     assert not torch.equal(graph.edge_index[0], graph.edge_index[1])
@@ -684,6 +693,16 @@ def test_tabicl_graph_backend_forward_with_column_identity_rotation():
     )
     model.train()
 
-    out = model(X, y_train, d=d)
+    graph_set = build_class_conditioned_graphs(
+        y_train=y_train,
+        total_nodes=total_rows,
+        num_graphs=model.graph_num_graphs,
+        min_train_neighbors=model.graph_min_train_neighbors,
+        max_train_neighbors=model.graph_max_train_neighbors,
+        cross_label_fraction=model.graph_cross_label_fraction,
+        train_neighbors_per_test=model.graph_train_neighbors_per_test,
+        seed=model.graph_seed,
+    )
+    out = model(X, y_train, d=d, graph_set=graph_set)
     assert out.shape == (batch_size, total_rows - train_size, 5)
     assert torch.isfinite(out).all()
