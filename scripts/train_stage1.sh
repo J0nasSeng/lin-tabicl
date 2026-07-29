@@ -4,11 +4,11 @@
 ICL_BACKEND=${ICL_BACKEND:-graph}
 # Enable wandb logging by setting WAND_LOG=True (and optionally WAND_MODE=online)
 WAND_LOG=${WAND_LOG:-True}
-WAND_MODE=${WAND_MODE:-online}
+WAND_MODE=${WAND_MODE:-offline}
 # GPU selection controls
 DEVICE=${DEVICE:-cuda}
-NUM_GPUS=${NUM_GPUS:-1}
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-7}
+NUM_GPUS=${NUM_GPUS:-3}
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,6,7}
 # Confusion matrix logging interval
 LOG_CONF_MAT_EVERY=${LOG_CONF_MAT_EVERY:-2000}
 
@@ -29,7 +29,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --np_seed 42 \
             --torch_seed 42 \
             --max_steps 10000 \
-            --batch_size 512 \
+            --batch_size 128 \
             --micro_batch_size 3 \
             --log_conf_mat_every ${LOG_CONF_MAT_EVERY} \
             --lr 8e-4 \

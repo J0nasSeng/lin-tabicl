@@ -267,6 +267,7 @@ def build_class_conditioned_graph(
     for b in range(batch_size):
         edge_index_batch.append(_build_single_graph(y_train[b].long()))
 
+        
     return SparseGraphBatch(edge_index=edge_index_batch, num_nodes=total_nodes)
 
 
