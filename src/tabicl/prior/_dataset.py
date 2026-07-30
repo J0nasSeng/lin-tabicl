@@ -39,7 +39,7 @@ from ._hp_sampling import HpSamplerList
 from ._reg2cls import Reg2Cls
 from ._prior_config import DEFAULT_FIXED_HP, DEFAULT_SAMPLED_HP
 from tabicl._preprocessing.normalizer import normalize_batch
-from tabicl._model.graph import SparseGraphSet, build_class_conditioned_graphs
+from tabicl._model.graph import CompactGraphSet, build_class_conditioned_graphs, stack_graph_sets
 
 
 warnings.filterwarnings(
@@ -391,7 +391,7 @@ class Prior:
         return True
 
 
-def _build_prior_graph(params: Dict[str, Any], y: Tensor) -> SparseGraphSet:
+def _build_prior_graph(params: Dict[str, Any], y: Tensor) -> CompactGraphSet:
     """Build graph metadata for one valid dataset inside prior generation."""
     train_size = int(params["train_size"])
     return build_class_conditioned_graphs(
@@ -757,7 +757,7 @@ class SCMPrior(Prior):
         )
 
         if self.graph_backend:
-            return X, y, d, seq_lens, train_sizes, list(graph_sets)
+            return X, y, d, seq_lens, train_sizes, stack_graph_sets(list(graph_sets))
         return X, y, d, seq_lens, train_sizes
 
     def get_prior(self) -> str:
@@ -917,7 +917,18 @@ class DummyPrior(Prior):
                 "graph_seed": self.graph_seed,
                 "graph_share_across_batch": self.graph_share_across_batch,
             }
-            return X, y, d, seq_lens, train_sizes, [_build_prior_graph(params, y_i) for y_i in y]
+            graph_set = build_class_conditioned_graphs(
+                y_train=y[:, :train_size].long(),
+                total_nodes=seq_len,
+                num_graphs=self.graph_num_graphs,
+                min_train_neighbors=self.graph_min_train_neighbors,
+                max_train_neighbors=self.graph_max_train_neighbors,
+                cross_label_fraction=self.graph_cross_label_fraction,
+                train_neighbors_per_test=self.graph_train_neighbors_per_test,
+                seed=self.graph_seed,
+                share_graph_across_batch=self.graph_share_across_batch,
+            )
+            return X, y, d, seq_lens, train_sizes, graph_set
         return X, y, d, seq_lens, train_sizes
 
 

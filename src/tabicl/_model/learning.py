@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from .layers import ClassNode, OneHotAndLinear
 from .encoders import Encoder
 from .gat import GraphAttentionTransformer
-from .graph import SparseGraphSet
+from .graph import CompactGraphSet
 from .kv_cache import KVCache
 from .inference import InferenceManager
 from .inference_config import MgrConfig, InferenceConfig
@@ -404,7 +404,7 @@ class ICLearning(nn.Module):
         self,
         graph_input: Tensor,
         y_train: Tensor,
-        graph_set: Optional[SparseGraphSet] = None,
+        graph_set: Optional[CompactGraphSet] = None,
     ) -> Tensor:
         """Graph-only column pipeline.
 
@@ -446,29 +446,15 @@ class ICLearning(nn.Module):
         if graph_set.num_nodes != T:
             raise ValueError(f"Expected graph num_nodes={T}, got {graph_set.num_nodes}")
 
+        if graph_set.num_datasets != B:
+            raise ValueError(f"Expected {B} graph datasets, got {graph_set.num_datasets}")
+        if graph_set.edge_index.ndim != 2 or graph_set.edge_index.shape[0] != 2:
+            raise ValueError("Compact graph edge_index must have shape (2, E)")
+        if graph_set.edge_offsets.ndim != 2:
+            raise ValueError("Compact graph edge_offsets must have shape (num_graphs, num_datasets + 1)")
+
         x = graph_input
-        edge_index_batch: list[list[Tensor]] = []
-
-        for graph_idx, graph in enumerate(graph_set.graphs):
-            graph_edges: list[Tensor] = []
-            for b, edge_index in enumerate(graph.edge_index):
-                # Graph metadata is stored compactly as uint16; PyTorch's
-                # reductions and indexing paths require int64 here.
-                edge_index = edge_index.to(device=x.device, dtype=torch.long)
-                graph_edges.append(edge_index)
-                if edge_index.ndim != 2 or edge_index.shape[0] != 2:
-                    raise ValueError("Each graph edge index must have shape (2, E)")
-                if edge_index.numel() > 0:
-                    min_idx = int(edge_index.min().item())
-                    max_idx = int(edge_index.max().item())
-                    if min_idx < 0 or max_idx >= T:
-                        raise ValueError(
-                            f"edge_index out of bounds for graph {graph_idx}, dataset {b}: "
-                            f"[{min_idx}, {max_idx}] vs T={T}"
-                        )
-            edge_index_batch.append(graph_edges)
-
-        return self.gat_icl(x, edge_index_batch=edge_index_batch)
+        return self.gat_icl(x, graph_set=graph_set)
 
     def prepare_graph_input(
         self,

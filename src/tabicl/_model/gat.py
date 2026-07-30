@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from functools import partial
-from typing import Callable, Sequence
+from typing import Callable, Sequence, TYPE_CHECKING
 
 import torch
 from torch import nn, Tensor
 from torch.utils.checkpoint import checkpoint
+
+if TYPE_CHECKING:
+    from .graph import CompactGraphSet
 
 
 class GraphMultiheadAttention(nn.Module):
@@ -43,7 +46,13 @@ class GraphMultiheadAttention(nn.Module):
         nn.init.xavier_uniform_(self.out_proj.weight)
         nn.init.zeros_(self.out_proj.bias)
 
-    def forward(self, src: Tensor, edge_index_batch: list[Tensor], residual_src: Tensor | None = None) -> Tensor:
+    def forward(
+        self,
+        src: Tensor,
+        edge_index_batch: Sequence[Tensor] | Tensor,
+        residual_src: Tensor | None = None,
+        edge_index_is_global: bool = False,
+    ) -> Tensor:
         """Apply sparse graph attention.
 
         Parameters
@@ -63,7 +72,7 @@ class GraphMultiheadAttention(nn.Module):
 
         if src.ndim != 4:
             raise ValueError("src must have shape (B, T, C, D)")
-        if len(edge_index_batch) != src.shape[0]:
+        if not isinstance(edge_index_batch, Tensor) and len(edge_index_batch) != src.shape[0]:
             raise ValueError("edge_index_batch length must equal batch size")
 
         if residual_src is None:
@@ -75,7 +84,8 @@ class GraphMultiheadAttention(nn.Module):
         all_edge_src: list[Tensor] = []
         all_edge_dst: list[Tensor] = []
 
-        for b, edge_index in enumerate(edge_index_batch):
+        edge_items = [edge_index_batch] if isinstance(edge_index_batch, Tensor) else edge_index_batch
+        for b, edge_index in enumerate(edge_items):
             edge_index = edge_index.to(device=src.device, dtype=torch.long)
             if edge_index.ndim != 2 or edge_index.shape[0] != 2:
                 raise ValueError("Each edge_index must have shape (2, E)")
@@ -83,9 +93,10 @@ class GraphMultiheadAttention(nn.Module):
             if edge_index.numel() > 0:
                 edge_min = int(edge_index.min().item())
                 edge_max = int(edge_index.max().item())
-                if edge_min < 0 or edge_max >= T:
+                upper_bound = B * T if edge_index_is_global else T
+                if edge_min < 0 or edge_max >= upper_bound:
                     raise ValueError(
-                        f"edge_index for batch element {b} must be within [0, {T - 1}], "
+                        f"edge_index for batch element {b} must be within [0, {upper_bound - 1}], "
                         f"got min={edge_min}, max={edge_max}"
                     )
 
@@ -94,7 +105,7 @@ class GraphMultiheadAttention(nn.Module):
             if edge_src.numel() == 0:
                 continue
 
-            offset = b * T
+            offset = 0 if edge_index_is_global else b * T
             all_edge_src.append(edge_src + offset)
             all_edge_dst.append(edge_dst + offset)
 
@@ -198,13 +209,27 @@ class GraphAttentionBlock(nn.Module):
     def _ff_block(self, x: Tensor) -> Tensor:
         return self.dropout2(self.linear2(self.dropout(self.activation(self.linear1(x)))))
 
-    def forward(self, src: Tensor, edge_index_batch: list[Tensor]) -> Tensor:
+    def forward(
+        self,
+        src: Tensor,
+        edge_index_batch: Sequence[Tensor] | Tensor,
+        edge_index_is_global: bool = False,
+    ) -> Tensor:
         if self.norm_first:
-            x = self.dropout1(self.attn(self.norm1(src), edge_index_batch=edge_index_batch, residual_src=src))
+            x = self.dropout1(
+                self.attn(
+                    self.norm1(src), edge_index_batch=edge_index_batch,
+                    residual_src=src, edge_index_is_global=edge_index_is_global,
+                )
+            )
             x = x + self._ff_block(self.norm2(x))
             return x
 
-        x = self.norm1(self.dropout1(self.attn(src, edge_index_batch=edge_index_batch)))
+        x = self.norm1(
+            self.dropout1(
+                self.attn(src, edge_index_batch=edge_index_batch, edge_index_is_global=edge_index_is_global)
+            )
+        )
         x = self.norm2(x + self._ff_block(x))
         return x
 
@@ -278,17 +303,48 @@ class GraphAttentionTransformer(nn.Module):
         self.num_graphs = num_graphs
         self.layers_per_graph = num_blocks // num_graphs
 
-    def forward(self, src: Tensor, edge_index_batch: Sequence[list[Tensor]]) -> Tensor:
+    def forward(
+        self,
+        src: Tensor,
+        edge_index_batch: Sequence[list[Tensor]] | None = None,
+        graph_set: "CompactGraphSet" | None = None,
+    ) -> Tensor:
         if src.ndim != 4:
             raise ValueError("GraphAttentionTransformer expects src with shape (B, T, C, D)")
 
         B, T, C, D = src.shape
-        if len(edge_index_batch) != self.num_graphs:
+        edge_index_is_global = graph_set is not None
+        if graph_set is not None:
+            if edge_index_batch is not None:
+                raise ValueError("Provide either graph_set or edge_index_batch, not both")
+            if graph_set.num_graphs != self.num_graphs or graph_set.num_datasets != B:
+                raise ValueError("Compact graph dimensions do not match the transformer input")
+            if graph_set.num_nodes != T:
+                raise ValueError("Compact graph node count does not match the transformer input")
+            compact_edges = graph_set.edge_index.to(device=src.device, dtype=torch.long)
+            edge_index_batch = []
+            for graph_idx in range(self.num_graphs):
+                starts = graph_set.edge_offsets[graph_idx, :-1].to(device=src.device, dtype=torch.long)
+                ends = graph_set.edge_offsets[graph_idx, 1:].to(device=src.device, dtype=torch.long)
+                lengths = ends - starts
+                if int(lengths.sum().item()) == 0:
+                    edge_index_batch.append(compact_edges[:, :0])
+                    continue
+                dataset_ids = torch.repeat_interleave(torch.arange(B, device=src.device), lengths)
+                local_offsets = dataset_ids * T
+                edge_positions = torch.cat(
+                    [torch.arange(start, end, device=src.device) for start, end in zip(starts.tolist(), ends.tolist())]
+                )
+                edges = compact_edges[:, edge_positions]
+                edges = edges + local_offsets.unsqueeze(0)
+                edge_index_batch.append(edges)
+
+        if edge_index_batch is None or len(edge_index_batch) != self.num_graphs:
             raise ValueError(
-                f"Expected {self.num_graphs} graph batches, got {len(edge_index_batch)}"
+                f"Expected {self.num_graphs} graph batches, got {0 if edge_index_batch is None else len(edge_index_batch)}"
             )
         for graph_idx, graph_edges in enumerate(edge_index_batch):
-            if len(graph_edges) != B:
+            if not isinstance(graph_edges, Tensor) and len(graph_edges) != B:
                 raise ValueError(
                     f"Graph {graph_idx} must contain one edge index per batch item; "
                     f"got {len(graph_edges)} for batch size {B}"
@@ -302,9 +358,21 @@ class GraphAttentionTransformer(nn.Module):
         for block_idx, block in enumerate(self.graph_blocks):
             graph_edges = edge_index_batch[block_idx // self.layers_per_graph]
             if self.recompute:
-                out = checkpoint(partial(block, edge_index_batch=graph_edges), out, use_reentrant=False)
+                out = checkpoint(
+                    partial(
+                        block,
+                        edge_index_batch=graph_edges,
+                        edge_index_is_global=edge_index_is_global,
+                    ),
+                    out,
+                    use_reentrant=False,
+                )
             else:
-                out = block(out, edge_index_batch=graph_edges)
+                out = block(
+                    out,
+                    edge_index_batch=graph_edges,
+                    edge_index_is_global=edge_index_is_global,
+                )
 
             x_bt = out.reshape(B * T, C, D)
             attn_in = self.col_attn_ln[block_idx](x_bt)

@@ -42,11 +42,138 @@ class SparseGraphSet:
         return self.graphs[0].num_nodes
 
 
-def stack_graph_sets(graph_sets: list[SparseGraphSet]) -> SparseGraphSet:
+@dataclass
+class CompactGraphSet:
+    """Tensor-backed graph set used across DataLoader and training boundaries.
+
+    ``edge_index`` concatenates all edges in graph-major, dataset-major order.
+    ``edge_offsets`` has shape ``(num_graphs, num_datasets + 1)`` and identifies
+    the slice belonging to each graph/dataset pair.
+    """
+
+    edge_index: Tensor
+    edge_offsets: Tensor
+    num_nodes: int
+
+    @property
+    def num_graphs(self) -> int:
+        return int(self.edge_offsets.shape[0])
+
+    @property
+    def num_datasets(self) -> int:
+        return int(self.edge_offsets.shape[1] - 1)
+
+    def __len__(self) -> int:
+        return self.num_datasets
+
+    def __iter__(self):
+        """Yield single-dataset compact views for legacy callers."""
+        for index in range(self.num_datasets):
+            yield self.slice(index)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return self.slice(index)
+        return self.slice(index)
+
+    def slice(self, index: int | slice) -> "CompactGraphSet":
+        selected = [index] if isinstance(index, int) else list(range(self.num_datasets))[index]
+        if not selected:
+            offsets = torch.zeros((self.num_graphs, 1), dtype=torch.long, device=self.edge_offsets.device)
+            return CompactGraphSet(self.edge_index[:, :0], offsets, self.num_nodes)
+        parts = []
+        rows = []
+        running = 0
+        for graph_idx in range(self.num_graphs):
+            row = [running]
+            for dataset_idx in selected:
+                start = int(self.edge_offsets[graph_idx, dataset_idx])
+                end = int(self.edge_offsets[graph_idx, dataset_idx + 1])
+                parts.append(self.edge_index[:, start:end])
+                running += end - start
+                row.append(running)
+            rows.append(row)
+        return CompactGraphSet(torch.cat(parts, dim=1), torch.tensor(rows, dtype=torch.long), self.num_nodes)
+
+    def concat(self, other: "CompactGraphSet") -> "CompactGraphSet":
+        """Concatenate two already-batched payloads along the dataset axis."""
+        if self.num_graphs != other.num_graphs or self.num_nodes != other.num_nodes:
+            raise ValueError("Compact graph batches must have matching graph and node dimensions")
+        if self.edge_index.device != other.edge_index.device:
+            raise ValueError("Compact graph batches must be on the same device")
+        left_edges = self.edge_index.shape[1]
+        right_offsets = other.edge_offsets[:, 1:] + left_edges
+        offsets = torch.cat([self.edge_offsets, right_offsets], dim=1)
+        return CompactGraphSet(torch.cat([self.edge_index, other.edge_index], dim=1), offsets, self.num_nodes)
+
+    @property
+    def graphs(self) -> list["CompactGraphBatch"]:
+        """Compatibility view; the DataLoader payload remains tensor-backed."""
+        return [
+            CompactGraphBatch(
+                edge_index=[self.edge_index[:, start:end] for start, end in zip(
+                    offsets[:-1].tolist(), offsets[1:].tolist()
+                )],
+                num_nodes=self.num_nodes,
+            )
+            for offsets in self.edge_offsets
+        ]
+
+
+@dataclass
+class CompactGraphBatch:
+    edge_index: list[Tensor]
+    num_nodes: int
+
+
+def _compact_from_graph_batches(graphs: list[SparseGraphBatch | CompactGraphBatch], num_nodes: int) -> CompactGraphSet:
+    parts: list[Tensor] = []
+    offset_rows = []
+    running = 0
+    for graph in graphs:
+        row = [running]
+        for edge_index in graph.edge_index:
+            parts.append(edge_index)
+            running += edge_index.shape[1]
+            row.append(running)
+        offset_rows.append(row)
+    edge_index = torch.cat(parts, dim=1) if parts else torch.empty((2, 0), dtype=torch.uint16)
+    return CompactGraphSet(
+        edge_index=edge_index,
+        edge_offsets=torch.tensor(offset_rows, dtype=torch.long, device=edge_index.device),
+        num_nodes=num_nodes,
+    )
+
+
+def stack_graph_sets(graph_sets: list[SparseGraphSet | CompactGraphSet]) -> CompactGraphSet:
     """Combine per-dataset graph sets into graph batches for model input."""
 
     if not graph_sets:
         raise ValueError("graph_sets must not be empty")
+    if isinstance(graph_sets[0], CompactGraphSet):
+        compact = [graph for graph in graph_sets if isinstance(graph, CompactGraphSet)]
+        if len(compact) != len(graph_sets):
+            raise ValueError("Cannot mix compact and sparse graph sets")
+        num_graphs = compact[0].num_graphs
+        if any(graph.num_datasets != 1 for graph in compact):
+            raise ValueError("stack_graph_sets expects one compact graph set per dataset")
+        if any(graph.num_graphs != num_graphs for graph in compact):
+            raise ValueError("All graph sets must contain the same number of graphs")
+        parts = []
+        offset_rows = []
+        running = 0
+        for graph_idx in range(num_graphs):
+            row = [running]
+            for graph in compact:
+                start, end = graph.edge_offsets[graph_idx, 0].item(), graph.edge_offsets[graph_idx, 1].item()
+                parts.append(graph.edge_index[:, start:end])
+                running += end - start
+                row.append(running)
+            offset_rows.append(row)
+        edge_index = torch.cat(parts, dim=1) if parts else compact[0].edge_index[:, :0]
+        return CompactGraphSet(edge_index, torch.tensor(offset_rows, dtype=torch.long), compact[0].num_nodes)
+
+    # Legacy input is converted once at the boundary.
     num_graphs = graph_sets[0].num_graphs
     if any(graph_set.num_graphs != num_graphs for graph_set in graph_sets):
         raise ValueError("All graph sets must contain the same number of graphs")
@@ -58,13 +185,17 @@ def stack_graph_sets(graph_sets: list[SparseGraphSet]) -> SparseGraphSet:
         if any(graph.num_nodes != num_nodes for graph in per_dataset):
             raise ValueError("All graph batches must have the same number of nodes")
         graphs.append(SparseGraphBatch(edge_index=[graph.edge_index[0] for graph in per_dataset], num_nodes=num_nodes))
-    return SparseGraphSet(graphs=graphs)
+    return _compact_from_graph_batches(graphs, graphs[0].num_nodes)
 
 
-def slice_graph_sets(graph_sets: list[SparseGraphSet], indices: slice) -> list[SparseGraphSet]:
-    """Slice per-dataset graph sets along the batch dimension."""
+def slice_graph_sets(graph_sets: CompactGraphSet, indices: slice) -> CompactGraphSet:
+    """Slice a compact graph set along its dataset dimension."""
+    return graph_sets.slice(indices)
 
-    return graph_sets[indices]
+
+def concat_compact_graph_sets(first: CompactGraphSet, second: CompactGraphSet) -> CompactGraphSet:
+    """Concatenate compact graph payloads without reconstructing graph objects."""
+    return first.concat(second)
 
 
 def _sample_indices(
@@ -161,38 +292,35 @@ def build_class_conditioned_graph(
         src_edges: list[Tensor] = []
         dst_edges: list[Tensor] = []
 
-        # Build finite unordered candidate pools. Sampling without replacement
-        # makes the ratio describe the final unique train-train edges rather
-        # than a replacement-based request that is later collapsed by unique().
-        same_candidate_parts: list[Tensor] = []
-        cross_candidate_parts: list[Tensor] = []
-        for class_pool in class_pools:
-            if class_pool.numel() >= 2:
-                same_candidate_parts.append(torch.combinations(class_pool, r=2).T)
-
-        for i in range(num_classes):
-            for j in range(i + 1, num_classes):
-                left_pool = class_pools[i]
-                right_pool = class_pools[j]
-                if left_pool.numel() == 0 or right_pool.numel() == 0:
-                    continue
-                cross_candidate_parts.append(
-                    torch.stack(
-                        [
-                            left_pool.repeat_interleave(right_pool.numel()),
-                            right_pool.repeat(left_pool.numel()),
-                        ],
-                        dim=0,
-                    )
-                )
-
-        def _concat_candidates(parts: list[Tensor]) -> Tensor:
-            if not parts:
+        # Sample pairs directly.  The previous implementation materialized all
+        # same-label combinations and cross-label Cartesian products, which is
+        # quadratic in the training-set size.
+        def _sample_pairs(kind: str, count: int) -> Tensor:
+            if count <= 0:
                 return torch.empty((2, 0), dtype=torch.long, device=labels.device)
-            return torch.cat(parts, dim=1)
-
-        same_candidates = _concat_candidates(same_candidate_parts)
-        cross_candidates = _concat_candidates(cross_candidate_parts)
+            eligible = [pool for pool in class_pools if pool.numel() >= 2] if kind == "same" else class_pools
+            if kind == "cross":
+                eligible = [pool for pool in class_pools if pool.numel() > 0]
+                if len(eligible) < 2:
+                    return torch.empty((2, 0), dtype=torch.long, device=labels.device)
+            pairs: set[tuple[int, int]] = set()
+            max_attempts = max(100, count * 20)
+            for _ in range(max_attempts):
+                if len(pairs) >= count:
+                    break
+                if kind == "same":
+                    pool = eligible[int(torch.randint(len(eligible), (1,), generator=gen, device=labels.device))]
+                    positions = torch.randperm(pool.numel(), generator=gen, device=labels.device)[:2]
+                    left, right = int(pool[positions[0]]), int(pool[positions[1]])
+                else:
+                    class_ids = torch.randperm(len(eligible), generator=gen, device=labels.device)[:2]
+                    left_pool, right_pool = eligible[int(class_ids[0])], eligible[int(class_ids[1])]
+                    left = int(left_pool[torch.randint(left_pool.numel(), (1,), generator=gen, device=labels.device)])
+                    right = int(right_pool[torch.randint(right_pool.numel(), (1,), generator=gen, device=labels.device)])
+                pairs.add((min(left, right), max(left, right)))
+            if not pairs:
+                return torch.empty((2, 0), dtype=torch.long, device=labels.device)
+            return torch.tensor(list(pairs), dtype=torch.long, device=labels.device).T
 
         total_pair_budget = int(
             torch.randint(
@@ -206,52 +334,55 @@ def build_class_conditioned_graph(
         requested_cross = int(round(total_pair_budget * cross_label_fraction))
         requested_same = total_pair_budget - requested_cross
 
-        # If one candidate pool is exhausted, use any remaining budget from
-        # the other pool rather than fabricating duplicate edges.
-        same_count = min(requested_same, same_candidates.shape[1])
-        cross_count = min(requested_cross, cross_candidates.shape[1])
+        # Compute capacities analytically so an exhausted category can donate
+        # its remaining budget without constructing candidate pairs.
+        same_capacity = sum(int(pool.numel()) * (int(pool.numel()) - 1) // 2 for pool in class_pools)
+        cross_capacity = sum(
+            int(class_pools[i].numel()) * int(class_pools[j].numel())
+            for i in range(num_classes)
+            for j in range(i + 1, num_classes)
+        )
+        same_count = min(requested_same, same_capacity)
+        cross_count = min(requested_cross, cross_capacity)
         remaining = total_pair_budget - same_count - cross_count
-        if remaining > 0:
-            extra_same = min(remaining, same_candidates.shape[1] - same_count)
+        if remaining:
+            extra_same = min(remaining, same_capacity - same_count)
             same_count += extra_same
             remaining -= extra_same
-        if remaining > 0:
-            extra_cross = min(remaining, cross_candidates.shape[1] - cross_count)
-            cross_count += extra_cross
+        if remaining:
+            cross_count += min(remaining, cross_capacity - cross_count)
 
-        same_candidate_indices = torch.arange(same_candidates.shape[1], device=labels.device)
-        cross_candidate_indices = torch.arange(cross_candidates.shape[1], device=labels.device)
-        same_sample = _sample_indices(same_candidate_indices, same_count, generator=gen)
-        cross_sample = _sample_indices(cross_candidate_indices, cross_count, generator=gen)
-
-        if same_count > 0:
-            same_edges = same_candidates[:, same_sample]
+        same_edges = _sample_pairs("same", same_count)
+        cross_edges = _sample_pairs("cross", cross_count)
+        if same_edges.shape[1] > 0:
             src_edges.extend([same_edges[0], same_edges[1]])
             dst_edges.extend([same_edges[1], same_edges[0]])
-        if cross_count > 0:
-            cross_edges = cross_candidates[:, cross_sample]
+        if cross_edges.shape[1] > 0:
             src_edges.extend([cross_edges[0], cross_edges[1]])
             dst_edges.extend([cross_edges[1], cross_edges[0]])
 
         # 3) Train->test edges only: test nodes are consumers and do not send to train nodes.
         if num_test > 0 and num_classes > 0:
-            dst_template = torch.arange(train_size, total_nodes, device=labels.device, dtype=torch.long).repeat_interleave(
-                train_neighbors_per_test
-            )
-
             src_test_parts: list[Tensor] = []
             dst_test_parts: list[Tensor] = []
             test_nodes = torch.arange(train_size, total_nodes, device=labels.device, dtype=torch.long)
             for class_pool in class_pools:
-                for test_node in test_nodes:
-                    src_c = _sample_indices(
-                        class_pool,
-                        train_neighbors_per_test,
+                pool_size = class_pool.numel()
+                if pool_size < train_neighbors_per_test:
+                    positions = torch.randint(
+                        pool_size,
+                        (num_test, train_neighbors_per_test),
                         generator=gen,
-                        allow_replacement=class_pool.numel() < train_neighbors_per_test,
+                        device=labels.device,
                     )
-                    src_test_parts.append(src_c)
-                    dst_test_parts.append(test_node.expand(src_c.shape[0]))
+                else:
+                    # A separate permutation per test node avoids the nested
+                    # Python loop while retaining sampling without replacement.
+                    positions = torch.argsort(
+                        torch.rand((num_test, pool_size), generator=gen, device=labels.device), dim=1
+                    )[:, :train_neighbors_per_test]
+                src_test_parts.append(class_pool[positions].reshape(-1))
+                dst_test_parts.append(test_nodes[:, None].expand(-1, train_neighbors_per_test).reshape(-1))
 
             src_test = torch.cat(src_test_parts, dim=0)
             dst_test = torch.cat(dst_test_parts, dim=0)
@@ -281,7 +412,7 @@ def build_class_conditioned_graphs(
     train_neighbors_per_test: int = 3,
     seed: Optional[int] = None,
     share_graph_across_batch: bool = False,
-) -> SparseGraphSet:
+) -> CompactGraphSet:
     """Build multiple independently sampled class-conditioned graph batches.
 
     Each graph uses the same sampling rules as
@@ -308,11 +439,15 @@ def build_class_conditioned_graphs(
                 )
                 for graph_idx in range(num_graphs)
             ]
-            return SparseGraphSet(
-                graphs=[
-                    SparseGraphBatch(edge_index=[graph.edge_index[0]] * y_train.shape[0], num_nodes=total_nodes)
+            return _compact_from_graph_batches(
+                [
+                    SparseGraphBatch(
+                        edge_index=[graph.edge_index[0]] * y_train.shape[0],
+                        num_nodes=total_nodes,
+                    )
                     for graph in shared
-                ]
+                ],
+                total_nodes,
             )
 
     graphs = [
@@ -327,4 +462,4 @@ def build_class_conditioned_graphs(
         )
         for graph_idx in range(num_graphs)
     ]
-    return SparseGraphSet(graphs=graphs)
+    return _compact_from_graph_batches(graphs, total_nodes)

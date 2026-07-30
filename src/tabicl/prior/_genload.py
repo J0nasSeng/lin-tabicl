@@ -37,7 +37,7 @@ import numpy as np
 from torch.utils.data import IterableDataset
 
 from tabicl.prior._dataset import PriorDataset
-from tabicl._model.graph import SparseGraphBatch, SparseGraphSet
+from tabicl._model.graph import CompactGraphSet, SparseGraphBatch, SparseGraphSet, concat_compact_graph_sets, stack_graph_sets
 from tabicl._preprocessing.normalizer import normalize_batch
 from tabicl.prior._prior_config import DEFAULT_FIXED_HP, DEFAULT_SAMPLED_HP
 
@@ -303,18 +303,27 @@ class LoadPriorDataset(IterableDataset):
         batch_size = batch["batch_size"]
         graph_sets = None
         if "graph_sets" in batch:
-            graph_sets = [
-                SparseGraphSet(
-                    graphs=[
-                        SparseGraphBatch(
-                            edge_index=[edge.clone() for edge in graph["edge_index"]],
-                            num_nodes=int(graph["num_nodes"]),
-                        )
-                        for graph in graph_set
-                    ]
+            stored_graphs = batch["graph_sets"]
+            if isinstance(stored_graphs, dict) and "edge_index" in stored_graphs:
+                graph_sets = CompactGraphSet(
+                    edge_index=stored_graphs["edge_index"],
+                    edge_offsets=stored_graphs["edge_offsets"],
+                    num_nodes=int(stored_graphs["num_nodes"]),
                 )
-                for graph_set in batch["graph_sets"]
-            ]
+            else:
+                graph_sets = [
+                    SparseGraphSet(
+                        graphs=[
+                            SparseGraphBatch(
+                                edge_index=[edge.clone() for edge in graph["edge_index"]],
+                                num_nodes=int(graph["num_nodes"]),
+                            )
+                            for graph in graph_set
+                        ]
+                    )
+                    for graph_set in stored_graphs
+                ]
+                graph_sets = stack_graph_sets(graph_sets)
         elif self.graph_backend:
             raise RuntimeError(
                 f"Graph backend requested but {batch_file} has no precomputed graph metadata. "
@@ -412,7 +421,10 @@ class LoadPriorDataset(IterableDataset):
                     self.buffer_seq_lens = torch.cat([self.buffer_seq_lens, seq_lens], dim=0)
                     self.buffer_train_sizes = torch.cat([self.buffer_train_sizes, train_sizes], dim=0)
                     if self.graph_backend:
-                        self.buffer_graph_sets.extend(graph_sets or [])
+                        if isinstance(self.buffer_graph_sets, CompactGraphSet) and isinstance(graph_sets, CompactGraphSet):
+                            self.buffer_graph_sets = concat_compact_graph_sets(self.buffer_graph_sets, graph_sets)
+                        else:
+                            self.buffer_graph_sets.extend(graph_sets or [])
                     self.buffer_size += file_batch_size
             except Exception as e:
                 # If we can't load more files, use what we have
@@ -614,13 +626,20 @@ class SavePriorDataset:
         temp_file = self.save_dir / f"batch_{batch_idx:06d}.pt.tmp"
         payload = {"X": X, "y": y, "d": d, "seq_lens": seq_lens, "train_sizes": train_sizes, "batch_size": B}
         if graph_sets is not None:
-            payload["graph_sets"] = [
-                [
-                    {"edge_index": [edge.cpu() for edge in graph.edge_index], "num_nodes": graph.num_nodes}
-                    for graph in graph_set.graphs
+            if isinstance(graph_sets, CompactGraphSet):
+                payload["graph_sets"] = {
+                    "edge_index": graph_sets.edge_index.cpu(),
+                    "edge_offsets": graph_sets.edge_offsets.cpu(),
+                    "num_nodes": graph_sets.num_nodes,
+                }
+            else:
+                payload["graph_sets"] = [
+                    [
+                        {"edge_index": [edge.cpu() for edge in graph.edge_index], "num_nodes": graph.num_nodes}
+                        for graph in graph_set.graphs
+                    ]
+                    for graph_set in graph_sets
                 ]
-                for graph_set in graph_sets
-            ]
         torch.save(payload, temp_file)
         # Atomic rename to ensure file integrity
         temp_file.replace(batch_file)

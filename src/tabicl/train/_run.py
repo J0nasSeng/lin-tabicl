@@ -38,7 +38,7 @@ except ImportError:
 
 from tabicl._model.tabicl import TabICL
 from tabicl._model.nanotabicl import NanoTabICLv2
-from tabicl._model.graph import stack_graph_sets
+from tabicl._model.graph import CompactGraphSet, slice_graph_sets
 from tabicl.prior._dataset import PriorDataset
 from tabicl.prior._genload import LoadPriorDataset
 from tabicl.train._optim import get_scheduler
@@ -411,8 +411,8 @@ class Trainer:
             dataset,
             batch_size=None,  # No additional batching since prior dataset handles batching internally
             shuffle=False,
-            num_workers=4,
-            prefetch_factor=4,
+            num_workers=16,
+            prefetch_factor=2,
             pin_memory=True if self.config.prior_device == "cpu" else False,
             pin_memory_device=self.config.device if self.config.prior_device == "cpu" else "",
             persistent_workers=True,
@@ -714,9 +714,12 @@ class Trainer:
         tensor_splits = [torch.split(t, self.config.micro_batch_size, dim=0) for t in tensor_fields]
         micro_batches = [tuple(parts) for parts in zip(*tensor_splits)]
         if graph_mode:
+            graph_payload = batch[-1]
+            if not isinstance(graph_payload, CompactGraphSet):
+                raise TypeError("Graph batches must use CompactGraphSet")
             graph_splits = [
-                batch[-1][start : start + self.config.micro_batch_size]
-                for start in range(0, len(batch[-1]), self.config.micro_batch_size)
+                slice_graph_sets(graph_payload, slice(start, start + self.config.micro_batch_size))
+                for start in range(0, graph_payload.num_datasets, self.config.micro_batch_size)
             ]
             micro_batches = [parts + (graphs,) for parts, graphs in zip(micro_batches, graph_splits)]
         return num_micro_batches, micro_batches
@@ -1044,7 +1047,7 @@ class Trainer:
         #self.fit_ensemble(micro_batch)
 
         micro_X, _micro_y, micro_d, y_train, y_test, graph_sets = self._prepare_micro_batch_tensors(micro_batch)
-        graph_set = stack_graph_sets(graph_sets) if graph_sets is not None else None
+        graph_set = graph_sets if graph_sets is not None else None
 
         # Set DDP gradient sync for last micro batch only
         if do_backward and self.ddp:

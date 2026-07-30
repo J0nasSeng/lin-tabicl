@@ -47,6 +47,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.1,
         help="Fraction of test nodes to display in the plot (0-1). All train nodes are always shown.",
     )
+    parser.add_argument(
+        "--no-plot",
+        action="store_true",
+        help="Only print graph statistics; do not generate or save a plot.",
+    )
     parser.add_argument("--output", type=str, default="scripts/graph_preview.png")
     return parser
 
@@ -238,6 +243,9 @@ def main() -> None:
         train_size=train_size,
         cross_label_fraction=args.graph_cross_label_fraction,
     )
+
+    if args.no_plot:
+        return
 
     plot_nodes = _select_plot_nodes(seq_len=seq_len, train_size=train_size, test_fraction=args.plot_test_fraction, seed=args.seed)
     g_plot = g.subgraph(plot_nodes.tolist()).copy()

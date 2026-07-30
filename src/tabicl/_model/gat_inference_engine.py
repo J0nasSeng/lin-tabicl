@@ -139,7 +139,28 @@ class GATInferenceEngine(nn.Module):
 		gat = predictor.gat_icl
 		start = 0 if self.entry_layer is None else self.entry_layer - 1
 		layers_per_graph = gat.layers_per_graph
-		graph_edges = [[edge.to(graph_input.device, dtype=torch.long) for edge in graph.edge_index] for graph in graph_set.graphs]
+		if hasattr(graph_set, "edge_offsets") and hasattr(graph_set, "edge_index"):
+			# Keep compact graph payloads compact.  The compatibility ``graphs``
+			# property materializes Python lists and, when offsets are on CUDA, can
+			# also synchronize while a previous invalid index is still pending.
+			# Convert each dataset slice to local indices for the graph blocks.
+			batch_size = graph_input.shape[0]
+			compact_edges = graph_set.edge_index.to(graph_input.device, dtype=torch.long)
+			graph_edges = []
+			for graph_idx in range(graph_set.num_graphs):
+				starts = graph_set.edge_offsets[graph_idx, :-1].detach().cpu().tolist()
+				ends = graph_set.edge_offsets[graph_idx, 1:].detach().cpu().tolist()
+				graph_edges.append([
+					compact_edges[:, start:end]
+					for start, end in zip(starts, ends)
+				])
+			if len(graph_edges[0]) != batch_size:
+				raise ValueError("Compact graph batch size does not match graph input")
+		else:
+			graph_edges = [
+				[edge.to(graph_input.device, dtype=torch.long) for edge in graph.edge_index]
+				for graph in graph_set.graphs
+			]
 
 		out = graph_input
 		# Establish the representation at the requested entry point once.
