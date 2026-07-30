@@ -167,6 +167,23 @@ def build_parser() -> argparse.ArgumentParser:
 		help="Number of classes for the soft-KNN ablation (default: 10).",
 	)
 	parser.add_argument(
+		"--refinement-ablation",
+		action="store_true",
+		help="Run a native GAT evaluation ablation over refinement iterations 1..10.",
+	)
+	parser.add_argument(
+		"--refinement-ablation-num-datasets",
+		type=int,
+		default=100,
+		help="Number of datasets for the refinement ablation (default: 100).",
+	)
+	parser.add_argument(
+		"--refinement-ablation-num-classes",
+		type=int,
+		default=10,
+		help="Number of classes for the refinement ablation (default: 10).",
+	)
+	parser.add_argument(
 		"--rf-n-estimators",
 		type=int,
 		default=50,
@@ -334,6 +351,207 @@ def _soft_knn_predictions_from_representation(
 	return predictions, probabilities, classes
 
 
+def _soft_knn_ensemble_probabilities(
+	gat_tabicl: TabICLClassifier,
+	x_test: np.ndarray,
+	y_train: np.ndarray,
+	neighbor_counts: tuple[int, ...],
+	temperatures: tuple[float, ...],
+) -> dict[tuple[int, float], tuple[np.ndarray, np.ndarray]]:
+	"""Run soft-KNN independently per GAT ensemble view, then average outputs.
+
+	This mirrors the default sklearn evaluation more closely than decoding the
+	mean representation: each view gets its own final predictor LayerNorm and
+	readout, and only then are probabilities averaged across views.
+	"""
+	X_encoded = gat_tabicl.X_encoder_.transform(x_test)
+	data = gat_tabicl.ensemble_generator_.transform(X_encoded, mode="both")
+	classes = np.unique(y_train)
+	probability_sums = {
+		(n_neighbors, temperature): np.zeros((x_test.shape[0], classes.shape[0]), dtype=np.float64)
+		for n_neighbors in neighbor_counts
+		for temperature in temperatures
+	}
+	view_count = 0
+	ln = gat_tabicl.model_.model.icl_predictor.ln
+
+	for norm_method, (Xs, ys) in data.items():
+		feature_shuffles = gat_tabicl.ensemble_generator_.feature_shuffles_[norm_method]
+		view_representations = gat_tabicl._batch_forward_with_repr(Xs, ys, feature_shuffles)
+		with torch.no_grad():
+			normalized = ln(
+				torch.from_numpy(view_representations).to(gat_tabicl.device_)
+			).float().cpu().numpy()
+		view_count += len(normalized)
+
+		for view_index, representation in enumerate(normalized):
+			view_labels = ys[view_index].astype(int)
+			train_size = view_labels.shape[0]
+			train_repr = representation[:train_size].astype(np.float32, copy=False)
+			test_repr = representation[train_size:].astype(np.float32, copy=False)
+			similarity = test_repr @ train_repr.T
+			similarity /= np.sqrt(max(train_repr.shape[1], 1))
+			view_classes, inverse_labels = np.unique(view_labels, return_inverse=True)
+			view_to_global = np.asarray([np.searchsorted(classes, label) for label in view_classes])
+
+			for n_neighbors in neighbor_counts:
+				k = min(n_neighbors, train_size)
+				top_indices = (
+					np.argpartition(similarity, -k, axis=1)[:, -k:]
+					if k < train_size
+					else np.broadcast_to(np.arange(train_size), similarity.shape)
+				)
+				top_similarity = np.take_along_axis(similarity, top_indices, axis=1)
+				top_labels = inverse_labels[top_indices]
+				for temperature in temperatures:
+					weights = top_similarity / temperature
+					weights -= weights.max(axis=1, keepdims=True)
+					weights = np.exp(weights)
+					weights /= weights.sum(axis=1, keepdims=True)
+					view_probabilities = np.zeros(
+						(test_repr.shape[0], view_classes.shape[0]), dtype=np.float64
+					)
+					for class_index in range(view_classes.shape[0]):
+						view_probabilities[:, class_index] = np.sum(
+							weights * (top_labels == class_index), axis=1
+						)
+					probabilities = probability_sums[(n_neighbors, temperature)]
+					probabilities[:, view_to_global] += view_probabilities
+	if view_count == 0:
+		raise ValueError("GAT ensemble produced no representations")
+	return {
+		key: (classes[np.argmax(probabilities / view_count, axis=1)].astype(int), probabilities / view_count)
+		for key, probabilities in probability_sums.items()
+	}
+
+
+def run_refinement_ablation(
+	model,
+	checkpoint: Path,
+	args: argparse.Namespace,
+	device: str,
+) -> list[dict]:
+	"""Evaluate native GAT predictions for refinement iterations 1 through 10.
+
+	Unlike the soft-KNN ablation, this uses ``predict_proba`` directly. Thus it
+	keeps the default GAT inference path, including the model decoder and the
+	classifier's normal ensemble aggregation.
+	"""
+	import matplotlib
+	matplotlib.use("Agg", force=True)
+	import matplotlib.pyplot as plt
+
+	iterations = tuple(range(1, 11))
+	num_datasets = args.refinement_ablation_num_datasets
+	num_classes = args.refinement_ablation_num_classes
+	if num_datasets < 1:
+		raise ValueError("--refinement-ablation-num-datasets must be positive")
+	if num_classes < 2:
+		raise ValueError("--refinement-ablation-num-classes must be at least 2")
+	max_classes = int(getattr(model, "max_classes", 0))
+	if max_classes > 0 and num_classes > max_classes:
+		raise ValueError(
+			f"This graph checkpoint supports at most {max_classes} classes, but the refinement "
+			f"ablation requested {num_classes}. Use --refinement-ablation-num-classes "
+			f"{max_classes} or a compatible checkpoint."
+		)
+
+	prior = PriorDataset(
+		batch_size=args.batch_size,
+		min_features=args.min_features,
+		max_features=args.max_features,
+		max_classes=num_classes,
+		min_seq_len=args.min_seq_len,
+		max_seq_len=args.max_seq_len,
+		min_train_size=args.min_train_size,
+		max_train_size=args.max_train_size,
+		prior_type=args.prior_type,
+		device=args.prior_device,
+		n_jobs=1,
+		normalization=("std" if args.normalize_features and args.normalization == "none" else args.normalization),
+	)
+
+	rows: list[dict] = []
+	gat_n_estimators = args.gat_tabicl_n_estimators or args.pretrained_tabicl_n_estimators
+	processed = 0
+	batch_index = 0
+	while processed < num_datasets:
+		batch = _as_regular_tensors(prior.get_batch())
+		current_batch_index = batch_index
+		batch_index += 1
+		for index in range(int(batch[0].shape[0])):
+			if processed >= num_datasets:
+				break
+			seq_len = int(batch[3][index].item())
+			train_size = int(batch[4][index].item())
+			y = batch[1][index, :seq_len].numpy().astype(int)
+			y_train, y_test = y[:train_size], y[train_size:]
+			if not _has_complete_label_support(y_train, y_test):
+				processed += 1
+				continue
+			x = batch[0][index, :seq_len, : int(batch[2][index].item())].numpy()
+			for refinement_iter in iterations:
+				gat_tabicl = _build_gat_tabicl(
+					checkpoint,
+					gat_n_estimators,
+					device,
+					args.seed + processed,
+					refinement_iter,
+					args.entry_layer,
+				)
+				gat_tabicl.fit(x[:train_size], y_train)
+				# Native evaluation path: decoder, softmax/logit handling, and
+				# ensemble aggregation are all performed by predict_proba().
+				probabilities = gat_tabicl.predict_proba(x[train_size:])
+				prediction = gat_tabicl.classes_[np.argmax(probabilities, axis=1)].astype(int)
+				rows.append({
+					"num_classes": num_classes,
+					"dataset": processed,
+					"batch": current_batch_index,
+					"n_features": x.shape[1],
+					"model": "gat_tabicl",
+					"score": "balanced_accuracy",
+					"refinement_iterations": refinement_iter,
+					"value": _balanced_accuracy(y_test, prediction),
+				})
+			processed += 1
+
+	output_dir = args.output_dir
+	output_dir.mkdir(parents=True, exist_ok=True)
+	results_output = args.results_output or output_dir / "refinement_ablation.json"
+	results_output.parent.mkdir(parents=True, exist_ok=True)
+	results_output.write_text(json.dumps(rows, indent=2))
+
+	values = [
+		[row["value"] for row in rows if row["refinement_iterations"] == refinement_iter]
+		for refinement_iter in iterations
+	]
+	fig, ax = plt.subplots(figsize=(11, 7), dpi=150)
+	boxplot = ax.boxplot(
+		values,
+		labels=[str(refinement_iter) for refinement_iter in iterations],
+		patch_artist=True,
+		showmeans=True,
+	)
+	for patch in boxplot["boxes"]:
+		patch.set_facecolor("#4472C4")
+		patch.set_alpha(0.7)
+	ax.set(
+		title=f"Native GAT refinement ablation (datasets={num_datasets}, classes={num_classes})",
+		xlabel="Refinement iterations",
+		ylabel="Balanced accuracy",
+		ylim=(0.0, 1.0),
+	)
+	ax.grid(axis="y", alpha=0.25)
+	fig.tight_layout()
+	plot_output = output_dir / "refinement_ablation_balanced_accuracy.png"
+	fig.savefig(plot_output)
+	plt.close(fig)
+	print(f"Saved refinement ablation results to {results_output}")
+	print(f"Saved refinement ablation plot to {plot_output}")
+	return rows
+
+
 def run_soft_knn_ablation(
 	model,
 	checkpoint: Path,
@@ -357,6 +575,10 @@ def run_soft_knn_ablation(
 		raise ValueError("--soft-knn-ablation-num-datasets must be positive")
 	if args.soft_knn_ablation_num_classes < 2:
 		raise ValueError("--soft-knn-ablation-num-classes must be at least 2")
+	if args.refinement_ablation_num_datasets < 1:
+		raise ValueError("--refinement-ablation-num-datasets must be positive")
+	if args.refinement_ablation_num_classes < 2:
+		raise ValueError("--refinement-ablation-num-classes must be at least 2")
 	max_classes = int(getattr(model, "max_classes", 0))
 	if max_classes > 0 and args.soft_knn_ablation_num_classes > max_classes:
 		raise ValueError(
@@ -412,38 +634,12 @@ def run_soft_knn_ablation(
 				args.entry_layer,
 			)
 			gat_tabicl.fit(x[:train_size], y_train)
-			representations = gat_tabicl.predict_representation(x[train_size:])
-			representations = np.nan_to_num(
-				representations, nan=0.0, posinf=0.0, neginf=0.0
-			).astype(np.float32, copy=False)
-			train_repr = representations[:train_size]
-			test_repr = representations[train_size:]
-			classes, inverse_labels = np.unique(y_train, return_inverse=True)
-			similarity = test_repr @ train_repr.T
-			similarity /= np.sqrt(max(train_repr.shape[1], 1))
-
+			ablation_outputs = _soft_knn_ensemble_probabilities(
+				gat_tabicl, x[train_size:], y_train, neighbor_counts, temperatures
+			)
 			for n_neighbors in neighbor_counts:
-				k = min(n_neighbors, train_size)
-				top_indices = (
-					np.argpartition(similarity, -k, axis=1)[:, -k:]
-					if k < train_size
-					else np.broadcast_to(np.arange(train_size), similarity.shape)
-				)
-				top_similarity = np.take_along_axis(similarity, top_indices, axis=1)
-				top_labels = inverse_labels[top_indices]
 				for temperature in temperatures:
-					weights = top_similarity / temperature
-					weights -= weights.max(axis=1, keepdims=True)
-					weights = np.exp(weights)
-					weights /= weights.sum(axis=1, keepdims=True)
-					probabilities = np.zeros(
-						(test_repr.shape[0], classes.shape[0]), dtype=np.float64
-					)
-					for class_index in range(classes.shape[0]):
-						probabilities[:, class_index] = np.sum(
-							weights * (top_labels == class_index), axis=1
-						)
-					prediction = classes[np.argmax(probabilities, axis=1)].astype(int)
+					prediction, _probabilities = ablation_outputs[(n_neighbors, temperature)]
 					rows.append({
 						"num_classes": args.soft_knn_ablation_num_classes,
 						"dataset": processed,
@@ -478,6 +674,29 @@ def run_soft_knn_ablation(
 		for n_neighbors, temperature in parameter_pairs
 	]
 	labels = [f"k={n_neighbors}, t={temperature:g}" for n_neighbors, temperature in parameter_pairs]
+	valid_values = [
+		(np.asarray(parameter_values, dtype=float), parameter_pair)
+		for parameter_values, parameter_pair in zip(values, parameter_pairs)
+		if parameter_values
+	]
+	if valid_values:
+		statistics = {
+			"mean": lambda scores: float(np.mean(scores)),
+			"median": lambda scores: float(np.median(scores)),
+			"min": lambda scores: float(np.min(scores)),
+			"max": lambda scores: float(np.max(scores)),
+		}
+		print("Best soft-KNN configurations by balanced-accuracy statistic:")
+		for statistic_name, statistic_fn in statistics.items():
+			best_scores, best_pair = max(
+				valid_values,
+				key=lambda item: statistic_fn(item[0]),
+			)
+			best_k, best_temperature = best_pair
+			print(
+				f"  {statistic_name}: k={best_k}, temperature={best_temperature:g}, "
+				f"{statistic_name}={statistic_fn(best_scores):.6f}"
+			)
 	fig_width = max(18.0, len(labels) * 0.18)
 	fig, ax = plt.subplots(figsize=(fig_width, 8), dpi=150)
 	boxplot = ax.boxplot(values, labels=labels, patch_artist=True, showmeans=True)
@@ -1078,6 +1297,9 @@ def main() -> None:
 		raise ValueError("The supplied checkpoint must contain a TabICL model.")
 	if checkpoint_config.get("icl_backend") != "graph":
 		raise ValueError("The supplied checkpoint must contain a TabICL model with icl_backend='graph'.")
+	if args.refinement_ablation:
+		run_refinement_ablation(model, args.checkpoint, args, device)
+		return
 	if args.soft_knn_ablation:
 		run_soft_knn_ablation(model, args.checkpoint, args, device)
 		return

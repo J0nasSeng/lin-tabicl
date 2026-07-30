@@ -7,8 +7,8 @@ WAND_LOG=${WAND_LOG:-True}
 WAND_MODE=${WAND_MODE:-online}
 # GPU selection controls
 DEVICE=${DEVICE:-cuda}
-NUM_GPUS=${NUM_GPUS:-3}
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,6,7}
+NUM_GPUS=${NUM_GPUS:-4}
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-3,4,5,6}
 # Confusion matrix logging interval
 LOG_CONF_MAT_EVERY=${LOG_CONF_MAT_EVERY:-200000} # effectively disables confusion matrix logging if set to a large number
 
@@ -30,7 +30,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --torch_seed 42 \
             --max_steps 10000 \
             --batch_size 512 \
-            --micro_batch_size 3 \
+            --micro_batch_size 4 \
             --log_conf_mat_every ${LOG_CONF_MAT_EVERY} \
             --lr 8e-4 \
             --weight_decay 1e-4 \
@@ -45,7 +45,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --normalization std \
             --batch_size_per_gp 8 \
             --min_features 2 \
-            --max_features 10 \
+            --max_features 100 \
             --max_classes 10 \
             --max_seq_len 1024 \
             --min_train_size 0.1 \
@@ -58,12 +58,12 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --row_nhead 8 \
             --row_num_cls 1 \
             --row_rope_base 100000 \
-            --icl_num_blocks 4 \
+            --icl_num_blocks 8 \
             --icl_nhead 8 \
             --icl_backend ${ICL_BACKEND} \
             --ff_factor 2 \
             --norm_first True \
-            --checkpoint_dir /workspace/checkpoints_dyngraph_intraclass=0.3/stage1/ \
+            --checkpoint_dir /workspace/checkpoints_dyngraph_intraclass=0.25/stage1/ \
             --save_temp_every 1000 \
             --save_perm_every 5000 \
             --icl_soft_kmeans_temperature 0.5 \
@@ -72,7 +72,8 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --graph_max_train_neighbors 4 \
             --graph_train_neighbors_per_test 2 \
             --graph_cross_label_fraction 0.25 \
-            #--recompute True \
+            --graph_num_graphs 4 \
+            --recompute True \
             #--scheduled_loader_steps 0,300,600,1000,2000 \
             #--scheduled_loader_sizes 64,256,1024,2048,inf
             #--model_type nanotabicl

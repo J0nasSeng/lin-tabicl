@@ -541,7 +541,7 @@ if __name__ == '__main__':
     labels = []
     for i, ax in enumerate(axs.flat):
         print(f"Generating random dataset {i+1}/{len(axs.flat)}")
-        n_classes = 10 # 2 if np.random.rand() < 0.5 else np.random.randint(3, 11)
+        n_classes = np.random.randint(2, 11)
         tensors = rand_dataset_filtered(x_cat_sizes=[0] * 2, y_cat_sizes=[n_classes], n_samples=300, 
                                         multiclass_type='quantile', multiclass_jitter_scale=0.)
         x = torch.cat([tensors['x_0'], tensors['x_1']], dim=-1)

@@ -17,13 +17,13 @@ DEFAULT_FIXED_HP = {
     "scale_by_max_features": False,
     "permute_features": True,
     "permute_labels": True,
-    "multiclass_type": "quantile",
+    #"multiclass_type": "quantile",
     #"is_causal": True,
 }
 
 DEFAULT_SAMPLED_HP = {
     # Reg2Cls
-    #"multiclass_type": {"distribution": "meta_choice", "choice_values": ["value", "rank", "quantile"]},
+    "multiclass_type": {"distribution": "meta_choice", "choice_values": ["value", "rank", "quantile"]},
     # MLPSCM
     "mlp_activations": {
         "distribution": "meta_choice_mixed",
