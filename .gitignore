@@ -144,3 +144,6 @@ wandb/
 checkpoints*
 gat_eval/
 prior_eval/
+
+# benchmark data
+src/tabicl/eval/benchmarks/graph_land/data/

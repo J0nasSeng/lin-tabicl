@@ -8,7 +8,7 @@ WAND_MODE=${WAND_MODE:-online}
 # GPU selection controls
 DEVICE=${DEVICE:-cuda}
 NUM_GPUS=${NUM_GPUS:-4}
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-3,4,5,6}
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
 # Confusion matrix logging interval
 LOG_CONF_MAT_EVERY=${LOG_CONF_MAT_EVERY:-200000} # effectively disables confusion matrix logging if set to a large number
 
@@ -25,7 +25,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --wandb_dir /workspace/wandb/ \
             --wandb_mode ${WAND_MODE} \
             --device ${DEVICE} \
-            --dtype float32 \
+            --dtype bfloat16 \
             --np_seed 42 \
             --torch_seed 42 \
             --max_steps 10000 \
@@ -50,15 +50,15 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --max_seq_len 1024 \
             --min_train_size 0.1 \
             --max_train_size 0.6 \
-            --embed_dim 256 \
+            --embed_dim 128 \
             --col_num_blocks 3 \
             --col_nhead 8 \
             --col_num_inds 128 \
             --row_num_blocks 3 \
             --row_nhead 8 \
-            --row_num_cls 1 \
+            --row_num_cls 4 \
             --row_rope_base 100000 \
-            --icl_num_blocks 8 \
+            --icl_num_blocks 12 \
             --icl_nhead 8 \
             --icl_backend ${ICL_BACKEND} \
             --ff_factor 2 \
@@ -72,8 +72,8 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --graph_max_train_neighbors 4 \
             --graph_train_neighbors_per_test 2 \
             --graph_cross_label_fraction 0.25 \
-            --graph_num_graphs 4 \
-            --recompute True \
+            --graph_num_graphs 6 \
+            --recompute False \
             #--scheduled_loader_steps 0,300,600,1000,2000 \
             #--scheduled_loader_sizes 64,256,1024,2048,inf
             #--model_type nanotabicl
