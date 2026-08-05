@@ -1,6 +1,7 @@
 import os
 import yaml
 from functools import partial
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -64,8 +65,10 @@ class Dataset:
     def __init__(self, name, split='RL', add_self_loops=False, to_undirected=True, node_embeddings=None,
                  regression_targets_transform='default', numerical_features_transform='default',
                  fraction_features_transform='default', numerical_features_nan_imputation_strategy='default',
-                 fraction_features_nan_imputation_strategy='default', device='cpu', use_pyg=False):
+                 fraction_features_nan_imputation_strategy='default', device='cpu', use_pyg=False,
+                 data_dir='/workspace/src/tabicl/eval/benchmarks/graph_land/data', load_graph=True):
         print('Preparing data...')
+        data_dir = Path(data_dir).expanduser().resolve()
 
         if split in ['TH', 'THI'] and name in ['city-reviews', 'city-roads-M', 'city-roads-L', 'web-traffic']:
             raise ValueError(f'{split} split is not available for {name} dataset.')
@@ -87,7 +90,8 @@ class Dataset:
                  numerical_features_mask, fraction_features_mask, categorical_features_mask) = \
                     self.get_graphland_transductive_dataset(name=name, split=split, add_self_loops=add_self_loops,
                                                             to_undirected=to_undirected,
-                                                            node_embeddings_name=node_embeddings, use_pyg=use_pyg)
+                                                            node_embeddings_name=node_embeddings, use_pyg=use_pyg,
+                                                            data_dir=data_dir, load_graph=load_graph)
 
             else:
                 (train_graph, train_features, train_targets, train_mask, train_node_ids_in_full_graph,
@@ -96,7 +100,8 @@ class Dataset:
                  numerical_features_mask, fraction_features_mask, categorical_features_mask) = \
                     self.get_graphland_inductive_dataset(name=name, split=split, add_self_loops=add_self_loops,
                                                          to_undirected=to_undirected,
-                                                         node_embeddings_name=node_embeddings, use_pyg=use_pyg)
+                                                         node_embeddings_name=node_embeddings, use_pyg=use_pyg,
+                                                         data_dir=data_dir, load_graph=load_graph)
 
         elif name in self.pyg_datasets_names:
             graph, features, targets, train_mask, val_mask, test_mask = self.get_pyg_dataset(
@@ -156,7 +161,7 @@ class Dataset:
         self.device = device
 
         if transductive:
-            self.graph = graph.to(device)
+            self.graph = graph.to(device) if graph is not None else None
             self.features = features.to(device)
             self.targets = targets.to(device)
             self.train_mask = train_mask.to(device)
@@ -164,19 +169,19 @@ class Dataset:
             self.test_mask = test_mask.to(device)
 
         else:
-            self.train_graph = train_graph.to(device)
+            self.train_graph = train_graph.to(device) if train_graph is not None else None
             self.train_features = train_features.to(device)
             self.train_targets = train_targets.to(device)
             self.train_mask = train_mask.to(device)
             self.train_node_ids_in_full_graph = train_node_ids_in_full_graph.to(device)
 
-            self.val_graph = val_graph.to(device)
+            self.val_graph = val_graph.to(device) if val_graph is not None else None
             self.val_features = val_features.to(device)
             self.val_targets = val_targets.to(device)
             self.val_mask = val_mask.to(device)
             self.val_node_ids_in_full_graph = val_node_ids_in_full_graph.to(device)
 
-            self.test_graph = test_graph.to(device)
+            self.test_graph = test_graph.to(device) if test_graph is not None else None
             self.test_features = test_features.to(device)
             self.test_targets = test_targets.to(device)
             self.test_mask = test_mask.to(device)
@@ -466,8 +471,9 @@ class Dataset:
 
     @staticmethod
     def get_graphland_transductive_dataset(name, split, add_self_loops, to_undirected=True, node_embeddings_name=None,
-                                           use_pyg=False):
-        with open(f'data/{name}/info.yaml', 'r') as file:
+                                           use_pyg=False, data_dir='data', load_graph=True):
+        dataset_dir = Path(data_dir).expanduser().resolve() / name
+        with open(dataset_dir / 'info.yaml', 'r') as file:
             info = yaml.safe_load(file)
 
         fraction_features_names_set = set(info['fraction_features_names'])
@@ -475,7 +481,7 @@ class Dataset:
             name for name in info['numerical_features_names'] if name not in fraction_features_names_set
         ]
 
-        features_df = pd.read_csv(f'data/{name}/features.csv', index_col=0)
+        features_df = pd.read_csv(dataset_dir / 'features.csv', index_col=0)
         numerical_features = features_df[numerical_features_names].values.astype(np.float32)
         fraction_features = features_df[info['fraction_features_names']].values.astype(np.float32)
         categorical_features = features_df[info['categorical_features_names']].values.astype(np.float32)
@@ -487,7 +493,7 @@ class Dataset:
         features = np.concatenate([numerical_features, fraction_features, categorical_features], axis=1)
 
         if node_embeddings_name is not None:
-            node_embeddings = np.load(f'data/{name}/{node_embeddings_name}.npy')
+            node_embeddings = np.load(dataset_dir / f'{node_embeddings_name}.npy')
             features = np.concatenate([features, node_embeddings], axis=1)
 
         if numerical_features.shape[1] > 0:
@@ -513,12 +519,12 @@ class Dataset:
         else:
             categorical_features_mask = None
 
-        targets = pd.read_csv(f'data/{name}/targets.csv', index_col=0).values.squeeze(1).astype(np.float32)
+        targets = pd.read_csv(dataset_dir / 'targets.csv', index_col=0).values.squeeze(1).astype(np.float32)
 
-        edges_df = pd.read_csv(f'data/{name}/edgelist.csv')
+        edges_df = Dataset._read_edge_list(dataset_dir)
         edges = edges_df.values[:, :2]
 
-        split_masks_df = pd.read_csv(f'data/{name}/split_masks_{split}.csv', index_col=0)
+        split_masks_df = pd.read_csv(dataset_dir / f'split_masks_{split}.csv', index_col=0)
         train_mask_orig = split_masks_df['train'].values
         val_mask_orig = split_masks_df['val'].values
         test_mask_orig = split_masks_df['test'].values
@@ -529,7 +535,7 @@ class Dataset:
         test_mask = (test_mask_orig & labeled_mask)
 
         graph = Dataset.get_graph(edges=edges, num_nodes=len(features), add_self_loops=add_self_loops,
-                                  to_undirected=to_undirected, use_pyg=use_pyg)
+                      to_undirected=to_undirected, use_pyg=use_pyg) if load_graph else None
 
         features = torch.tensor(features)
         targets = torch.tensor(targets)
@@ -553,11 +559,12 @@ class Dataset:
 
     @staticmethod
     def get_graphland_inductive_dataset(name, split, add_self_loops, to_undirected=True, node_embeddings_name=None,
-                                        use_pyg=False):
-        with open(f'data/{name}/info.yaml', 'r') as file:
+                                        use_pyg=False, data_dir='data', load_graph=True):
+        dataset_dir = Path(data_dir).expanduser().resolve() / name
+        with open(dataset_dir / 'info.yaml', 'r') as file:
             info = yaml.safe_load(file)
 
-        split_masks_df = pd.read_csv(f'data/{name}/split_masks_{split}.csv', index_col=0)
+        split_masks_df = pd.read_csv(dataset_dir / f'split_masks_{split}.csv', index_col=0)
         train_mask_orig = split_masks_df['train'].values
         val_mask_orig = split_masks_df['val'].values
         test_mask_orig = split_masks_df['test'].values
@@ -567,7 +574,7 @@ class Dataset:
             name for name in info['numerical_features_names'] if name not in fraction_features_names_set
         ]
 
-        features_df = pd.read_csv(f'data/{name}/features.csv', index_col=0)
+        features_df = pd.read_csv(dataset_dir / 'features.csv', index_col=0)
         numerical_features = features_df[numerical_features_names].values.astype(np.float32)
         fraction_features = features_df[info['fraction_features_names']].values.astype(np.float32)
         categorical_features = features_df[info['categorical_features_names']].values.astype(np.float32)
@@ -581,7 +588,7 @@ class Dataset:
         features = np.concatenate([numerical_features, fraction_features, categorical_features], axis=1)
 
         if node_embeddings_name is not None:
-            node_embeddings = np.load(f'data/{name}/{node_embeddings_name}.npy')
+            node_embeddings = np.load(dataset_dir / f'{node_embeddings_name}.npy')
             features = np.concatenate([features, node_embeddings], axis=1)
 
         if numerical_features.shape[1] > 0:
@@ -607,11 +614,11 @@ class Dataset:
         else:
             categorical_features_mask = None
 
-        targets = pd.read_csv(f'data/{name}/targets.csv', index_col=0).values.squeeze(1).astype(np.float32)
+        targets = pd.read_csv(dataset_dir / 'targets.csv', index_col=0).values.squeeze(1).astype(np.float32)
 
         node_ids_in_full_graph = np.arange(len(features))
 
-        edges_df = pd.read_csv(f'data/{name}/edgelist.csv')
+        edges_df = Dataset._read_edge_list(dataset_dir)
         edges = edges_df.values[:, :2]
 
         train_and_val_mask_orig = (train_mask_orig | val_mask_orig)
@@ -637,11 +644,11 @@ class Dataset:
         test_mask = (test_mask_orig & labeled_mask)
 
         train_graph = Dataset.get_graph(edges=train_edges, num_nodes=len(train_features), add_self_loops=add_self_loops,
-                                        to_undirected=to_undirected, use_pyg=use_pyg)
+                        to_undirected=to_undirected, use_pyg=use_pyg) if load_graph else None
         val_graph = Dataset.get_graph(edges=val_edges, num_nodes=len(val_features), add_self_loops=add_self_loops,
-                                      to_undirected=to_undirected, use_pyg=use_pyg)
+                          to_undirected=to_undirected, use_pyg=use_pyg) if load_graph else None
         test_graph = Dataset.get_graph(edges=test_edges, num_nodes=len(test_features), add_self_loops=add_self_loops,
-                                       to_undirected=to_undirected, use_pyg=use_pyg)
+                           to_undirected=to_undirected, use_pyg=use_pyg) if load_graph else None
 
         train_features = torch.tensor(train_features)
         train_targets = torch.tensor(train_targets)
@@ -763,47 +770,55 @@ class Dataset:
 
     @staticmethod
     def get_graph(edges, num_nodes, add_self_loops, to_undirected=True, use_pyg=False):
-        if not use_pyg:
-            graph = Dataset.get_dgl_graph(edges=edges, num_nodes=num_nodes, add_self_loops=add_self_loops,
-                                          to_undirected=to_undirected)
+        """Return a graph as a plain PyTorch ``edge_index`` tensor.
 
-        else:
-            graph = Dataset.get_pyg_edge_index(edges=edges, num_nodes=num_nodes, add_self_loops=add_self_loops,
-                                               to_undirected=to_undirected)
-
-        return graph
+        The returned tensor has shape ``(2, num_edges)`` and is suitable for
+        the GAT backend without requiring DGL or PyTorch Geometric.
+        """
+        del use_pyg  # Retained for compatibility with existing callers.
+        return Dataset.get_torch_edge_index(
+            edges=edges,
+            num_nodes=num_nodes,
+            add_self_loops=add_self_loops,
+            to_undirected=to_undirected,
+        )
 
     @staticmethod
-    def get_dgl_graph(edges, num_nodes, add_self_loops, to_undirected=True):
-        graph = dgl.graph((edges[:, 0], edges[:, 1]), num_nodes=num_nodes, idtype=torch.int32)
-
-        graph = dgl.remove_self_loop(graph)
-        graph = dgl.to_simple(graph)
+    def get_torch_edge_index(edges, num_nodes, add_self_loops, to_undirected=True):
+        edge_index = torch.as_tensor(edges, dtype=torch.long).reshape(-1, 2).t().contiguous()
+        edge_index = edge_index[:, edge_index[0] != edge_index[1]]
+        edge_index = torch.unique(edge_index, dim=1)
 
         if to_undirected:
-            graph = dgl.to_bidirected(graph)
+            edge_index = torch.cat((edge_index, edge_index.flip(0)), dim=1)
+            edge_index = torch.unique(edge_index, dim=1)
 
         if add_self_loops:
-            graph = dgl.add_self_loop(graph)
+            nodes = torch.arange(num_nodes, dtype=torch.long)
+            edge_index = torch.cat((edge_index, torch.stack((nodes, nodes))), dim=1)
+            edge_index = torch.unique(edge_index, dim=1)
 
-        return graph
+        return edge_index
 
     @staticmethod
     def get_pyg_edge_index(edges, num_nodes, add_self_loops, to_undirected=True):
-        edge_index = torch.tensor(edges.T)
+        return Dataset.get_torch_edge_index(
+            edges=edges,
+            num_nodes=num_nodes,
+            add_self_loops=add_self_loops,
+            to_undirected=to_undirected,
+        )
 
-        edge_index = pyg.utils.remove_self_loops(edge_index)[0]
-        edge_index = pyg.transforms.RemoveDuplicatedEdges()(
-            pyg.data.Data(num_nodes=num_nodes, edge_index=edge_index)
-        ).edge_index
-
-        if to_undirected:
-            edge_index = pyg.utils.to_undirected(edge_index)
-
-        if add_self_loops:
-            edge_index = pyg.utils.add_self_loops(edge_index)
-
-        return edge_index
+    @staticmethod
+    def _read_edge_list(dataset_dir):
+        """Read either the documented ``edge_list.csv`` or legacy filename."""
+        for filename in ('edge_list.csv', 'edgelist.csv'):
+            path = dataset_dir / filename
+            if path.is_file():
+                return pd.read_csv(path)
+        raise FileNotFoundError(
+            f'No edge list found in {dataset_dir}; expected edge_list.csv or edgelist.csv.'
+        )
 
     @staticmethod
     def get_induced_subgraph_edges(edges, nodes_to_keep):

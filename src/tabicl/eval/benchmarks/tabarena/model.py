@@ -1,106 +1,256 @@
-"""TabArena adapter for a trained graph-backend TabICL classifier.
+"""TabArena model and leaderboard comparison entry point for graph TabICL.
 
-The benchmark only needs the usual ``fit``/``predict``/``predict_proba``
-interface. The actual preprocessing and inference implementation lives in
-``TabICLClassifier``; keeping this module as a thin adapter avoids having a
-second implementation of graph construction and checkpoint loading.
+This module follows TabArena's AutoGluon ``AbstractModel`` contract.  The
+model-specific implementation remains the sklearn-compatible
+``TabICLClassifier`` so that TabICL's preprocessing and graph-backend routing
+are used unchanged.
 """
 
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import numpy as np
 import torch
 
+try:
+	from autogluon.core.models import AbstractModel  # pyright: ignore[reportMissingImports]
+except ImportError as error:  # Keep importing this file possible without TabArena extras.
+	AbstractModel = None
+	_AUTOGLUON_IMPORT_ERROR = error
+else:
+	_AUTOGLUON_IMPORT_ERROR = None
+
 from tabicl import TabICLClassifier
 
+if TYPE_CHECKING:
+	import pandas as pd
+	from tabarena.utils.config_utils import ConfigGenerator  # pyright: ignore[reportMissingImports]
 
-class TabArenaModel:
-	"""TabArena-compatible wrapper around a graph-backend TabICL model."""
 
-	def __init__(
-		self,
-		model_path: str | Path | None = None,
-		*,
-		checkpoint_path: str | Path | None = None,
-		device: str | torch.device | None = None,
-		**kwargs: Any,
-	) -> None:
-		if model_path is not None and checkpoint_path is not None:
-			if Path(model_path).expanduser() != Path(checkpoint_path).expanduser():
-				raise ValueError("model_path and checkpoint_path must refer to the same checkpoint")
+if AbstractModel is None:
+	class _AbstractModelUnavailable:
+		"""Placeholder that provides an actionable error outside a TabArena env."""
 
-		self.model_path = model_path if model_path is not None else checkpoint_path
-		self.checkpoint_path = self.model_path
-		self.device = device
-		self.kwargs = dict(kwargs)
-		self.estimator_: TabICLClassifier | None = None
+		def __init__(self, *args: Any, **kwargs: Any) -> None:
+			raise ImportError(
+				"TabArenaModel requires AutoGluon. Install the TabArena dependencies before running TabArena."
+			) from _AUTOGLUON_IMPORT_ERROR
+
+	AbstractModelBase = _AbstractModelUnavailable
+else:
+	AbstractModelBase = AbstractModel
+
+
+class TabICLGraphModel(AbstractModelBase):
+	"""AutoGluon model wrapper for a trained graph-backend TabICL checkpoint."""
+
+	ag_key = "TabICLGraph"
+	ag_name = "TabICLGraph"
+	# Tell AutoGluon that this model can use a CUDA device. The actual device
+	# ordinal is still selected through the TabICL ``device`` parameter.
+	default_num_gpus = 1
+
+	def __init__(self, model_path: str | Path | None = None, **kwargs: Any) -> None:
+		# Keep constructor-only settings in AbstractModel.params. AutoGluon
+		# reconstructs cloned/bagged fold models from those parameters.
+		model_path = model_path or kwargs.get("model_path")
+		if model_path is not None:
+			model_path = str(model_path)
+			kwargs["model_path"] = model_path
+		self.model_path = model_path
+		self._tabicl: TabICLClassifier | None = None
+		super().__init__(**kwargs)
+
+	def _set_default_params(self) -> None:
+		"""Set defaults consumed by the TabICL sklearn estimator."""
+		for parameter, value in {
+			"n_estimators": 8,
+			"batch_size": 2,
+			"kv_cache": False,
+			"gat_mode": "ensemble",
+			"gat_num_iterations": 1,
+			"gat_entry_layer": None,
+			"device": None,
+		}.items():
+			self._set_default_param_value(parameter, value)
+
+	def _get_default_auxiliary_params(self) -> dict[str, Any]:
+		params = super()._get_default_auxiliary_params()
+		params.update({"valid_raw_types": ["int", "float", "category", "object"]})
+		return params
+
+	@classmethod
+	def supported_problem_types(cls) -> list[str]:
+		return ["binary", "multiclass"]
 
 	def _validate_checkpoint(self) -> None:
-		"""Validate the supplied checkpoint before constructing the estimator."""
-		if self.model_path is None:
-			raise ValueError("A trained graph-backend checkpoint is required; pass model_path or checkpoint_path")
-
+		model_path = self.model_path or self.params.get("model_path")
+		if model_path is None:
+			raise ValueError("TabICLGraphModel requires model_path in its configuration")
+		self.model_path = str(model_path)
 		checkpoint_path = Path(self.model_path).expanduser()
 		if not checkpoint_path.is_file():
 			raise FileNotFoundError(f"TabICL checkpoint not found: {checkpoint_path}")
-
 		checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-		if not isinstance(checkpoint, dict):
-			raise ValueError("The TabICL checkpoint must contain a mapping")
-		if "config" not in checkpoint or "state_dict" not in checkpoint:
-			raise ValueError("The TabICL checkpoint must contain 'config' and 'state_dict'")
-
+		if not isinstance(checkpoint, dict) or "config" not in checkpoint or "state_dict" not in checkpoint:
+			raise ValueError("TabICL checkpoint must contain 'config' and 'state_dict'")
 		config = checkpoint["config"]
-		if not isinstance(config, dict):
-			raise ValueError("The TabICL checkpoint configuration must be a mapping")
 		if str(config.get("model_type", "tabicl")).lower() != "tabicl":
-			raise ValueError("TabArenaModel requires a TabICL classification checkpoint")
+			raise ValueError("TabICLGraphModel requires a TabICL checkpoint")
 		if config.get("icl_backend", "encoder") != "graph":
-			raise ValueError("TabArenaModel requires a checkpoint with icl_backend='graph'")
+			raise ValueError("TabICLGraphModel requires a checkpoint with icl_backend='graph'")
 
-	def fit(self, X: Any, y: Any) -> "TabArenaModel":
-		"""Prepare the trained TabICL model for in-context predictions."""
+	def _tabicl_kwargs(self) -> dict[str, Any]:
+		params = self.params.copy()
+		params.pop("model_path", None)
+		params.pop("problem_type", None)
+		params.pop("path", None)
+		params.pop("name", None)
+		params.pop("ag_name", None)
+		params.pop("ag_key", None)
+		params.pop("ag_args_fit", None)
+		params["model_path"] = self.model_path or self.params.get("model_path")
+		params["allow_auto_download"] = False
+		params["kv_cache"] = False
+		return params
+
+	def _fit(self, X: "pd.DataFrame", y: "pd.Series", **kwargs: Any) -> None:
 		self._validate_checkpoint()
+		self._tabicl = TabICLClassifier(**self._tabicl_kwargs())
+		self._tabicl.fit(X, y)
+		self.model = self._tabicl
 
-		estimator_kwargs = dict(self.kwargs)
-		estimator_kwargs.update(model_path=self.model_path, device=self.device)
-		# An explicit checkpoint path makes downloading another model
-		# undesirable for a reproducible benchmark run.
-		estimator_kwargs.setdefault("allow_auto_download", False)
-		self.estimator_ = TabICLClassifier(**estimator_kwargs)
-		self.estimator_.fit(X, y)
-
-		for name in ("classes_", "n_classes_", "n_features_in_", "n_samples_in_"):
-			if hasattr(self.estimator_, name):
-				setattr(self, name, getattr(self.estimator_, name))
-		return self
-
-	def _require_fitted(self) -> TabICLClassifier:
-		if self.estimator_ is None:
-			raise RuntimeError("Call fit(X, y) before making predictions")
-		return self.estimator_
-
-	def predict_proba(self, X: Any) -> np.ndarray:
-		"""Return class probabilities for benchmark test rows."""
-		probabilities = np.asarray(self._require_fitted().predict_proba(X))
-		if probabilities.ndim != 2:
-			raise ValueError(f"TabICL returned probabilities with shape {probabilities.shape}, expected 2D")
-		if not np.isfinite(probabilities).all():
-			raise ValueError("TabICL returned non-finite class probabilities")
+	def _predict_proba(self, X: "pd.DataFrame", **kwargs: Any) -> np.ndarray:
+		if self._tabicl is None:
+			raise RuntimeError("TabICLGraphModel has not been fitted")
+		probabilities = np.asarray(self._tabicl.predict_proba(X))
+		# AutoGluon uses a unified representation internally: binary models must
+		# return only the positive-class probability. Passing the full (N, 2)
+		# matrix makes bagged OOF accumulation broadcast against its (N,) buffer.
+		if self.problem_type == "binary":
+			if probabilities.ndim != 2 or probabilities.shape[1] < 2:
+				raise ValueError(
+					f"TabICL binary predict_proba returned shape {probabilities.shape}; expected (n_samples, 2)."
+				)
+			return probabilities[:, 1]
 		return probabilities
 
-	def predict(self, X: Any) -> np.ndarray:
-		"""Return predictions using the original target-label representation."""
-		return np.asarray(self._require_fitted().predict(X))
+	@classmethod
+	def config_generator(
+		cls,
+		model_path: str | Path | None = None,
+		device: str | torch.device | None = None,
+		num_cpus: int = 64,
+		num_gpus: int = 1,
+	) -> "ConfigGenerator":
+		"""Return a TabArena config generator for the supplied checkpoint."""
+		from tabarena.utils.config_utils import ConfigGenerator  # pyright: ignore[reportMissingImports]
+
+		config: dict[str, Any] = {}
+		if model_path is not None:
+			config["model_path"] = str(model_path)
+		if device is not None:
+			config["device"] = str(device)
+		config["ag_args_fit"] = {
+			"num_cpus": num_cpus,
+			"num_gpus": num_gpus,
+		}
+		return ConfigGenerator(
+			model_cls=cls,
+			manual_configs=[config],
+			search_space={},
+		)
 
 
-# Common names used by lightweight benchmark launchers. Keeping aliases here
-# makes discovery possible without changing package exports.
-TabICLTabArenaModel = TabArenaModel
-Model = TabArenaModel
+# Backwards-compatible names for lightweight registry/discovery code.
+TabArenaModel = TabICLGraphModel
+Model = TabICLGraphModel
 
 
-__all__ = ["Model", "TabArenaModel", "TabICLTabArenaModel"]
+def build_parser() -> argparse.ArgumentParser:
+	parser = argparse.ArgumentParser(description=__doc__)
+	parser.add_argument("--model-path", required=True, type=Path, help="Trained graph-backend TabICL checkpoint")
+	parser.add_argument("--results-dir", type=Path, default=Path("experiments/tabicl_graph"))
+	parser.add_argument("--output-dir", type=Path, default=Path("eval/tabicl_graph"))
+	parser.add_argument("--subset", default="lite", choices=['all', 'binary', 'classification', 'high_cats', 'high_features', 'lite', 'low_cats', 
+														  'low_features', 'medium', 'multiclass', 'numerical', 'regression', 'small', 'tabicl', 
+														  'tabpfn', 'tiny'])
+	parser.add_argument("--datasets", nargs="+", default=None)
+	parser.add_argument("--n-configs", type=int, default=0)
+	parser.add_argument(
+		"--num-cpus",
+		type=int,
+		default=8,
+		help="Maximum CPU cores allocated to each TabICL model fit",
+	)
+	parser.add_argument(
+		"--num-gpus",
+		type=float,
+		default=1,
+		help="GPUs allocated to each TabICL model fit; use 0 for CPU-only execution",
+	)
+	parser.add_argument(
+		"--device",
+		default="cuda" if torch.cuda.is_available() else "cpu",
+		help="Torch device for TabICL inference, for example cpu, cuda, cuda:0, or mps",
+	)
+	parser.add_argument(
+		"--debug-mode",
+		action=argparse.BooleanOptionalAction,
+		default=True,
+		help="Run jobs in-process; use --no-debug-mode to enable the Ray-backed runner",
+	)
+	return parser
+
+
+def compare_against_leaderboard(args: argparse.Namespace) -> Any:
+	"""Run TabICL through TabArena and return its website-format leaderboard."""
+	from tabarena.benchmark.experiment import TabArenaV0pt1ExperimentBundle  # pyright: ignore[reportMissingImports]
+	from tabarena.contexts import TabArenaContext  # pyright: ignore[reportMissingImports]
+
+	model_path = args.model_path.expanduser().resolve()
+	if not model_path.is_file():
+		raise FileNotFoundError(f"TabICL checkpoint not found: {model_path}")
+
+	experiments = TabArenaV0pt1ExperimentBundle(
+		# Reduce bagging folds on small or imbalanced classification datasets so
+		# every validation fold contains every class.
+		adapt_num_folds_to_n_classes=True,
+		models=[(
+			TabICLGraphModel.config_generator(
+				model_path,
+				device=args.device,
+				num_cpus=args.num_cpus,
+				num_gpus=args.num_gpus,
+			),
+			args.n_configs,
+		)]
+	).build_experiments(time_limit=1*60*60)
+
+	print(len(experiments), "experiments built; running...")
+	print(experiments)
+	print("===========================================")
+
+	context = TabArenaContext()
+	context.build_and_run_jobs(
+		experiments,
+		expname=str(args.results_dir.expanduser().resolve()),
+		subset=args.subset,
+		build_kwargs={"dataset_names": args.datasets} if args.datasets else {},
+		new_result_prefix="[New] ",
+		debug_mode=args.debug_mode,
+	)
+	leaderboard = context.compare(output_dir=args.output_dir.expanduser().resolve())
+	website_leaderboard = context.leaderboard_to_website_format(leaderboard=leaderboard)
+	print(website_leaderboard.to_markdown(index=False))
+	return website_leaderboard
+
+
+if __name__ == "__main__":
+	compare_against_leaderboard(build_parser().parse_args())
+
+
+__all__ = ["Model", "TabArenaModel", "TabICLGraphModel", "build_parser", "compare_against_leaderboard"]

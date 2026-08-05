@@ -42,6 +42,7 @@ dependencies = [
     "matplotlib",
     "kagglehub>=1.0.2",
     "pandas>=2.3.3",
+    "torchdata>=0.11.0",
 ]
 
 [project.optional-dependencies]

@@ -9,11 +9,9 @@ requested classification metrics.
 from __future__ import annotations
 
 import argparse
-import os
 import time
-from contextlib import contextmanager
+from contextlib import nullcontext
 from pathlib import Path
-from typing import Iterator
 
 import numpy as np
 import pandas as pd
@@ -27,6 +25,8 @@ from sklearn.metrics import (
 
 from tabicl import TabICLClassifier
 from tabicl.eval.benchmarks.graph_land.dataset import Dataset
+
+MAX_FEATURES = 100
 
 
 def classification_tasks() -> list[tuple[str, str]]:
@@ -44,21 +44,9 @@ def classification_tasks() -> list[tuple[str, str]]:
 	return tasks
 
 
-@contextmanager
-def _data_directory(data_dir: Path) -> Iterator[None]:
-	"""Temporarily provide the ``data/<dataset>`` layout expected by Dataset."""
-	previous = Path.cwd()
-	os.chdir(data_dir.parent)
-	try:
-		yield
-	finally:
-		os.chdir(previous)
-
-
 def _load_dataset(name: str, split: str, data_dir: Path, device: str) -> Dataset:
-	"""Construct a Dataset while resolving its relative data paths correctly."""
-	with _data_directory(data_dir):
-		return Dataset(name=name, split=split, device=device, use_pyg=False)
+	"""Construct a Dataset using the supplied directory as its data root."""
+	return Dataset(name=name, split=split, device=device, use_pyg=False, data_dir=data_dir, load_graph=True)
 
 
 def _masked_arrays(dataset: Dataset) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -87,6 +75,20 @@ def _masked_arrays(dataset: Dataset) -> tuple[np.ndarray, np.ndarray, np.ndarray
 	return X_train, y_train, X_test, y_test
 
 
+def _print_dataset_size(name: str, dataset: Dataset) -> None:
+	"""Print graph and feature shapes for a loaded dataset."""
+	graphs = [
+		getattr(dataset, attribute, None)
+		for attribute in ("graph", "train_graph", "val_graph", "test_graph")
+	]
+	graph_shapes = [tuple(graph.shape) for graph in graphs if graph is not None]
+	feature_shape = tuple(dataset.features.shape)
+	print(
+		f"{name}: graph shape(s)={graph_shapes or ['unavailable']}, "
+		f"feature shape={feature_shape}"
+	)
+
+
 def _metrics(y_true: np.ndarray, y_pred: np.ndarray, binary: bool) -> dict[str, float]:
 	"""Calculate the requested classification metrics."""
 	result = {
@@ -111,10 +113,17 @@ def evaluate_dataset(
 	gat_mode: str = "ensemble",
 	gat_num_iterations: int = 1,
 	gat_entry_layer: int | str | None = None,
-) -> dict[str, object]:
+) -> dict[str, object] | None:
 	"""Load, run, and score one node-classification dataset."""
 	started = time.perf_counter()
 	dataset = _load_dataset(name, split, data_dir, device="cpu")
+	_print_dataset_size(name, dataset)
+	if dataset.features.shape[1] > MAX_FEATURES:
+		print(
+			f"skipping {name}: dataset has {dataset.features.shape[1]} features "
+			f"(maximum supported by this benchmark is {MAX_FEATURES})"
+		)
+		return None
 	X_train, y_train, X_test, y_test = _masked_arrays(dataset)
 
 	classifier = TabICLClassifier(
@@ -129,8 +138,18 @@ def evaluate_dataset(
 		gat_entry_layer=gat_entry_layer,
 	)
 	classifier.fit(X_train, y_train)
-	y_pred = np.asarray(classifier.predict(X_test))
-	probabilities = np.asarray(classifier.predict_proba(X_test))
+	# The sklearn adapter already loads frozen weights in eval mode; make the
+	# benchmark invariant explicit for both the adapter and graph engine.
+	classifier.model_.eval()
+	device_type = torch.device(device).type
+	amp_context = (
+		torch.autocast(device_type=device_type, dtype=torch.bfloat16)
+		if device_type in {"cpu", "cuda"}
+		else nullcontext()
+	)
+	with amp_context:
+		y_pred = np.asarray(classifier.predict(X_test))
+		probabilities = np.asarray(classifier.predict_proba(X_test))
 	if probabilities.shape[0] != y_test.shape[0]:
 		raise ValueError("TabICL returned a probability row count different from the test set")
 
@@ -155,8 +174,8 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument(
 		"--data-dir",
 		type=Path,
-		default=Path(__file__).resolve().parent / "data",
-		help="Dataset data directory containing one subdirectory per GraphLand dataset",
+		default=Path("data"),
+		help="Dataset data root containing one subdirectory per GraphLand dataset (default: ./data)",
 	)
 	parser.add_argument("--output", type=Path, default=Path("graph_land_results.csv"), help="Output CSV path")
 	parser.add_argument("--split", default="RL", help="Dataset split (default: RL)")
@@ -194,13 +213,15 @@ def main() -> None:
 			entry_layer: int | str | None = args.gat_entry_layer
 			if entry_layer is not None and entry_layer != "last":
 				entry_layer = int(entry_layer)
-			rows.append(evaluate_dataset(
+			result = evaluate_dataset(
 				name, source, model_path, data_dir, split=args.split, device=args.device,
 				n_estimators=args.n_estimators, batch_size=args.batch_size,
 				gat_mode=args.gat_mode, gat_num_iterations=args.gat_num_iterations,
 				gat_entry_layer=entry_layer,
-			))
-			print(f"completed {name}")
+			)
+			if result is not None:
+				rows.append(result)
+				print(f"completed {name}")
 		except Exception as error:
 			print(f"failed {name}: {error}")
 			if not args.continue_on_error:
