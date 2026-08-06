@@ -31,7 +31,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /path/to/tabicl/train/run.py 
             --max_steps 50 \
             --batch_size 512 \
             --micro_batch_size 1 \
-                --log_conf_mat_every ${LOG_CONF_MAT_EVERY} \
+            --log_conf_mat_every ${LOG_CONF_MAT_EVERY} \
             --lr 2e-6 \
             --scheduler constant \
             --gradient_clipping 1.0 \

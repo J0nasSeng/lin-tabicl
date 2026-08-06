@@ -147,3 +147,5 @@ prior_eval/
 
 # benchmark data
 src/tabicl/eval/benchmarks/graph_land/data/
+experiments/
+data/

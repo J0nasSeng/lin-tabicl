@@ -21,9 +21,11 @@ from sklearn.metrics import (
 	f1_score,
 	precision_score,
 	recall_score,
+	roc_auc_score,
 )
 
 from tabicl import TabICLClassifier
+from tabicl._model.graph import SparseGraphBatch, SparseGraphSet
 from tabicl.eval.benchmarks.graph_land.dataset import Dataset
 
 MAX_FEATURES = 100
@@ -89,7 +91,12 @@ def _print_dataset_size(name: str, dataset: Dataset) -> None:
 	)
 
 
-def _metrics(y_true: np.ndarray, y_pred: np.ndarray, binary: bool) -> dict[str, float]:
+def _metrics(
+	y_true: np.ndarray,
+	y_pred: np.ndarray,
+	probabilities: np.ndarray,
+	binary: bool,
+) -> dict[str, float]:
 	"""Calculate the requested classification metrics."""
 	result = {
 		"balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
@@ -97,7 +104,45 @@ def _metrics(y_true: np.ndarray, y_pred: np.ndarray, binary: bool) -> dict[str, 
 		"recall": float(recall_score(y_true, y_pred, average="macro", zero_division=0)),
 		"f1": float(f1_score(y_true, y_pred, average="binary", zero_division=0)) if binary else float("nan"),
 	}
+	if binary and np.unique(y_true).size == 2:
+		if probabilities.ndim != 2 or probabilities.shape[1] < 2:
+			raise ValueError(
+				f"Binary classification requires two probability columns for ROC AUC, got shape {probabilities.shape}"
+			)
+		result["roc_auc"] = float(roc_auc_score(y_true, probabilities[:, 1]))
+	else:
+		result["roc_auc"] = float("nan")
 	return result
+
+
+def _dataset_graph_set(
+	dataset: Dataset,
+	classifier: TabICLClassifier,
+	train_mask: np.ndarray,
+	test_mask: np.ndarray,
+) -> SparseGraphSet:
+	"""Build one identical graph per GAT graph slot for the selected rows."""
+	if dataset.graph is None:
+		raise ValueError("GraphLand dataset did not provide a graph")
+	selected = np.concatenate((np.flatnonzero(train_mask), np.flatnonzero(test_mask)))
+	if len(selected) != int(train_mask.sum() + test_mask.sum()):
+		raise ValueError("Train and test masks overlap")
+	if not hasattr(classifier.model_, "model"):
+		raise ValueError("GraphLand graph injection requires the graph inference engine")
+	num_graphs = classifier.model_.model.icl_predictor.graph_num_graphs
+	edges = dataset.graph.detach().cpu().long()
+	if edges.numel() and (edges.min() < 0 or edges.max() >= dataset.features.shape[0]):
+		raise ValueError("Dataset graph contains an out-of-range node index")
+	remap = torch.full((dataset.features.shape[0],), -1, dtype=torch.long)
+	remap[torch.from_numpy(selected)] = torch.arange(len(selected))
+	keep = (remap[edges[0]] >= 0) & (remap[edges[1]] >= 0)
+	selected_edges = remap[edges[:, keep]]
+	return SparseGraphSet(
+		graphs=[
+			SparseGraphBatch(edge_index=[selected_edges], num_nodes=len(selected))
+			for _ in range(num_graphs)
+		]
+	)
 
 
 def evaluate_dataset(
@@ -125,6 +170,8 @@ def evaluate_dataset(
 		)
 		return None
 	X_train, y_train, X_test, y_test = _masked_arrays(dataset)
+	train_mask = dataset.train_mask.detach().cpu().numpy().astype(bool)
+	test_mask = dataset.test_mask.detach().cpu().numpy().astype(bool)
 
 	classifier = TabICLClassifier(
 		model_path=model_path,
@@ -138,6 +185,7 @@ def evaluate_dataset(
 		gat_entry_layer=gat_entry_layer,
 	)
 	classifier.fit(X_train, y_train)
+	graph_set = _dataset_graph_set(dataset, classifier, train_mask, test_mask)
 	# The sklearn adapter already loads frozen weights in eval mode; make the
 	# benchmark invariant explicit for both the adapter and graph engine.
 	classifier.model_.eval()
@@ -148,8 +196,8 @@ def evaluate_dataset(
 		else nullcontext()
 	)
 	with amp_context:
-		y_pred = np.asarray(classifier.predict(X_test))
-		probabilities = np.asarray(classifier.predict_proba(X_test))
+		y_pred = np.asarray(classifier.predict(X_test, graph_set=graph_set))
+		probabilities = np.asarray(classifier.predict_proba(X_test, graph_set=graph_set))
 	if probabilities.shape[0] != y_test.shape[0]:
 		raise ValueError("TabICL returned a probability row count different from the test set")
 
@@ -163,7 +211,7 @@ def evaluate_dataset(
 		"n_train": int(X_train.shape[0]),
 		"n_val": int(dataset.val_mask.sum().item()),
 		"n_test": int(X_test.shape[0]),
-		**_metrics(y_test, y_pred, dataset.task == "binary_classification"),
+		**_metrics(y_test, y_pred, probabilities, dataset.task == "binary_classification"),
 		"seconds": float(time.perf_counter() - started),
 	}
 

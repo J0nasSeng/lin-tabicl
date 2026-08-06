@@ -8,7 +8,13 @@ from typing import Optional, Sequence
 import torch
 from torch import Tensor, nn
 
-from .graph import SparseGraphSet, build_class_conditioned_graphs
+from .graph import (
+	CompactGraphSet,
+	SparseGraphBatch,
+	SparseGraphSet,
+	build_class_conditioned_graphs,
+	stack_graph_sets,
+)
 from .inference_config import InferenceConfig
 from .tabicl import TabICL
 
@@ -134,7 +140,7 @@ class GATInferenceEngine(nn.Module):
 			pre_col_embeddings=pre_col_embeddings,
 		)
 
-	def _run_refinement(self, graph_input: Tensor, graph_set: SparseGraphSet) -> Tensor:
+	def _run_refinement(self, graph_input: Tensor, graph_set: SparseGraphSet | CompactGraphSet) -> Tensor:
 		predictor = self.model.icl_predictor
 		gat = predictor.gat_icl
 		start = 0 if self.entry_layer is None else self.entry_layer - 1
@@ -192,6 +198,55 @@ class GATInferenceEngine(nn.Module):
 			cls_out = gat.out_proj(cls_out)
 		return cls_out
 
+	def _validate_graph_set(self, graph_set: SparseGraphSet | CompactGraphSet, total_nodes: int, batch_size: int) -> None:
+		"""Validate externally supplied graph metadata before launching CUDA kernels."""
+		gat = self.model.icl_predictor.gat_icl
+		if graph_set.num_graphs != gat.num_graphs:
+			raise ValueError(
+				f"Expected {gat.num_graphs} graphs for the GAT stack, got {graph_set.num_graphs}"
+			)
+		if graph_set.num_nodes != total_nodes:
+			raise ValueError(f"Expected graph num_nodes={total_nodes}, got {graph_set.num_nodes}")
+		if isinstance(graph_set, CompactGraphSet):
+			if graph_set.num_datasets != batch_size:
+				raise ValueError(
+					f"Expected {batch_size} graph datasets, got {graph_set.num_datasets}"
+				)
+			edge_index = graph_set.edge_index
+		else:
+			if any(len(graph.edge_index) != batch_size for graph in graph_set.graphs):
+				raise ValueError("Each graph must contain one edge index per input batch item")
+			edge_index = torch.cat(
+				[edge for graph in graph_set.graphs for edge in graph.edge_index], dim=1
+			) if graph_set.graphs else torch.empty((2, 0), dtype=torch.long)
+		if edge_index.ndim != 2 or edge_index.shape[0] != 2:
+			raise ValueError("Graph edge indices must have shape (2, num_edges)")
+		if edge_index.numel() and (edge_index.min() < 0 or edge_index.max() >= total_nodes):
+			raise ValueError("Graph edge indices must be within the input node range")
+
+	def _compact_graph_set(
+		self, graph_set: SparseGraphSet | CompactGraphSet, batch_size: int
+	) -> CompactGraphSet:
+		if isinstance(graph_set, CompactGraphSet):
+			return graph_set
+		if not graph_set.graphs:
+			raise ValueError("Graph set must contain at least one graph")
+		graph_batch_sizes = {len(graph.edge_index) for graph in graph_set.graphs}
+		if graph_batch_sizes == {1}:
+			return stack_graph_sets([graph_set])
+		if graph_batch_sizes != {batch_size}:
+			raise ValueError("Sparse graph batches must all match the input batch size")
+		per_dataset = [
+			SparseGraphSet(
+				graphs=[
+					SparseGraphBatch(edge_index=[graph.edge_index[batch_idx]], num_nodes=graph.num_nodes)
+					for graph in graph_set.graphs
+				]
+			)
+			for batch_idx in range(batch_size)
+		]
+		return stack_graph_sets(per_dataset)
+
 	def _decode(self, representations: Tensor, y_train: Tensor) -> Tensor:
 		predictor = self.model.icl_predictor
 		src = predictor.ln(representations) if predictor.norm_first else representations
@@ -213,7 +268,7 @@ class GATInferenceEngine(nn.Module):
 		feature_shuffles: Optional[Sequence[Sequence[int]]] = None,
 		return_logits: bool = True,
 		softmax_temperature: float = 0.9,
-		graph_set: SparseGraphSet | None = None,
+		graph_set: SparseGraphSet | CompactGraphSet | None = None,
 		inference_config: InferenceConfig | None = None,
 		return_repr: bool = False,
 	) -> Tensor | tuple[Tensor, Tensor]:
@@ -223,6 +278,9 @@ class GATInferenceEngine(nn.Module):
 		inference_config = inference_config or self.inference_config_
 		if graph_set is None:
 			graph_set = self._make_graph_set(y_train, X.shape[1])
+		else:
+			graph_set = self._compact_graph_set(graph_set, X.shape[0])
+			self._validate_graph_set(graph_set, X.shape[1], X.shape[0])
 
 		if self.mode == "ensemble" or self.num_iterations == 1 and self.entry_layer is None:
 			if return_repr:

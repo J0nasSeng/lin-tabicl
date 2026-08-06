@@ -115,6 +115,7 @@ class TabICLGraphModel(AbstractModelBase):
 		params["model_path"] = self.model_path or self.params.get("model_path")
 		params["allow_auto_download"] = False
 		params["kv_cache"] = False
+		params["n_estimators"] = 1
 		return params
 
 	def _fit(self, X: "pd.DataFrame", y: "pd.Series", **kwargs: Any) -> None:

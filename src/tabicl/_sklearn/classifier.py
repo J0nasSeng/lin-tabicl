@@ -25,6 +25,7 @@ from tabicl import InferenceConfig
 from tabicl._model.tabicl import TabICL
 from tabicl._model.kv_cache import TabICLCache
 from tabicl._model.gat_inference_engine import GATInferenceEngine
+from tabicl._model.graph import CompactGraphSet, SparseGraphSet, stack_graph_sets
 
 
 class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
@@ -575,7 +576,8 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
             self.model_kv_cache_[norm_method] = TabICLCache.concat(caches)
 
     def _batch_forward(
-        self, Xs: np.ndarray, ys: np.ndarray, feature_shuffles: Optional[np.ndarray] = None
+        self, Xs: np.ndarray, ys: np.ndarray, feature_shuffles: Optional[np.ndarray] = None,
+        graph_set: SparseGraphSet | CompactGraphSet | None = None,
     ) -> np.ndarray:
         """Process model forward passes in batches to manage memory efficiently.
 
@@ -619,6 +621,7 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
             y_batch = torch.from_numpy(y_batch).float().to(self.device_)
             if shuffle_batch is not None:
                 shuffle_batch = shuffle_batch.tolist()
+            batch_graph_set = None if graph_set is None else stack_graph_sets([graph_set] * len(X_batch))
 
             with torch.no_grad():
                 out = self.model_(
@@ -628,6 +631,7 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
                     return_logits=True if self.average_logits else False,
                     softmax_temperature=self.softmax_temperature,
                     inference_config=self.inference_config_,
+                    graph_set=batch_graph_set,
                 )
             outputs.append(out.float().cpu().numpy())
 
@@ -729,7 +733,9 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
             outputs.append(out.float().cpu().numpy())
         return np.concatenate(outputs, axis=0)
 
-    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+    def predict_proba(
+        self, X: np.ndarray, graph_set: SparseGraphSet | CompactGraphSet | None = None
+    ) -> np.ndarray:
         """Predict class probabilities for test samples.
 
         Applies the ensemble of TabICL models to make predictions, with each ensemble
@@ -837,7 +843,7 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
                 else:
                     feature_shuffles = self.ensemble_generator_.masked_feature_shuffles_[norm_method]
 
-                outputs.append(self._batch_forward(Xs, ys, feature_shuffles))
+                outputs.append(self._batch_forward(Xs, ys, feature_shuffles, graph_set=graph_set))
             outputs = np.concatenate(outputs, axis=0)
 
         # Extract class shuffle patterns from ensemble generator
@@ -868,7 +874,9 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
         # Normalize probabilities
         return avg / avg.sum(axis=1, keepdims=True)
 
-    def predict(self, X: np.ndarray) -> np.ndarray:
+    def predict(
+        self, X: np.ndarray, graph_set: SparseGraphSet | CompactGraphSet | None = None
+    ) -> np.ndarray:
         """Predict class labels for test samples.
 
         Uses predict_proba to get class probabilities and returns the class with
@@ -887,7 +895,7 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
         array-like of shape (n_samples,)
             Predicted class labels for each test sample.
         """
-        proba = self.predict_proba(X)
+        proba = self.predict_proba(X, graph_set=graph_set)
         y = np.argmax(proba, axis=1)
 
         return self.y_encoder_.inverse_transform(y)
