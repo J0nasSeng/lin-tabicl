@@ -39,7 +39,7 @@ from ._hp_sampling import HpSamplerList
 from ._reg2cls import Reg2Cls
 from ._prior_config import DEFAULT_FIXED_HP, DEFAULT_SAMPLED_HP
 from tabicl._preprocessing.normalizer import normalize_batch
-from tabicl._model.graph import CompactGraphSet, build_class_conditioned_graphs, stack_graph_sets
+from tabicl._model.graph import CompactGraphSet, GraphPrior, build_class_conditioned_graphs, stack_graph_sets
 
 
 warnings.filterwarnings(
@@ -394,17 +394,21 @@ class Prior:
 def _build_prior_graph(params: Dict[str, Any], y: Tensor) -> CompactGraphSet:
     """Build graph metadata for one valid dataset inside prior generation."""
     train_size = int(params["train_size"])
-    return build_class_conditioned_graphs(
-        y_train=y[:train_size].long().unsqueeze(0),
-        total_nodes=int(params["seq_len"]),
-        num_graphs=int(params["graph_num_graphs"]),
+    return GraphPrior(
+        tab_graphs=params.get("tab_graphs", "v1"),
+        mode_prob=float(params.get("mode_prob", 1.0)),
         min_train_neighbors=int(params["graph_min_train_neighbors"]),
         max_train_neighbors=int(params["graph_max_train_neighbors"]),
         cross_label_fraction=float(params["graph_cross_label_fraction"]),
         train_neighbors_per_test=int(params["graph_train_neighbors_per_test"]),
         seed=params.get("graph_seed"),
-        share_graph_across_batch=bool(params["graph_share_across_batch"]),
-    )
+        homophily_prob=float(params.get("graph_homophily_prob", 0.7)),
+        transition_scope_prob=float(params.get("graph_transition_scope_prob", 0.5)),
+        remain_prob_range=tuple(params.get("graph_remain_prob_range", (0.7, 0.99))),
+        heterophily_structure_probs=params.get("graph_heterophily_structure_probs"),
+        group_count_range=tuple(params.get("graph_group_count_range", (2, 4))),
+        share_graph_across_batch=bool(params.get("graph_share_across_batch", False)),
+    )(y.long().unsqueeze(0), train_size, num_graphs=int(params["graph_num_graphs"]))
 
 
 class SCMPrior(Prior):
@@ -512,6 +516,8 @@ class SCMPrior(Prior):
         graph_train_neighbors_per_test: int = 8,
         graph_seed: Optional[int] = None,
         graph_share_across_batch: bool = False,
+        tab_graphs: str = "v1",
+        mode_prob: float = 1.0,
     ):
         super().__init__(
             batch_size=batch_size,
@@ -543,6 +549,8 @@ class SCMPrior(Prior):
         self.graph_train_neighbors_per_test = graph_train_neighbors_per_test
         self.graph_seed = graph_seed
         self.graph_share_across_batch = graph_share_across_batch
+        self.tab_graphs = tab_graphs
+        self.mode_prob = float(mode_prob)
 
     def hp_sampling(self) -> Dict[str, Any]:
         """Sample hyperparameters for dataset generation.
@@ -717,6 +725,8 @@ class SCMPrior(Prior):
                         "graph_train_neighbors_per_test": self.graph_train_neighbors_per_test,
                         "graph_seed": None if self.graph_seed is None else self.graph_seed + len(param_list),
                         "graph_share_across_batch": self.graph_share_across_batch,
+                        "tab_graphs": self.tab_graphs,
+                        "mode_prob": self.mode_prob,
                     }
                     param_list.append(params)
 
@@ -838,6 +848,8 @@ class DummyPrior(Prior):
         graph_train_neighbors_per_test: int = 8,
         graph_seed: Optional[int] = None,
         graph_share_across_batch: bool = False,
+        tab_graphs: str = "v1",
+        mode_prob: float = 1.0,
     ):
         super().__init__(
             batch_size=batch_size,
@@ -859,6 +871,8 @@ class DummyPrior(Prior):
         self.graph_train_neighbors_per_test = graph_train_neighbors_per_test
         self.graph_seed = graph_seed
         self.graph_share_across_batch = graph_share_across_batch
+        self.tab_graphs = tab_graphs
+        self.mode_prob = float(mode_prob)
 
     @torch.no_grad()
     def get_batch(self, batch_size: Optional[int] = None) -> tuple:
@@ -917,17 +931,16 @@ class DummyPrior(Prior):
                 "graph_seed": self.graph_seed,
                 "graph_share_across_batch": self.graph_share_across_batch,
             }
-            graph_set = build_class_conditioned_graphs(
-                y_train=y[:, :train_size].long(),
-                total_nodes=seq_len,
-                num_graphs=self.graph_num_graphs,
+            graph_set = GraphPrior(
+                tab_graphs=self.tab_graphs,
+                mode_prob=self.mode_prob,
                 min_train_neighbors=self.graph_min_train_neighbors,
                 max_train_neighbors=self.graph_max_train_neighbors,
                 cross_label_fraction=self.graph_cross_label_fraction,
                 train_neighbors_per_test=self.graph_train_neighbors_per_test,
                 seed=self.graph_seed,
                 share_graph_across_batch=self.graph_share_across_batch,
-            )
+            )(y, train_size, num_graphs=self.graph_num_graphs)
             return X, y, d, seq_lens, train_sizes, graph_set
         return X, y, d, seq_lens, train_sizes
 
@@ -1036,6 +1049,8 @@ class PriorDataset(IterableDataset):
         graph_train_neighbors_per_test: int = 8,
         graph_seed: Optional[int] = None,
         graph_share_across_batch: bool = False,
+        tab_graphs: str = "v1",
+        mode_prob: float = 1.0,
     ):
         super().__init__()
         # None preserves the historical direct-PriorDataset behavior. Training
@@ -1062,6 +1077,8 @@ class PriorDataset(IterableDataset):
                 graph_train_neighbors_per_test=graph_train_neighbors_per_test,
                 graph_seed=graph_seed,
                 graph_share_across_batch=graph_share_across_batch,
+                tab_graphs=tab_graphs,
+                mode_prob=mode_prob,
             )
         elif prior_type in ["mlp_scm", "tree_scm", "mix_scm", "nanotabicl"]:
             self.prior = SCMPrior(
@@ -1092,6 +1109,8 @@ class PriorDataset(IterableDataset):
                 graph_train_neighbors_per_test=graph_train_neighbors_per_test,
                 graph_seed=graph_seed,
                 graph_share_across_batch=graph_share_across_batch,
+                tab_graphs=tab_graphs,
+                mode_prob=mode_prob,
             )
         else:
             raise ValueError(

@@ -332,6 +332,19 @@ def build_parser():
         type=str2bool,
         help="If True, reuse one graph for all items in a batch",
     )
+    parser.add_argument(
+        "--tab_graphs",
+        type=str,
+        choices=["v1", "v2"],
+        default="v1",
+        help="Tabular graph prior version",
+    )
+    parser.add_argument(
+        "--mode_prob",
+        type=float,
+        default=1.0,
+        help="Probability that GraphPrior samples tabular mode",
+    )
     parser.add_argument("--freeze_icl", default=False, type=str2bool, help="Whether to freeze the ICL predictor")
 
     # Shared Architecture Config

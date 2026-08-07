@@ -427,6 +427,8 @@ class Trainer:
                 graph_train_neighbors_per_test=self.config.graph_train_neighbors_per_test,
                 graph_seed=self.config.graph_seed,
                 graph_share_across_batch=self.config.graph_share_across_batch,
+                tab_graphs=getattr(self.config, "tab_graphs", "v1"),
+                mode_prob=getattr(self.config, "mode_prob", 1.0),
             )
 
         val_start_offset = max(1, int(self.config.max_steps))

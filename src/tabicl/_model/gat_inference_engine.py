@@ -13,6 +13,7 @@ from .graph import (
 	SparseGraphBatch,
 	SparseGraphSet,
 	build_class_conditioned_graphs,
+	GraphPrior,
 	stack_graph_sets,
 )
 from .inference_config import InferenceConfig
@@ -107,10 +108,9 @@ class GATInferenceEngine(nn.Module):
 
 	def _make_graph_set(self, y_train: Tensor, total_nodes: int) -> SparseGraphSet:
 		predictor = self.model.icl_predictor
-		return build_class_conditioned_graphs(
-			y_train=y_train.long(),
-			total_nodes=total_nodes,
-			num_graphs=predictor.graph_num_graphs,
+		prior = GraphPrior(
+			tab_graphs=getattr(predictor, "tab_graphs", "v1"),
+			mode_prob=getattr(predictor, "mode_prob", 1.0),
 			min_train_neighbors=predictor.graph_min_train_neighbors,
 			max_train_neighbors=predictor.graph_max_train_neighbors,
 			cross_label_fraction=predictor.graph_cross_label_fraction,
@@ -118,6 +118,9 @@ class GATInferenceEngine(nn.Module):
 			seed=predictor.graph_seed,
 			share_graph_across_batch=predictor.graph_share_across_batch,
 		)
+		full_labels = torch.zeros((y_train.shape[0], total_nodes), dtype=y_train.dtype, device=y_train.device)
+		full_labels[:, : y_train.shape[1]] = y_train
+		return prior(full_labels.long(), y_train.shape[1], num_graphs=predictor.graph_num_graphs)
 
 	def _graph_input(
 		self,

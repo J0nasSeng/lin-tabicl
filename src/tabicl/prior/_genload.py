@@ -558,6 +558,8 @@ class SavePriorDataset:
             graph_max_train_neighbors=getattr(self.args, "graph_max_train_neighbors", 15),
             graph_cross_label_fraction=getattr(self.args, "graph_cross_label_fraction", 0.1),
             graph_train_neighbors_per_test=getattr(self.args, "graph_train_neighbors_per_test", 8),
+            tab_graphs=getattr(self.args, "tab_graphs", "v1"),
+            mode_prob=getattr(self.args, "mode_prob", 1.0),
         )
         print(self.prior)
 
@@ -741,6 +743,8 @@ if __name__ == "__main__":
     parser.add_argument("--graph_max_train_neighbors", type=int, default=6)
     parser.add_argument("--graph_cross_label_fraction", type=float, default=0.1)
     parser.add_argument("--graph_train_neighbors_per_test", type=int, default=2)
+    parser.add_argument("--tab_graphs", type=str, choices=["v1", "v2"], default="v1")
+    parser.add_argument("--mode_prob", type=float, default=1.0)
 
     args = parser.parse_args()
     np.random.seed(args.np_seed)

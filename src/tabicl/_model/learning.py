@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from .layers import ClassNode, OneHotAndLinear
 from .encoders import Encoder
 from .gat import GraphAttentionTransformer
-from .graph import CompactGraphSet
+from .graph import CompactGraphSet, SparseGraphSet
 from .kv_cache import KVCache
 from .inference import InferenceManager
 from .inference_config import MgrConfig, InferenceConfig
@@ -98,6 +98,8 @@ class ICLearning(nn.Module):
         graph_share_across_batch: bool = False,
         graph_num_cls: int = 4,
         graph_num_graphs: int = 1,
+        tab_graphs: str = "v1",
+        mode_prob: float = 1.0,
         learnable_residual: bool = False,
     ):
         super().__init__()
@@ -115,6 +117,8 @@ class ICLearning(nn.Module):
         self.graph_share_across_batch = graph_share_across_batch
         self.graph_num_cls = graph_num_cls
         self.graph_num_graphs = int(graph_num_graphs)
+        self.tab_graphs = tab_graphs
+        self.mode_prob = float(mode_prob)
         self.learnable_residual = bool(learnable_residual)
 
         if self.icl_backend not in ("encoder", "graph"):

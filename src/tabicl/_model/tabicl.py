@@ -183,6 +183,8 @@ class TabICL(nn.Module):
         graph_seed: Optional[int] = None,
         graph_share_across_batch: bool = False,
         graph_num_graphs: int = 1,
+        tab_graphs: str = "v1",
+        mode_prob: float = 1.0,
         learnable_residual: bool = False,
         icl_ssmax: Union[
             bool,
@@ -243,6 +245,8 @@ class TabICL(nn.Module):
         self.graph_seed = graph_seed
         self.graph_num_graphs = graph_num_graphs
         self.graph_share_across_batch = graph_share_across_batch
+        self.tab_graphs = tab_graphs
+        self.mode_prob = float(mode_prob)
         self.icl_ssmax = icl_ssmax
         self.ff_factor = ff_factor
         self.dropout = dropout
@@ -311,6 +315,8 @@ class TabICL(nn.Module):
             graph_share_across_batch=graph_share_across_batch,
             graph_num_cls=row_num_cls,
             graph_num_graphs=graph_num_graphs,
+            tab_graphs=tab_graphs,
+            mode_prob=mode_prob,
             learnable_residual=learnable_residual,
         )
 

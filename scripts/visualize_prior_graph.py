@@ -16,6 +16,7 @@ try:
 except ImportError as exc:
     raise ImportError("networkx is required for graph visualization. Install with `uv pip install networkx`.") from exc
 
+from tabicl._model.graph import GraphPrior
 from tabicl.prior._dataset import PriorDataset
 
 
@@ -52,7 +53,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Only print graph statistics; do not generate or save a plot.",
     )
+    parser.add_argument(
+        "--plot-statistics",
+        action="store_true",
+        help="Generate a 3-by-statistic histogram plot over all sampled datasets.",
+    )
     parser.add_argument("--output", type=str, default="scripts/graph_preview.png")
+    parser.add_argument(
+        "--statistics-output",
+        type=str,
+        default="scripts/graph_statistics.png",
+        help="Output path for the batch statistics histogram plot.",
+    )
     return parser
 
 
@@ -138,6 +150,33 @@ def _log_graph_metrics(
     cross_label_fraction: float,
 ) -> None:
     """Log degree summaries and label-conditioned edge counts for the full graph."""
+    statistics = _graph_statistics(g, labels, train_size)
+    print("Graph metrics (full generated graph):")
+    print(
+        f"  train degree: in={statistics['train_in_degree']:.2f}, "
+        f"out={statistics['train_out_degree']:.2f}"
+    )
+    print(
+        f"  test degree:  in={statistics['test_in_degree']:.2f}, "
+        f"out={statistics['test_out_degree']:.2f}"
+    )
+    print(
+        f"  all sample edges: intra-label={statistics['all_intra_edges']:.0f}, "
+        f"cross-label={statistics['all_cross_edges']:.0f}"
+    )
+    print(
+        f"  train-train sample edges: intra-label={statistics['train_train_intra_edges']:.0f}, "
+        f"cross-label={statistics['train_train_cross_edges']:.0f}"
+    )
+    print(
+        f"  train-train cross-label fraction: requested={cross_label_fraction:.3f}, "
+        f"realized={statistics['train_train_cross_fraction']:.3f}"
+    )
+    print(f"  adjusted homophily/assortativity: {statistics['assortativity']:.3f}")
+
+
+def _graph_statistics(g: nx.DiGraph, labels: np.ndarray, train_size: int) -> dict[str, float]:
+    """Return the statistics plotted for one generated graph."""
     train_nodes = list(range(train_size))
     test_nodes = list(range(train_size, len(labels)))
 
@@ -147,6 +186,10 @@ def _log_graph_metrics(
         values = g.in_degree(nodes) if degree == "in" else g.out_degree(nodes)
         return float(np.mean([value for _, value in values]))
 
+    train_in_degree = _average_degree(train_nodes, "in")
+    train_out_degree = _average_degree(train_nodes, "out")
+    test_in_degree = _average_degree(test_nodes, "in")
+    test_out_degree = _average_degree(test_nodes, "out")
     intra_label_edges = 0
     cross_label_edges = 0
     train_train_intra_edges = 0
@@ -164,32 +207,130 @@ def _log_graph_metrics(
             else:
                 train_train_cross_edges += 1
 
-    print("Graph metrics (full generated graph):")
-    print(
-        f"  train degree: in={_average_degree(train_nodes, 'in'):.2f}, "
-        f"out={_average_degree(train_nodes, 'out'):.2f}"
-    )
-    print(
-        f"  test degree:  in={_average_degree(test_nodes, 'in'):.2f}, "
-        f"out={_average_degree(test_nodes, 'out'):.2f}"
-    )
-    print(
-        f"  all sample edges: intra-label={intra_label_edges}, "
-        f"cross-label={cross_label_edges}"
-    )
-    print(
-        f"  train-train sample edges: intra-label={train_train_intra_edges}, "
-        f"cross-label={train_train_cross_edges}"
-    )
     train_train_total = train_train_intra_edges + train_train_cross_edges
-    requested_cross_fraction = cross_label_fraction
     realized_cross_fraction = (
         train_train_cross_edges / train_train_total if train_train_total else 0.0
     )
-    print(
-        f"  train-train cross-label fraction: requested={requested_cross_fraction:.3f}, "
-        f"realized={realized_cross_fraction:.3f}"
+    nx.set_node_attributes(g, {node: int(labels[node]) for node in g.nodes}, "label")
+    assortativity = nx.attribute_assortativity_coefficient(g, "label")
+    if not np.isfinite(assortativity):
+        assortativity = 0.0
+    return {
+        "train_in_degree": train_in_degree,
+        "train_out_degree": train_out_degree,
+        "test_in_degree": test_in_degree,
+        "test_out_degree": test_out_degree,
+        "all_intra_edges": float(intra_label_edges),
+        "all_cross_edges": float(cross_label_edges),
+        "train_train_intra_edges": float(train_train_intra_edges),
+        "train_train_cross_edges": float(train_train_cross_edges),
+        "train_train_cross_fraction": realized_cross_fraction,
+        "assortativity": float(assortativity),
+    }
+
+
+STATISTIC_LABELS = {
+    "train_in_degree": "Train mean in-degree",
+    "train_out_degree": "Train mean out-degree",
+    "test_in_degree": "Test mean in-degree",
+    "test_out_degree": "Test mean out-degree",
+    "all_intra_edges": "All intra-label edges",
+    "all_cross_edges": "All cross-label edges",
+    "train_train_intra_edges": "Train-train intra-label edges",
+    "train_train_cross_edges": "Train-train cross-label edges",
+    "train_train_cross_fraction": "Train-train cross-label fraction",
+    "assortativity": "Adjusted homophily / assortativity",
+}
+
+
+def _plot_statistics(
+    statistics: dict[str, list[dict[str, float]]],
+    output: str,
+) -> None:
+    """Plot one histogram row per graph mode and one column per statistic."""
+    modes = ["tabular v1", "tabular v2", "graph mode"]
+    stat_names = list(STATISTIC_LABELS)
+    figure, axes = plt.subplots(
+        len(modes), len(stat_names), figsize=(4.0 * len(stat_names), 10), squeeze=False, dpi=160
     )
+    for row, mode in enumerate(modes):
+        values_by_stat = {
+            name: np.asarray([item[name] for item in statistics[mode]], dtype=float)
+            for name in stat_names
+        }
+        for column, name in enumerate(stat_names):
+            axis = axes[row, column]
+            values = values_by_stat[name]
+            axis.hist(values, bins=min(15, max(3, len(values))), color=("#4C78A8", "#F58518", "#54A24B")[row], alpha=0.8)
+            mean = float(np.mean(values))
+            median = float(np.median(values))
+            axis.axvline(mean, color="black", linestyle="--", linewidth=1.2, label=f"mean {mean:.2f}")
+            axis.axvline(median, color="black", linestyle=":", linewidth=1.5, label=f"median {median:.2f}")
+            axis.set_title(STATISTIC_LABELS[name], fontsize=9)
+            axis.tick_params(axis="both", labelsize=8)
+            axis.legend(fontsize=7, loc="best")
+            if column == 0:
+                axis.set_ylabel(mode, fontsize=11)
+    figure.suptitle("GraphPrior statistics across sampled datasets", fontsize=16)
+    figure.tight_layout()
+    out_path = Path(output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(out_path, bbox_inches="tight")
+    plt.close(figure)
+    print(f"Saved statistics histogram plot to: {out_path}")
+
+
+def _to_networkx(edge_index: torch.Tensor, total_nodes: int) -> nx.DiGraph:
+    graph = nx.DiGraph()
+    graph.add_nodes_from(range(total_nodes))
+    graph.add_edges_from(zip(edge_index[0].tolist(), edge_index[1].tolist()))
+    return graph
+
+
+def _draw_graph(
+    ax: plt.Axes,
+    graph: nx.DiGraph,
+    labels: np.ndarray,
+    train_size: int,
+    test_fraction: float,
+    seed: int,
+    title: str,
+) -> None:
+    plot_nodes = _select_plot_nodes(
+        seq_len=len(labels), train_size=train_size, test_fraction=test_fraction, seed=seed
+    )
+    g_plot = graph.subgraph(plot_nodes.tolist()).copy()
+    cmap = plt.get_cmap("tab20")
+    node_colors = [
+        "#808080" if node >= train_size else cmap((labels[node] % 20) / 20.0)
+        for node in g_plot.nodes
+    ]
+    pos = _label_group_layout(g_plot=g_plot, label_colors=labels, train_size=train_size, seed=seed)
+    edge_colors = [
+        "#D62728"
+        if source < train_size
+        and target < train_size
+        and labels[source] == labels[target]
+        else "#3A3A3A"
+        for source, target in g_plot.edges
+    ]
+    nx.draw_networkx_edges(
+        g_plot, pos, ax=ax, alpha=0.45, width=1.0, edge_color=edge_colors, arrows=False
+    )
+    nx.draw_networkx_nodes(g_plot, pos, ax=ax, node_color=node_colors, node_size=100)
+    labeled_nodes = list(g_plot.nodes)[: min(g_plot.number_of_nodes(), 40)]
+    nx.draw_networkx_labels(
+        g_plot,
+        pos,
+        ax=ax,
+        labels={node: str(node) for node in labeled_nodes},
+        font_size=6,
+        font_color="black",
+    )
+    ax.set_title(
+        f"{title}\nshown={g_plot.number_of_nodes()}, edges={g_plot.number_of_edges()}"
+    )
+    ax.axis("off")
 
 
 def main() -> None:
@@ -210,7 +351,7 @@ def main() -> None:
         prior_type=args.prior_type,
         device=args.prior_device,
         n_jobs=1,
-        graph_backend=True,
+        graph_backend=False,
         graph_min_train_neighbors=args.graph_min_train_neighbors,
         graph_max_train_neighbors=args.graph_max_train_neighbors,
         graph_cross_label_fraction=args.graph_cross_label_fraction,
@@ -218,86 +359,122 @@ def main() -> None:
         graph_seed=args.seed,
     )
 
-    _, y, _, seq_lens, train_sizes, graph_sets = dataset.get_batch(batch_size=args.batch_size)
+    _, y, _, seq_lens, train_sizes = dataset.get_batch(batch_size=args.batch_size)
 
     seq_len = int(seq_lens[0].item())
     train_size = int(train_sizes[0].item())
     y0 = y[0, :seq_len].long()
 
-    # Use the graph generated together with the sampled prior dataset so the
-    # visualization reflects the exact graph configuration and random draw.
-    graph = graph_sets[0]
-
-    edge_index = graph.graphs[0].edge_index[0].cpu()
-    src = edge_index[0].tolist()
-    dst = edge_index[1].tolist()
-
-    g = nx.DiGraph()
-    g.add_nodes_from(range(seq_len))
-    g.add_edges_from(zip(src, dst))
-
     label_colors = _to_numpy_color_labels(y0, train_size, seq_len)
-    _log_graph_metrics(
-        g=g,
-        labels=label_colors,
-        train_size=train_size,
-        cross_label_fraction=args.graph_cross_label_fraction,
-    )
+    labels = y[0, :seq_len].long().unsqueeze(0)
+
+    # Keep all three samples based on the same generated dataset. This makes
+    # differences in topology attributable to GraphPrior rather than the SCM.
+    priors = {
+        "tabular v1": GraphPrior(
+            tab_graphs="v1",
+            mode_prob=1.0,
+            min_train_neighbors=args.graph_min_train_neighbors,
+            max_train_neighbors=args.graph_max_train_neighbors,
+            cross_label_fraction=args.graph_cross_label_fraction,
+            train_neighbors_per_test=args.graph_train_neighbors_per_test,
+            seed=args.seed,
+        ),
+        "tabular v2": GraphPrior(
+            tab_graphs="v2",
+            mode_prob=1.0,
+            min_train_neighbors=args.graph_min_train_neighbors,
+            max_train_neighbors=args.graph_max_train_neighbors,
+            cross_label_fraction=args.graph_cross_label_fraction,
+            train_neighbors_per_test=args.graph_train_neighbors_per_test,
+            seed=args.seed + 1,
+        ),
+        "graph mode": GraphPrior(
+            tab_graphs="v2",
+            mode_prob=0.0,
+            min_train_neighbors=args.graph_min_train_neighbors,
+            max_train_neighbors=args.graph_max_train_neighbors,
+            cross_label_fraction=args.graph_cross_label_fraction,
+            train_neighbors_per_test=args.graph_train_neighbors_per_test,
+            seed=args.seed + 2,
+        ),
+    }
+
+    if args.plot_statistics:
+        # Generate one graph per mode for every dataset in the sampled batch.
+        # The prior dataset normally uses a shared sequence length and split
+        # within a batch; retain a clear error if a custom prior violates that
+        # assumption, since the compact graph payload requires rectangular
+        # labels.
+        batch_seq_lens = seq_lens[: args.batch_size].long().tolist()
+        batch_train_sizes = train_sizes[: args.batch_size].long().tolist()
+        if len(set(batch_seq_lens)) != 1 or len(set(batch_train_sizes)) != 1:
+            raise ValueError("--plot-statistics requires one sequence length and train size per batch")
+        batch_labels = y[:, :seq_len].long()
+        batch_statistics: dict[str, list[dict[str, float]]] = {}
+        for mode, prior in priors.items():
+            graph_set = prior(batch_labels, train_size, num_graphs=1)
+            mode_statistics = []
+            for dataset_index in range(batch_labels.shape[0]):
+                edge_index = graph_set.graphs[0].edge_index[dataset_index].cpu()
+                graph = _to_networkx(edge_index, seq_len)
+                dataset_labels = batch_labels[dataset_index].cpu().numpy().astype(int)
+                mode_statistics.append(_graph_statistics(graph, dataset_labels, train_size))
+            batch_statistics[mode] = mode_statistics
+
+            values = {
+                name: float(np.mean([item[name] for item in mode_statistics]))
+                for name in STATISTIC_LABELS
+            }
+            print(f"\n{mode} batch means:")
+            for name, value in values.items():
+                print(f"  {STATISTIC_LABELS[name]}: {value:.3f}")
+
+        if not args.no_plot:
+            _plot_statistics(batch_statistics, args.statistics_output)
+        return
+
+    graphs = {
+        name: prior(labels, train_size, num_graphs=1).graphs[0].edge_index[0].cpu()
+        for name, prior in priors.items()
+    }
+    networkx_graphs = {
+        name: _to_networkx(edge_index, seq_len) for name, edge_index in graphs.items()
+    }
+
+    for name, graph in networkx_graphs.items():
+        print(f"\n{name}:")
+        _log_graph_metrics(
+            g=graph,
+            labels=label_colors,
+            train_size=train_size,
+            cross_label_fraction=args.graph_cross_label_fraction,
+        )
 
     if args.no_plot:
         return
 
-    plot_nodes = _select_plot_nodes(seq_len=seq_len, train_size=train_size, test_fraction=args.plot_test_fraction, seed=args.seed)
-    g_plot = g.subgraph(plot_nodes.tolist()).copy()
-
-    # Train nodes by label colormap, test nodes in grey
-    cmap = plt.get_cmap("tab20")
-
-    node_colors = []
-    for idx in g_plot.nodes:
-        if idx >= train_size:
-            node_colors.append("#808080")
-        else:
-            node_colors.append(cmap((label_colors[idx] % 20) / 20.0))
-
-    plot_node_count = g_plot.number_of_nodes()
-    pos = _label_group_layout(g_plot=g_plot, label_colors=label_colors, train_size=train_size, seed=args.seed)
-
-    edge_colors = []
-    for source, target in g_plot.edges:
-        same_class = (
-            source < train_size
-            and target < train_size
-            and label_colors[source] == label_colors[target]
+    figure, axes = plt.subplots(1, 3, figsize=(24, 9), dpi=180)
+    for axis, (name, graph) in zip(axes, networkx_graphs.items()):
+        _draw_graph(
+            ax=axis,
+            graph=graph,
+            labels=label_colors,
+            train_size=train_size,
+            test_fraction=args.plot_test_fraction,
+            seed=args.seed,
+            title=name,
         )
-        edge_colors.append("#D62728" if same_class else "#3A3A3A")
-
-    plt.figure(figsize=(16, 12), dpi=180)
-    nx.draw_networkx_edges(g_plot, pos, alpha=0.45, width=1.3, edge_color=edge_colors, arrows=False)
-    nx.draw_networkx_nodes(g_plot, pos, node_color=node_colors, node_size=220)
-
-    # Label a subset of nodes for readability
-    sample_label_count = min(plot_node_count, 60)
-    labeled_nodes = list(g_plot.nodes)[:sample_label_count]
-    node_labels = {i: str(i) for i in labeled_nodes}
-    nx.draw_networkx_labels(g_plot, pos, labels=node_labels, font_size=8, font_color="black")
-
-    train_patch = plt.Line2D([0], [0], marker="o", color="w", markerfacecolor="#1f77b4", markersize=10)
-    test_patch = plt.Line2D([0], [0], marker="o", color="w", markerfacecolor="#808080", markersize=10)
-    plt.legend([train_patch, test_patch], ["Train nodes (class-colored)", "Test nodes (grey)"], loc="upper right")
-
-    plt.title(
-        f"Class-Conditioned Graph (first dataset)\n"
-        f"nodes_shown={plot_node_count} (train={train_size}, test={plot_node_count - train_size}), "
-        f"edges_shown={g_plot.number_of_edges()}, total_nodes={seq_len}, total_edges={edge_index.shape[1]}"
+    figure.suptitle(
+        f"GraphPrior comparison (total_nodes={seq_len}, train_nodes={train_size})",
+        fontsize=16,
     )
-    plt.axis("off")
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.tight_layout()
-    plt.savefig(out_path)
-    plt.close()
+    figure.tight_layout()
+    figure.savefig(out_path)
+    plt.close(figure)
 
     print(f"Saved graph visualization to: {out_path}")
 
