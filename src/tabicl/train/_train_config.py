@@ -63,6 +63,12 @@ def build_parser():
         "--micro_batch_size", type=int, default=8, help="Size of micro-batches for gradient accumulation"
     )
     parser.add_argument(
+        "--gradient_accum",
+        type=int,
+        default=1,
+        help="Number of generated batches to accumulate before an optimizer update",
+    )
+    parser.add_argument(
         "--scheduled_loader_steps",
         type=str,
         default="0",
@@ -155,6 +161,13 @@ def build_parser():
     parser.add_argument("--batch_size_per_gp", type=int, default=4, help="Batch size per group")
     parser.add_argument("--min_features", type=int, default=5, help="The minimum number of features")
     parser.add_argument("--max_features", type=int, default=100, help="The maximum number of features")
+    parser.add_argument(
+        "--train-col-embed-only",
+        "--train_col_embed_only",
+        default=False,
+        type=str2bool,
+        help="Stage 1.5 mode: expand and train only the TabICL column embedder from a checkpoint",
+    )
     parser.add_argument("--max_classes", type=int, default=10, help="The maximum number of classes")
     parser.add_argument("--min_seq_len", type=int, default=None, help="Minimum samples per dataset")
     parser.add_argument("--max_seq_len", type=int, default=1024, help="Maximum samples per dataset")

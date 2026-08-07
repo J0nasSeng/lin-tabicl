@@ -142,6 +142,14 @@ class Trainer:
 
     def __init__(self, config):
         self.config = config
+        if getattr(self.config, "gradient_accum", 1) <= 0:
+            raise ValueError("--gradient_accum must be a positive integer")
+        if not hasattr(self.config, "gradient_accum"):
+            self.config.gradient_accum = 1
+        self._gradient_accum_count = 0
+        self.train_col_embed_only = bool(getattr(config, "train_col_embed_only", False))
+        if self.train_col_embed_only:
+            self._validate_column_embedding_only_mode()
         self.configure_ddp()
         self.build_model()
         self.configure_prior()
@@ -151,6 +159,21 @@ class Trainer:
         self.configure_wandb()
         self.rtpt = RTPT(name_initials="JS", experiment_name="TabICL_Stage1", max_iterations=self.config.max_steps)
         self.rtpt.start()
+
+    def _validate_column_embedding_only_mode(self):
+        """Validate the opt-in stage 1.5 checkpoint-transfer mode."""
+        if str(getattr(self.config, "model_type", "tabicl")).lower() != "tabicl":
+            raise ValueError("--train-col-embed-only is supported only for model_type='tabicl'.")
+        if not getattr(self.config, "checkpoint_path", None):
+            raise ValueError("--train-col-embed-only requires an explicit --checkpoint_path.")
+        if not os.path.isfile(self.config.checkpoint_path):
+            raise FileNotFoundError(
+                f"--train-col-embed-only checkpoint not found: {self.config.checkpoint_path}"
+            )
+        if getattr(self.config, "freeze_col", False):
+            raise ValueError("--train-col-embed-only cannot be combined with --freeze_col=True.")
+        if self.config.max_features <= 0:
+            raise ValueError("--max_features must be positive.")
 
     def configure_ddp(self):
         """Set up distributed training and system configuration.
@@ -291,6 +314,10 @@ class Trainer:
         }
 
         if model_type == "tabicl":
+            # Persist this field for new full TabICL checkpoints. Historical
+            # checkpoints may omit it and are handled by shape inference when
+            # the stage 1.5 loader reads their identity table.
+            self.model_config["max_features"] = self.config.max_features
             model = TabICL(**{k: v for k, v in self.model_config.items() if k != "model_type"})
         elif model_type == "nanotabicl":
             if self.config.max_classes <= 0:
@@ -321,8 +348,18 @@ class Trainer:
             num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
             print(f"Model has {num_params} parameters.")
 
-        # Freeze model components if requested
-        if model_type == "tabicl" and self.config.freeze_col:
+        # Freeze model components if requested. Stage 1.5 deliberately keeps
+        # the complete column embedder trainable and freezes everything else.
+        if self.train_col_embed_only:
+            for parameter in model.parameters():
+                parameter.requires_grad_(False)
+            for parameter in model.col_embedder.parameters():
+                parameter.requires_grad_(True)
+            model.train()
+            model.col_embedder.train()
+            model.row_interactor.eval()
+            model.icl_predictor.eval()
+        elif model_type == "tabicl" and self.config.freeze_col:
             model.col_embedder.eval()
             for param in model.col_embedder.parameters():
                 param.requires_grad = False
@@ -411,9 +448,9 @@ class Trainer:
             dataset,
             batch_size=None,  # No additional batching since prior dataset handles batching internally
             shuffle=False,
-            num_workers=16,
+            num_workers=4,
             prefetch_factor=2,
-            pin_memory=True if self.config.prior_device == "cpu" else False,
+            pin_memory=False, #True if self.config.prior_device == "cpu" else False,
             pin_memory_device=self.config.device if self.config.prior_device == "cpu" else "",
             persistent_workers=True,
         )
@@ -451,8 +488,11 @@ class Trainer:
     def configure_optimizer(self):
         """Configure optimizer and scheduler."""
 
+        trainable_parameters = [parameter for parameter in self.raw_model.parameters() if parameter.requires_grad]
+        if not trainable_parameters:
+            raise ValueError("No trainable parameters remain after applying freeze settings.")
         self.optimizer = optim.AdamW(
-            params=self.raw_model.parameters(), lr=self.config.lr, weight_decay=self.config.weight_decay
+            params=trainable_parameters, lr=self.config.lr, weight_decay=self.config.weight_decay
         )
         self.scheduler = get_scheduler(config=self.config, optimizer=self.optimizer)
 
@@ -535,16 +575,72 @@ class Trainer:
         if "state_dict" not in checkpoint:
             raise ValueError("Checkpoint does not contain model state")
 
-        self.raw_model.load_state_dict(checkpoint["state_dict"])
+        if self.train_col_embed_only:
+            self._load_expanded_column_checkpoint(checkpoint)
+        else:
+            self.raw_model.load_state_dict(checkpoint["state_dict"])
 
         # Optionally load optimizer and scheduler state
-        if self.config.only_load_model:
+        if self.config.only_load_model or self.train_col_embed_only:
             print("Only loading model weights")
-        else:
+        elif not self.train_col_embed_only:
             self.optimizer.load_state_dict(checkpoint["optimizer_state"])
             self.scheduler.load_state_dict(checkpoint["scheduler_state"])
             self.curr_step = checkpoint["curr_step"]
             print(f"Resuming training at step {self.curr_step}")
+
+    def _load_expanded_column_checkpoint(self, checkpoint):
+        """Load a checkpoint while expanding its column identity table."""
+        source_config = checkpoint.get("config") or {}
+        if str(source_config.get("model_type", "tabicl")).lower() != "tabicl":
+            raise ValueError("--train-col-embed-only requires a TabICL checkpoint.")
+
+        source_state = checkpoint["state_dict"]
+        identity_key = "col_embedder.column_identity_rotations"
+        source_identity = source_state.get(identity_key)
+        target_state = self.raw_model.state_dict()
+        target_identity = target_state.get(identity_key)
+        if source_identity is None or target_identity is None:
+            raise ValueError("Checkpoint/model does not contain column identity embeddings.")
+        if source_identity.ndim != target_identity.ndim or source_identity.shape[1:] != target_identity.shape[1:]:
+            raise ValueError(
+                "Column identity embedding dimensions are incompatible: "
+                f"checkpoint={tuple(source_identity.shape)}, model={tuple(target_identity.shape)}"
+            )
+        source_max_features = int(source_identity.shape[0])
+        configured_source_max_features = source_config.get("max_features")
+        if configured_source_max_features is not None and int(configured_source_max_features) != source_max_features:
+            raise ValueError(
+                "Checkpoint max_features does not match its column identity embedding shape: "
+                f"config={configured_source_max_features}, tensor={source_max_features}"
+            )
+        if source_max_features > self.config.max_features:
+            raise ValueError(
+                f"Target max_features={self.config.max_features} is smaller than checkpoint capacity "
+                f"{source_max_features}."
+            )
+
+        missing = set(target_state) - set(source_state) - {identity_key}
+        unexpected = set(source_state) - set(target_state)
+        mismatched = {
+            key: (tuple(source_state[key].shape), tuple(target_state[key].shape))
+            for key in set(source_state) & set(target_state)
+            if key != identity_key and source_state[key].shape != target_state[key].shape
+        }
+        if missing or unexpected or mismatched:
+            raise ValueError(
+                "Checkpoint architecture is incompatible with the stage 1.5 model: "
+                f"missing={sorted(missing)}, unexpected={sorted(unexpected)}, mismatched={mismatched}"
+            )
+
+        expanded_identity = target_identity.clone()
+        expanded_identity[:source_max_features].copy_(source_identity.to(expanded_identity))
+        target_state[identity_key] = expanded_identity
+        self.raw_model.load_state_dict(target_state, strict=True)
+        print(
+            f"Loaded checkpoint column embeddings: copied {source_max_features} rows, "
+            f"initialized {self.config.max_features - source_max_features} new rows"
+        )
 
     def save_checkpoint(self, name: str):
         """Save model and training state to checkpoint file.
@@ -1022,6 +1118,8 @@ class Trainer:
         dataset_results_to_log: int = 2,
         dataset_results_start_index: int = 0,
         do_backward: bool = True,
+        sync_gradients: bool = True,
+        accumulation_divisor: int = 1,
     ):
         """Process a micro batch for gradient accumulation.
 
@@ -1051,7 +1149,9 @@ class Trainer:
 
         # Set DDP gradient sync for last micro batch only
         if do_backward and self.ddp:
-            self.model.require_backward_grad_sync = micro_batch_idx == num_micro_batches - 1
+            self.model.require_backward_grad_sync = (
+                sync_gradients and micro_batch_idx == num_micro_batches - 1
+            )
 
         with self.amp_ctx:
             supcon_weight = float(getattr(self.config, "supcon_weight", 0.0))
@@ -1127,7 +1227,7 @@ class Trainer:
             loss = ce_loss + supcon_weight * supcon_raw_loss - entropy_weight * entropy_raw_loss
 
         if do_backward:
-            scaled_loss = loss / num_micro_batches
+            scaled_loss = loss / (num_micro_batches * accumulation_divisor)
             self.scaler.scale(scaled_loss).backward()
 
         with torch.no_grad():
@@ -1183,7 +1283,10 @@ class Trainer:
             If more than 10% of micro-batches fail due to OOM errors.
         """
         self.model.train()
-        self.optimizer.zero_grad(set_to_none=True)
+        accumulation_steps = self.config.gradient_accum
+        is_accumulation_start = self._gradient_accum_count == 0
+        if is_accumulation_start:
+            self.optimizer.zero_grad(set_to_none=True)
 
         batch = self._prepare_padded_batch(batch)
         num_micro_batches, micro_batches = self._split_micro_batches(batch)
@@ -1199,6 +1302,10 @@ class Trainer:
                     num_micro_batches,
                     collect_artifacts=False,
                     do_backward=True,
+                    sync_gradients=(
+                        self._gradient_accum_count == accumulation_steps - 1
+                    ),
+                    accumulation_divisor=accumulation_steps,
                 )
                 for k, v in micro_results.items():
                     if k in {
@@ -1226,7 +1333,10 @@ class Trainer:
                 f"Please check configuration to reduce memory consumption."
             )
 
-        results["grad_norm"] = self._apply_optimizer_updates()
+        self._gradient_accum_count += 1
+        if self._gradient_accum_count == accumulation_steps:
+            results["grad_norm"] = self._apply_optimizer_updates()
+            self._gradient_accum_count = 0
 
         return results
 
