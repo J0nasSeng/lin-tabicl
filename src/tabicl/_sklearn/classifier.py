@@ -316,6 +316,7 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
         gat_entry_layer: int | str | None = None,
         feature_reduction: str | None = None,
         n_components: int | None = None,
+        max_chunk_size: int | None = None,
     ):
         self.n_estimators = n_estimators
         self.norm_methods = norm_methods
@@ -342,6 +343,7 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
         self.gat_mode = gat_mode
         self.gat_num_iterations = gat_num_iterations
         self.gat_entry_layer = gat_entry_layer
+        self.max_chunk_size = max_chunk_size
         self.feature_reduction = feature_reduction
         self.n_components = n_components
 
@@ -442,6 +444,7 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
                 mode=self.gat_mode,
                 num_iterations=self.gat_num_iterations,
                 entry_layer=self.gat_entry_layer,
+                max_chunk_size=self.max_chunk_size,
             )
         else:
             self.model_ = TabICL(**checkpoint["config"], icl_backend="encoder")
@@ -665,6 +668,13 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
         """
 
         batch_size = self.batch_size or Xs.shape[0]
+        # Hierarchical graph inference allocates a fresh column/GAT pass for
+        # every tree node. Force one ensemble view per model call so a batch of
+        # views cannot multiply those node-local GPU allocations.
+        model = getattr(self.model_, "model", self.model_)
+        max_classes = getattr(model, "max_classes", None)
+        if max_classes is not None and ys.size and np.unique(ys[0]).size > max_classes:
+            batch_size = 1
         n_batches = np.ceil(Xs.shape[0] / batch_size)
         Xs = np.array_split(Xs, n_batches)
         ys = np.array_split(ys, n_batches)

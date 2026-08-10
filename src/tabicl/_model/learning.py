@@ -10,7 +10,14 @@ import torch.nn.functional as F
 from .layers import ClassNode, OneHotAndLinear
 from .encoders import Encoder
 from .gat import GraphAttentionTransformer
-from .graph import CompactGraphSet, SparseGraphSet
+from .graph import (
+    CompactGraphSet,
+    SparseGraphBatch,
+    SparseGraphSet,
+    build_class_conditioned_graphs,
+    induce_graph_set,
+    stack_graph_sets,
+)
 from .kv_cache import KVCache
 from .inference import InferenceManager
 from .inference_config import MgrConfig, InferenceConfig
@@ -101,6 +108,7 @@ class ICLearning(nn.Module):
         tab_graphs: str = "v1",
         mode_prob: float = 1.0,
         learnable_residual: bool = False,
+        graph_max_chunk_size: int | None = None,
     ):
         super().__init__()
 
@@ -120,6 +128,7 @@ class ICLearning(nn.Module):
         self.tab_graphs = tab_graphs
         self.mode_prob = float(mode_prob)
         self.learnable_residual = bool(learnable_residual)
+        self.graph_max_chunk_size = graph_max_chunk_size
 
         if self.icl_backend not in ("encoder", "graph"):
             raise ValueError(f"Unknown icl_backend={self.icl_backend}. Expected 'encoder' or 'graph'.")
@@ -173,6 +182,7 @@ class ICLearning(nn.Module):
                 out_dim=d_model,
                 learnable_residual=self.learnable_residual,
                 num_graphs=self.graph_num_graphs,
+                max_chunk_size=self.graph_max_chunk_size,
             )
         if self.norm_first:
             self.ln = nn.LayerNorm(d_model, bias=not bias_free_ln)
@@ -442,6 +452,23 @@ class ICLearning(nn.Module):
 
         if graph_set is None:
             raise ValueError("Graph backend requires precomputed graph metadata")
+        if isinstance(graph_set, SparseGraphSet):
+            if not graph_set.graphs or any(len(graph.edge_index) != B for graph in graph_set.graphs):
+                raise ValueError("Sparse graph batches must match the graph input batch size")
+            graph_set = stack_graph_sets(
+                [
+                    SparseGraphSet(
+                        graphs=[
+                            SparseGraphBatch(
+                                edge_index=[graph.edge_index[batch_idx]],
+                                num_nodes=graph.num_nodes,
+                            )
+                            for graph in graph_set.graphs
+                        ]
+                    )
+                    for batch_idx in range(B)
+                ]
+            )
 
         if graph_set.num_graphs != self.graph_num_graphs:
             raise ValueError(
@@ -465,6 +492,7 @@ class ICLearning(nn.Module):
         col_embeddings: Tensor,
         y_train: Tensor,
         pre_col_embeddings: Optional[Tensor] = None,
+        encode_labels: bool = True,
     ) -> Tensor:
         """Prepare graph-ready 4D input with column identity and train-label signals.
 
@@ -479,6 +507,11 @@ class ICLearning(nn.Module):
         pre_col_embeddings : Optional[Tensor], default=None
             Optional projected input features of shape (B, T, C, D) carrying
             column-identity signal.
+
+        encode_labels : bool, default=True
+            Whether to add the training-label embedding. Oversized graph
+            inference sets this to False because each hierarchy node applies
+            its own local label encoding.
 
         Returns
         -------
@@ -502,8 +535,11 @@ class ICLearning(nn.Module):
             x = x + pre_col_embeddings
 
         train_size = y_train.shape[1]
-        y_encoded = self.y_encoder(y_train.float()).view(B, train_size, self.graph_num_cls, D)
-        x[:, :train_size, -self.graph_num_cls :, :] = x[:, :train_size, -self.graph_num_cls :, :] + y_encoded
+        if encode_labels:
+            y_encoded = self.y_encoder(y_train.float()).view(B, train_size, self.graph_num_cls, D)
+            x[:, :train_size, -self.graph_num_cls :, :] = (
+                x[:, :train_size, -self.graph_num_cls :, :] + y_encoded
+            )
 
         cls_tokens = self.graph_cls_tokens.view(1, 1, self.graph_num_cls, D).expand(B, x.shape[1], -1, -1)
         x = torch.cat([x, cls_tokens], dim=2)
@@ -573,6 +609,123 @@ class ICLearning(nn.Module):
             return out, src
 
         return out
+
+    def _decode_representations(self, src: Tensor, y_train: Tensor, train_size: int) -> Tensor:
+        """Decode row representations using the configured ICL decoder."""
+        if self.decoder_type == "mlp":
+            return self.decoder(src)
+        if self.decoder_type == "soft_kmeans":
+            return self._soft_kmeans_decoder(src, y_train=y_train, train_size=train_size)
+        if self.decoder_type == "rbf":
+            return self._rbf_decoder(src, y_train=y_train, train_size=train_size)
+        return self._euclidean_decoder(src, y_train=y_train, train_size=train_size)
+
+    def _decode_node_probabilities(
+        self, src: Tensor, y_train: Tensor, softmax_temperature: float = 0.9
+    ) -> Tensor:
+        """Decode one hierarchy node into probabilities over local labels."""
+        train_size = y_train.shape[1]
+        num_classes = int(torch.unique(y_train).numel())
+        out = self._decode_representations(src, y_train=y_train, train_size=train_size)
+        out = out[:, train_size:, :num_classes]
+        if self.decoder_type in ("soft_kmeans", "rbf", "euclidean"):
+            return out.exp()
+        return torch.softmax(out / softmax_temperature, dim=-1)
+
+    def _graph_hierarchical_predictions(
+        self,
+        graph_input: Tensor,
+        y_train: Tensor,
+        graph_set: CompactGraphSet | SparseGraphSet,
+        base_col_embeddings: Tensor,
+        pre_col_embeddings: Optional[Tensor] = None,
+        softmax_temperature: float = 0.9,
+    ) -> Tensor:
+        """Run hierarchy inference with a local graph label encoding per node."""
+        if self.icl_backend != "graph":
+            raise ValueError("Graph hierarchical inference requires the graph backend")
+        if base_col_embeddings.ndim != 4:
+            raise ValueError("base_col_embeddings must have shape (B, T, C, D)")
+        if base_col_embeddings.shape[:2] != graph_input.shape[:2]:
+            raise ValueError("base_col_embeddings and graph_input must share batch and node dimensions")
+        if pre_col_embeddings is not None and pre_col_embeddings.shape != base_col_embeddings.shape:
+            raise ValueError("pre_col_embeddings must have the same shape as base_col_embeddings")
+        if y_train.shape[0] != 1:
+            raise ValueError("Graph hierarchical inference currently processes one dataset at a time")
+
+        src_full = self._run_graph_column_pipeline(graph_input, y_train=y_train, graph_set=graph_set)
+        if self.norm_first:
+            src_full = self.ln(src_full)
+
+        train_size = y_train.shape[1]
+        self._fit_hierarchical(src_full[0, :train_size], y_train[0].long())
+        root = self.root
+        num_classes = int(root.classes_.numel())
+        test_size = graph_input.shape[1] - train_size
+        device = graph_input.device
+        global_y = y_train[0].long()
+        base = base_col_embeddings[0]
+        pre_base = None if pre_col_embeddings is None else pre_col_embeddings[0]
+        test_base = base[train_size:]
+        test_pre = None if pre_base is None else pre_base[train_size:]
+
+        def process_node(node: ClassNode) -> Tensor:
+            node_classes = node.classes_.to(device=device, dtype=global_y.dtype)
+            train_mask = torch.isin(global_y, node_classes)
+            node_base = torch.cat([base[:train_size][train_mask], test_base], dim=0).unsqueeze(0)
+            node_pre = None
+            if pre_base is not None:
+                node_pre = torch.cat([pre_base[:train_size][train_mask], test_pre], dim=0).unsqueeze(0)
+
+            if node.is_leaf:
+                node_y = self._label_encoding(node.y.to(device).long())
+            else:
+                node_y = node.group_indices.to(device).long()
+            if node_y.numel() == 0 or int(node_y.max()) >= self.max_classes:
+                raise ValueError("Hierarchy node labels must be within max_classes")
+
+            if graph_set is None:
+                node_graph = build_class_conditioned_graphs(
+                    y_train=node_y.unsqueeze(0),
+                    total_nodes=node_base.shape[1],
+                    num_graphs=self.graph_num_graphs,
+                    min_train_neighbors=self.graph_min_train_neighbors,
+                    max_train_neighbors=self.graph_max_train_neighbors,
+                    cross_label_fraction=self.graph_cross_label_fraction,
+                    train_neighbors_per_test=self.graph_train_neighbors_per_test,
+                    seed=self.graph_seed,
+                    share_graph_across_batch=self.graph_share_across_batch,
+                )
+                node_graph_set = CompactGraphSet(
+                    edge_index=node_graph.edge_index.to(device),
+                    edge_offsets=node_graph.edge_offsets.to(device),
+                    num_nodes=node_graph.num_nodes,
+                )
+            else:
+                node_graph = induce_graph_set(graph_set, train_mask, train_size)
+                node_graph_set = stack_graph_sets([node_graph])
+            node_input = self.prepare_graph_input(node_base, node_y.unsqueeze(0), node_pre)
+            node_src = self._run_graph_column_pipeline(
+                node_input, y_train=node_y.unsqueeze(0), graph_set=node_graph_set
+            )
+            if self.norm_first:
+                node_src = self.ln(node_src)
+            local_probs = self._decode_node_probabilities(
+                node_src, node_y.unsqueeze(0), softmax_temperature=softmax_temperature
+            ).squeeze(0)
+
+            if node.is_leaf:
+                global_probs = torch.zeros((test_size, num_classes), device=device, dtype=local_probs.dtype)
+                for local_idx, global_idx in enumerate(node.classes_.tolist()):
+                    global_probs[:, global_idx] = local_probs[:, local_idx]
+                return global_probs
+
+            final_probs = torch.zeros((test_size, num_classes), device=device, dtype=local_probs.dtype)
+            for group_idx, child_node in enumerate(node.child_nodes):
+                final_probs += process_node(child_node) * local_probs[:, group_idx : group_idx + 1]
+            return final_probs
+
+        return process_node(root)
 
     def _predict_standard(
         self,
@@ -797,6 +950,7 @@ class ICLearning(nn.Module):
         use_col_embeddings: bool = False,
         pre_col_embeddings: Optional[Tensor] = None,
         graph_set: Optional[SparseGraphSet] = None,
+        base_col_embeddings: Optional[Tensor] = None,
     ) -> Tensor | tuple[Tensor, Tensor]:
         """In-context learning based on learned row representations.
 
@@ -856,17 +1010,56 @@ class ICLearning(nn.Module):
             out = out[:, train_size:]
         else:
             if self.icl_backend == "graph":
-                out = self._icl_predictions(R, y_train, graph_set=graph_set)
-                train_size = y_train.shape[1]
-                out = out[:, train_size:]
-                if self.max_classes > 0:
-                    num_classes = len(torch.unique(y_train[0]))
-                    out = out[..., :num_classes]
-                    if self.decoder_type in ("soft_kmeans", "rbf", "euclidean"):
-                        if not return_logits:
-                            out = out.exp()
-                    elif not return_logits:
-                        out = torch.softmax(out / softmax_temperature, dim=-1)
+                num_classes = len(torch.unique(y_train[0]))
+                if num_classes > self.max_classes:
+                    if base_col_embeddings is None:
+                        raise ValueError(
+                            "Graph hierarchical inference requires the unlabelled base_col_embeddings input"
+                        )
+                    if graph_set is None:
+                        raise ValueError("Graph hierarchical inference requires graph metadata")
+                    graph_outputs = []
+                    for batch_idx in range(y_train.shape[0]):
+                        if isinstance(graph_set, CompactGraphSet):
+                            node_graph_set = graph_set.slice(batch_idx)
+                        else:
+                            node_graph_set = SparseGraphSet(
+                                graphs=[
+                                    SparseGraphBatch(
+                                        edge_index=[graph.edge_index[batch_idx]],
+                                        num_nodes=graph.num_nodes,
+                                    )
+                                    for graph in graph_set.graphs
+                                ]
+                            )
+                        graph_outputs.append(
+                            self._graph_hierarchical_predictions(
+                                graph_input=R[batch_idx : batch_idx + 1],
+                                y_train=y_train[batch_idx : batch_idx + 1],
+                                graph_set=node_graph_set,
+                                base_col_embeddings=base_col_embeddings[batch_idx : batch_idx + 1],
+                                pre_col_embeddings=(
+                                    None
+                                    if pre_col_embeddings is None
+                                    else pre_col_embeddings[batch_idx : batch_idx + 1]
+                                ),
+                                softmax_temperature=softmax_temperature,
+                            )
+                        )
+                    out = torch.stack(graph_outputs, dim=0)
+                    if return_logits:
+                        out = softmax_temperature * torch.log(out.clamp_min(1e-6))
+                else:
+                    out = self._icl_predictions(R, y_train, graph_set=graph_set)
+                    train_size = y_train.shape[1]
+                    out = out[:, train_size:]
+                    if self.max_classes > 0:
+                        out = out[..., :num_classes]
+                        if self.decoder_type in ("soft_kmeans", "rbf", "euclidean"):
+                            if not return_logits:
+                                out = out.exp()
+                        elif not return_logits:
+                            out = torch.softmax(out / softmax_temperature, dim=-1)
             else:
                 out = self._inference_forward(R, y_train, return_logits, softmax_temperature, mgr_config)
 

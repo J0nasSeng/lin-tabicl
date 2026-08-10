@@ -18,6 +18,7 @@ from .graph import (
 )
 from .inference_config import InferenceConfig
 from .tabicl import TabICL
+from .gat import GraphMultiheadAttention
 
 
 class GATInferenceEngine(nn.Module):
@@ -51,6 +52,7 @@ class GATInferenceEngine(nn.Module):
 		mode: str = "ensemble",
 		num_iterations: int = 1,
 		entry_layer: int | str | None = None,
+		max_chunk_size: int | None = None,
 	) -> None:
 		super().__init__()
 		if mode not in {"ensemble", "reasoning"}:
@@ -87,6 +89,12 @@ class GATInferenceEngine(nn.Module):
 		self.model_config_ = config
 		self.model = TabICL(**config)
 		self.model.load_state_dict(checkpoint["state_dict"])
+		if max_chunk_size is not None:
+			if max_chunk_size <= 0:
+				raise ValueError("max_chunk_size must be > 0 when provided")
+			for module in self.model.modules():
+				if isinstance(module, GraphMultiheadAttention):
+					module.max_chunk_size = int(max_chunk_size)
 		self.model.to(self.device_).eval()
 		for parameter in self.model.parameters():
 			parameter.requires_grad_(False)
@@ -279,6 +287,9 @@ class GATInferenceEngine(nn.Module):
 		"""Return predictions for a batch of already assembled tables."""
 		X = X.to(self.device_)
 		y_train = y_train.to(self.device_)
+		if self.model.max_classes > 0 and int(torch.unique(y_train[0]).numel()) > self.model.max_classes:
+			if self.mode != "ensemble":
+				raise ValueError("Hierarchical graph inference requires mode='ensemble'")
 		inference_config = inference_config or self.inference_config_
 		if graph_set is None:
 			graph_set = self._make_graph_set(y_train, X.shape[1])

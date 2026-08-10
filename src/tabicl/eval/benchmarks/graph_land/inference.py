@@ -155,6 +155,7 @@ def evaluate_dataset(
 	gat_mode: str = "ensemble",
 	gat_num_iterations: int = 1,
 	gat_entry_layer: int | str | None = None,
+	max_chunk_size: int | None = None,
 ) -> dict[str, object] | None:
 	"""Load, run, and score one node-classification dataset."""
 	started = time.perf_counter()
@@ -172,9 +173,12 @@ def evaluate_dataset(
 		n_estimators=n_estimators,
 		batch_size=batch_size,
 		kv_cache=False,
+		use_amp=True,
+		offload_mode="cpu",
 		gat_mode=gat_mode,
 		gat_num_iterations=gat_num_iterations,
 		gat_entry_layer=gat_entry_layer,
+		max_chunk_size=max_chunk_size,
 		feature_reduction="ensemble",
 		n_components=100,
 	)
@@ -223,10 +227,11 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--split", default="RL", help="Dataset split (default: RL)")
 	parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 	parser.add_argument("--n-estimators", type=int, default=8)
-	parser.add_argument("--batch-size", type=int, default=8)
+	parser.add_argument("--batch-size", type=int, default=1)
 	parser.add_argument("--gat-mode", choices=("ensemble", "reasoning"), default="ensemble")
 	parser.add_argument("--gat-num-iterations", type=int, default=1)
 	parser.add_argument("--gat-entry-layer", default=None)
+	parser.add_argument("--max-chunk-size", type=int, default=None)
 	parser.add_argument("--datasets", nargs="+", help="Optional dataset names; default is all classification tasks")
 	parser.add_argument("--continue-on-error", action="store_true")
 	return parser
@@ -259,7 +264,7 @@ def main() -> None:
 				name, source, model_path, data_dir, split=args.split, device=args.device,
 				n_estimators=args.n_estimators, batch_size=args.batch_size,
 				gat_mode=args.gat_mode, gat_num_iterations=args.gat_num_iterations,
-				gat_entry_layer=entry_layer,
+				gat_entry_layer=entry_layer, max_chunk_size=args.max_chunk_size,
 			)
 			if result is not None:
 				rows.append(result)

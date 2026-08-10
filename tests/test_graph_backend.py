@@ -1,7 +1,14 @@
 import torch
 import pytest
 
-from src.tabicl._model.graph import build_class_conditioned_graph, build_class_conditioned_graphs, stack_graph_sets
+from src.tabicl._model.graph import (
+    SparseGraphBatch,
+    SparseGraphSet,
+    build_class_conditioned_graph,
+    build_class_conditioned_graphs,
+    induce_graph_set,
+    stack_graph_sets,
+)
 from src.tabicl._model.gat import GraphMultiheadAttention, GraphAttentionTransformer
 from src.tabicl._model.gat import GraphAttentionBlock
 from src.tabicl._model.learning import ICLearning
@@ -102,6 +109,26 @@ def test_graph_builder_multiple_graphs_are_reproducible_and_independent():
         assert torch.equal(graph_a.edge_index[0], graph_b.edge_index[0])
     assert not torch.equal(
         graph_set_a.graphs[0].edge_index[0], graph_set_a.graphs[1].edge_index[0]
+    )
+
+
+def test_induce_graph_set_preserves_topology_and_all_test_nodes():
+    edge_index = torch.tensor(
+        [[0, 1, 2, 3, 4, 5], [1, 0, 3, 2, 5, 4]], dtype=torch.long
+    )
+    graph_set = SparseGraphSet([SparseGraphBatch(edge_index=[edge_index], num_nodes=6)])
+
+    induced = induce_graph_set(
+        graph_set,
+        train_mask=torch.tensor([True, False, True]),
+        train_size=3,
+    )
+
+    assert induced.num_nodes == 5
+    # Original vertices [0, 2, 3, 4, 5] map to [0, 1, 2, 3, 4].
+    assert torch.equal(
+        induced.graphs[0].edge_index[0],
+        torch.tensor([[1, 2, 3, 4], [2, 1, 4, 3]]),
     )
 
 
@@ -248,6 +275,86 @@ def test_iclearning_graph_backend_requires_4d_graph_input():
 
     with pytest.raises(ValueError, match=r"Graph backend expects R with shape \(B, T, C, D\)"):
         model(row_repr, y_train)
+
+
+def test_iclearning_graph_backend_hierarchical_soft_kmeans_uses_local_labels():
+    batch_size = 2
+    train_size = 12
+    test_size = 3
+    num_classes = 7
+    d_model = 12
+
+    y_train = torch.tensor(
+        [[0, 1, 2, 3, 4, 5, 6, 0, 1, 2, 3, 4]] * batch_size,
+        dtype=torch.long,
+    )
+    model = ICLearning(
+        max_classes=3,
+        out_dim=3,
+        d_model=d_model,
+        num_blocks=2,
+        nhead=3,
+        dim_feedforward=24,
+        icl_backend="graph",
+        decoder_type="soft_kmeans",
+        graph_min_train_neighbors=1,
+        graph_max_train_neighbors=2,
+        graph_train_neighbors_per_test=1,
+        graph_seed=0,
+    ).eval()
+
+    base_col_embeddings = torch.randn(
+        batch_size, train_size + test_size, model.graph_num_cls, model.graph_col_dim
+    )
+    pre_col_embeddings = torch.randn_like(base_col_embeddings)
+    graph_input = model.prepare_graph_input(
+        base_col_embeddings,
+        y_train,
+        pre_col_embeddings=pre_col_embeddings,
+        encode_labels=False,
+    )
+    graph_set = build_class_conditioned_graphs(
+        y_train=y_train,
+        total_nodes=train_size + test_size,
+        num_graphs=model.graph_num_graphs,
+        min_train_neighbors=model.graph_min_train_neighbors,
+        max_train_neighbors=model.graph_max_train_neighbors,
+        train_neighbors_per_test=model.graph_train_neighbors_per_test,
+        seed=model.graph_seed,
+    )
+
+    out = model(
+        graph_input,
+        y_train,
+        return_logits=False,
+        graph_set=graph_set,
+        base_col_embeddings=base_col_embeddings,
+        pre_col_embeddings=pre_col_embeddings,
+    )
+
+    assert out.shape == (batch_size, test_size, num_classes)
+    assert torch.isfinite(out).all()
+    assert torch.allclose(out.sum(dim=-1), torch.ones(batch_size, test_size), atol=1e-4)
+
+
+def test_iclearning_graph_checkpoint_state_dict_keys_are_unchanged():
+    kwargs = dict(
+        max_classes=3,
+        out_dim=3,
+        d_model=12,
+        num_blocks=2,
+        nhead=3,
+        dim_feedforward=24,
+        icl_backend="graph",
+        decoder_type="soft_kmeans",
+    )
+    model_before = ICLearning(**kwargs)
+    state_dict = model_before.state_dict()
+    model_after = ICLearning(**kwargs)
+    missing, unexpected = model_after.load_state_dict(state_dict, strict=False)
+    assert missing == []
+    assert unexpected == []
+    assert set(model_before.state_dict()) == set(model_after.state_dict())
 
 
 def test_iclearning_graph_backend_rejects_regression():

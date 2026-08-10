@@ -68,11 +68,14 @@ class TabICLGraphModel(AbstractModelBase):
 		"""Set defaults consumed by the TabICL sklearn estimator."""
 		for parameter, value in {
 			"n_estimators": 8,
-			"batch_size": 2,
+			"batch_size": 1,
 			"kv_cache": False,
+			"use_amp": True,
+			"offload_mode": "cpu",
 			"gat_mode": "ensemble",
 			"gat_num_iterations": 1,
 			"gat_entry_layer": None,
+			"max_chunk_size": None,
 			"device": None,
 		}.items():
 			self._set_default_param_value(parameter, value)
@@ -115,6 +118,10 @@ class TabICLGraphModel(AbstractModelBase):
 		params["model_path"] = self.model_path or self.params.get("model_path")
 		params["allow_auto_download"] = False
 		params["kv_cache"] = False
+		params["use_amp"] = True
+		params["offload_mode"] = "cpu"
+		params["batch_size"] = 1
+		params["max_chunk_size"] = self.params.get("max_chunk_size")
 		params["n_estimators"] = 1
 		params["feature_reduction"] = "ensemble"
 		params["n_components"] = 100
@@ -148,6 +155,7 @@ class TabICLGraphModel(AbstractModelBase):
 		device: str | torch.device | None = None,
 		num_cpus: int = 64,
 		num_gpus: int = 1,
+		max_chunk_size: int | None = None,
 	) -> "ConfigGenerator":
 		"""Return a TabArena config generator for the supplied checkpoint."""
 		from tabarena.utils.config_utils import ConfigGenerator  # pyright: ignore[reportMissingImports]
@@ -157,6 +165,8 @@ class TabICLGraphModel(AbstractModelBase):
 			config["model_path"] = str(model_path)
 		if device is not None:
 			config["device"] = str(device)
+		if max_chunk_size is not None:
+			config["max_chunk_size"] = max_chunk_size
 		config["ag_args_fit"] = {
 			"num_cpus": num_cpus,
 			"num_gpus": num_gpus,
@@ -201,6 +211,12 @@ def build_parser() -> argparse.ArgumentParser:
 		help="Torch device for TabICL inference, for example cpu, cuda, cuda:0, or mps",
 	)
 	parser.add_argument(
+		"--max-chunk-size",
+		type=int,
+		default=None,
+		help="Maximum number of destination-sorted graph edges processed per attention chunk.",
+	)
+	parser.add_argument(
 		"--debug-mode",
 		action=argparse.BooleanOptionalAction,
 		default=True,
@@ -226,6 +242,7 @@ def compare_against_leaderboard(args: argparse.Namespace) -> Any:
 			TabICLGraphModel.config_generator(
 				model_path,
 				device=args.device,
+				max_chunk_size=args.max_chunk_size,
 				num_cpus=args.num_cpus,
 				num_gpus=args.num_gpus,
 			),

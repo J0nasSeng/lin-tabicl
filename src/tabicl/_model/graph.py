@@ -126,6 +126,60 @@ class CompactGraphBatch:
     num_nodes: int
 
 
+def induce_graph_set(
+    graph_set: SparseGraphSet | CompactGraphSet,
+    train_mask: Tensor,
+    train_size: int,
+) -> SparseGraphSet:
+    """Induce a hierarchy-node graph while retaining every test vertex.
+
+    The input graph must describe one dataset with vertices ordered as all
+    training rows followed by all test rows.  The returned graph uses the
+    node-local ordering ``selected training rows + all test rows``.
+    """
+    if train_mask.ndim != 1 or train_mask.dtype != torch.bool:
+        raise ValueError("train_mask must be a one-dimensional boolean tensor")
+    if train_size > train_mask.numel():
+        raise ValueError("train_size cannot exceed the train mask length")
+    if isinstance(graph_set, CompactGraphSet):
+        if graph_set.num_datasets != 1:
+            raise ValueError("induce_graph_set expects a graph set containing one dataset")
+    elif not graph_set.graphs or any(len(graph.edge_index) != 1 for graph in graph_set.graphs):
+        raise ValueError("induce_graph_set expects a graph set containing one dataset")
+
+    total_nodes = graph_set.num_nodes
+    if total_nodes < train_size or train_mask.numel() != train_size:
+        raise ValueError("Graph and train mask dimensions are inconsistent")
+
+    selected = torch.cat(
+        [torch.where(train_mask)[0], torch.arange(train_size, total_nodes, device=train_mask.device)]
+    )
+    remap = torch.full((total_nodes,), -1, dtype=torch.long, device=selected.device)
+    remap[selected] = torch.arange(selected.numel(), device=selected.device)
+
+    if isinstance(graph_set, CompactGraphSet):
+        edges = [
+            graph_set.edge_index[:, int(graph_set.edge_offsets[i, 0]) : int(graph_set.edge_offsets[i, 1])]
+            for i in range(graph_set.num_graphs)
+        ]
+    else:
+        if not graph_set.graphs:
+            raise ValueError("Graph set must contain at least one graph")
+        edges = [graph.edge_index[0] for graph in graph_set.graphs]
+
+    induced = []
+    for edge_index in edges:
+        edge_index = edge_index.to(device=selected.device, dtype=torch.long)
+        if edge_index.numel() and (edge_index.min() < 0 or edge_index.max() >= total_nodes):
+            raise ValueError("Graph edge indices must be within the original node range")
+        keep = (remap[edge_index[0]] >= 0) & (remap[edge_index[1]] >= 0)
+        induced.append(remap[edge_index[:, keep]])
+
+    return SparseGraphSet(
+        graphs=[SparseGraphBatch(edge_index=[edge], num_nodes=int(selected.numel())) for edge in induced]
+    )
+
+
 class GraphPrior:
     """Configurable prior for tabular and graph-shaped classification tasks.
 

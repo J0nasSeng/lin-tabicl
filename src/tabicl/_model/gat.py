@@ -12,7 +12,13 @@ if TYPE_CHECKING:
 
 
 class GraphMultiheadAttention(nn.Module):
-    """Sparse graph multi-head attention with per-destination softmax weights."""
+    """Sparse graph multi-head attention with per-destination softmax weights.
+
+    Edges are destination-sorted at runtime and processed in complete
+    destination groups. ``max_chunk_size`` limits the number of edges held in
+    edge-wise temporary tensors; a single destination group can exceed this
+    limit because it cannot be split without changing its softmax.
+    """
 
     def __init__(
         self,
@@ -21,12 +27,15 @@ class GraphMultiheadAttention(nn.Module):
         dropout: float = 0.0,
         max_parallel_edges: int = 2**12,
         learnable_residual: bool = False,
+        max_chunk_size: int | None = None,
     ):
         super().__init__()
         if d_model % nhead != 0:
             raise ValueError(f"d_model ({d_model}) must be divisible by nhead ({nhead})")
         if max_parallel_edges <= 0:
             raise ValueError("max_parallel_edges must be > 0")
+        if max_chunk_size is not None and max_chunk_size <= 0:
+            raise ValueError("max_chunk_size must be > 0 when provided")
 
         self.d_model = d_model
         self.nhead = nhead
@@ -42,6 +51,10 @@ class GraphMultiheadAttention(nn.Module):
         if self.learnable_residual:
             self.alpha = nn.Parameter(torch.logit(torch.tensor(0.2, dtype=torch.float32)))
         self.max_parallel_edges = int(max_parallel_edges)
+        # ``max_parallel_edges`` is retained for checkpoint and constructor
+        # compatibility. The explicit name makes the runtime memory limit
+        # clearer for new callers.
+        self.max_chunk_size = None if max_chunk_size is None else int(max_chunk_size)
 
         nn.init.xavier_uniform_(self.out_proj.weight)
         nn.init.zeros_(self.out_proj.bias)
@@ -123,37 +136,90 @@ class GraphMultiheadAttention(nn.Module):
         global_edge_src = torch.cat(all_edge_src, dim=0)
         global_edge_dst = torch.cat(all_edge_dst, dim=0)
 
+        # Put all incoming edges for a destination next to each other. This
+        # chunk boundary is allowed only between complete destination groups.
+        sort_order = torch.argsort(global_edge_dst, stable=True)
+        global_edge_src = global_edge_src[sort_order]
+        global_edge_dst = global_edge_dst[sort_order]
+
         q = self.q_proj(src).view(B * T, C, self.nhead, self.head_dim)
         k = self.k_proj(src).view(B * T, C, self.nhead, self.head_dim)
         v = self.v_proj(src).view(B * T, C, self.nhead, self.head_dim)
 
-        q_dst = q[global_edge_dst]
-        k_src = k[global_edge_src]
-        v_src = v[global_edge_src]
-
-        attn_logits = (q_dst * k_src).sum(dim=-1) * self.scale
+        num_groups = B * T * C * self.nhead
+        max_per_group = torch.full((num_groups,), float("-inf"), dtype=src.dtype, device=src.device)
+        sum_per_group = torch.zeros((num_groups,), dtype=src.dtype, device=src.device)
+        agg = torch.zeros((B * T, C, self.nhead, self.head_dim), dtype=src.dtype, device=src.device)
 
         E = global_edge_dst.numel()
+        chunk_size = self.max_chunk_size or self.max_parallel_edges
+        # Destination groups are contiguous after sorting. A group larger than
+        # the requested limit is intentionally kept as one chunk; splitting it
+        # would make its softmax depend on the arbitrary chunk boundary.
+        group_starts = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.long, device=src.device),
+                torch.where(global_edge_dst[1:] != global_edge_dst[:-1])[0].add(1),
+                torch.tensor([E], dtype=torch.long, device=src.device),
+            ]
+        )
+        group_start_list = group_starts.tolist()
+        chunks: list[tuple[int, int]] = []
+        chunk_start = group_start_list[0]
+        chunk_end = chunk_start
+        for group_start, group_end in zip(group_start_list[:-1], group_start_list[1:]):
+            if chunk_end > chunk_start and group_end - chunk_start > chunk_size:
+                chunks.append((chunk_start, chunk_end))
+                chunk_start = group_start
+            chunk_end = group_end
+        if chunk_end > chunk_start:
+            chunks.append((chunk_start, chunk_end))
+
         head_ids = torch.arange(self.nhead, device=src.device, dtype=torch.long).view(1, 1, self.nhead)
         col_ids = torch.arange(C, device=src.device, dtype=torch.long).view(1, C, 1)
-        dst_rep = global_edge_dst.view(E, 1, 1)
-        group_index = (dst_rep * (C * self.nhead) + col_ids * self.nhead + head_ids).reshape(-1)
-        num_groups = B * T * C * self.nhead
 
-        logits_flat = attn_logits.reshape(-1)
-        max_per_group = torch.full((num_groups,), float("-inf"), dtype=src.dtype, device=src.device)
-        max_per_group.scatter_reduce_(0, group_index, logits_flat, reduce="amax", include_self=True)
+        def chunk_group_index(dst: Tensor) -> Tensor:
+            return (
+                dst.view(-1, 1, 1) * (C * self.nhead) + col_ids * self.nhead + head_ids
+            ).reshape(-1)
 
-        exp_logits = torch.exp(logits_flat - max_per_group[group_index])
-        sum_per_group = torch.zeros((num_groups,), dtype=src.dtype, device=src.device)
-        sum_per_group.index_add_(0, group_index, exp_logits)
-        edge_weight = (exp_logits / sum_per_group[group_index].clamp_min(1e-12)).view(E, C, self.nhead)
-        edge_weight = self.dropout(edge_weight)
+        def chunk_logits(start: int, end: int, include_values: bool = False):
+            dst = global_edge_dst[start:end]
+            src_index = global_edge_src[start:end]
+            q_dst = q[dst]
+            k_src = k[src_index]
+            logits = (q_dst * k_src).sum(dim=-1) * self.scale
+            if include_values:
+                return dst, logits, v[src_index]
+            return dst, logits
 
-        messages = v_src * edge_weight.unsqueeze(-1)
+        # Pass 1: compute the global maximum for every destination/column/head
+        # group. Only one edge chunk is materialized at a time.
+        for start, end in chunks:
+            dst, logits = chunk_logits(start, end)
+            group_index = chunk_group_index(dst)
+            max_per_group.scatter_reduce_(
+                0, group_index, logits.reshape(-1), reduce="amax", include_self=True
+            )
 
-        agg = torch.zeros((B * T, C, self.nhead, self.head_dim), dtype=src.dtype, device=src.device)
-        agg.index_add_(0, global_edge_dst, messages)
+        # Pass 2: compute the global denominator using the global maxima.
+        for start, end in chunks:
+            dst, logits = chunk_logits(start, end)
+            group_index = chunk_group_index(dst)
+            exp_logits = torch.exp(logits.reshape(-1) - max_per_group[group_index])
+            sum_per_group.index_add_(0, group_index, exp_logits)
+
+        # Pass 3: normalize and accumulate messages directly into destinations.
+        for start, end in chunks:
+            dst, logits, values = chunk_logits(start, end, include_values=True)
+            group_index = chunk_group_index(dst)
+            edge_weight = torch.exp(logits.reshape(-1) - max_per_group[group_index])
+            edge_weight = (edge_weight / sum_per_group[group_index].clamp_min(1e-12)).view(
+                end - start, C, self.nhead
+            )
+            edge_weight = self.dropout(edge_weight)
+            agg.index_add_(0, dst, values * edge_weight.unsqueeze(-1))
+
         attn_out = self.out_proj(agg.view(B, T, C, self.d_model))
         if alpha is None:
             return residual_src + attn_out
@@ -173,6 +239,7 @@ class GraphAttentionBlock(nn.Module):
         norm_first: bool = True,
         bias_free_ln: bool = False,
         learnable_residual: bool = False,
+        max_chunk_size: int | None = None,
     ):
         super().__init__()
         self.norm_first = norm_first
@@ -182,6 +249,7 @@ class GraphAttentionBlock(nn.Module):
             nhead=nhead,
             dropout=dropout,
             learnable_residual=learnable_residual,
+            max_chunk_size=max_chunk_size,
         )
 
         self.norm1 = nn.LayerNorm(d_model, bias=not bias_free_ln)
@@ -251,6 +319,7 @@ class GraphAttentionTransformer(nn.Module):
         out_dim: int | None = None,
         learnable_residual: bool = False,
         num_graphs: int = 1,
+        max_chunk_size: int | None = None,
     ):
         super().__init__()
         self.graph_blocks = nn.ModuleList(
@@ -264,6 +333,7 @@ class GraphAttentionTransformer(nn.Module):
                     norm_first=norm_first,
                     bias_free_ln=bias_free_ln,
                     learnable_residual=learnable_residual,
+                    max_chunk_size=max_chunk_size,
                 )
                 for _ in range(num_blocks)
             ]
