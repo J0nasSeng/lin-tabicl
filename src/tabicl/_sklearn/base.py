@@ -177,7 +177,9 @@ class TabICLBaseEstimator(BaseEstimator):
 
         # Warn once if we are actually upcasting reduced-precision tensors
         if upcast_dtype is not None:
-            first_cache = next(iter(self.model_kv_cache_.values()))
+            first_cache = next(iter(self.model_kv_cache_.values())) if isinstance(self.model_kv_cache_, dict) else next(
+                iter(self.model_kv_cache_[0].values())
+            )
             cache_dtype = next(iter(first_cache.col_cache.kv.values())).key.dtype
             if cache_dtype != torch.float32:
                 if self.device_.type in ("cpu", "mps"):
@@ -191,10 +193,16 @@ class TabICLBaseEstimator(BaseEstimator):
                     stacklevel=3,
                 )
 
-        device_cache = OrderedDict()
-        for method, cache in self.model_kv_cache_.items():
-            device_cache[method] = cache.to(self.device_, dtype=upcast_dtype)
-        self.model_kv_cache_ = device_cache
+        if isinstance(self.model_kv_cache_, dict):
+            device_cache = OrderedDict()
+            for method, cache in self.model_kv_cache_.items():
+                device_cache[method] = cache.to(self.device_, dtype=upcast_dtype)
+            self.model_kv_cache_ = device_cache
+        else:
+            self.model_kv_cache_ = [
+                OrderedDict((method, cache.to(self.device_, dtype=upcast_dtype)) for method, cache in subset.items())
+                for subset in self.model_kv_cache_
+            ]
 
     def __getstate__(self):
         """Customize pickle serialization.
@@ -253,10 +261,16 @@ class TabICLBaseEstimator(BaseEstimator):
 
         # Handle KV cache
         if save_kv_cache and state.get("model_kv_cache_") is not None:
-            cpu_cache = OrderedDict()
-            for method, cache in state["model_kv_cache_"].items():
-                cpu_cache[method] = cache.to("cpu")
-            state["model_kv_cache_"] = cpu_cache
+            if isinstance(state["model_kv_cache_"], dict):
+                cpu_cache = OrderedDict()
+                for method, cache in state["model_kv_cache_"].items():
+                    cpu_cache[method] = cache.to("cpu")
+                state["model_kv_cache_"] = cpu_cache
+            else:
+                state["model_kv_cache_"] = [
+                    OrderedDict((method, cache.to("cpu")) for method, cache in subset.items())
+                    for subset in state["model_kv_cache_"]
+                ]
         else:
             state["model_kv_cache_"] = None
 

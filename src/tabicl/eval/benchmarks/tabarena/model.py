@@ -116,6 +116,8 @@ class TabICLGraphModel(AbstractModelBase):
 		params["allow_auto_download"] = False
 		params["kv_cache"] = False
 		params["n_estimators"] = 1
+		params["feature_reduction"] = "ensemble"
+		params["n_components"] = 100
 		return params
 
 	def _fit(self, X: "pd.DataFrame", y: "pd.Series", **kwargs: Any) -> None:

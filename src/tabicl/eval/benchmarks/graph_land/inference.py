@@ -28,9 +28,6 @@ from tabicl import TabICLClassifier
 from tabicl._model.graph import SparseGraphBatch, SparseGraphSet
 from tabicl.eval.benchmarks.graph_land.dataset import Dataset
 
-MAX_FEATURES = 100
-
-
 def classification_tasks() -> list[tuple[str, str]]:
 	"""Return all unique classification datasets and their data sources."""
 	tasks: list[tuple[str, str]] = []
@@ -163,13 +160,8 @@ def evaluate_dataset(
 	started = time.perf_counter()
 	dataset = _load_dataset(name, split, data_dir, device="cpu")
 	_print_dataset_size(name, dataset)
-	if dataset.features.shape[1] > MAX_FEATURES:
-		print(
-			f"skipping {name}: dataset has {dataset.features.shape[1]} features "
-			f"(maximum supported by this benchmark is {MAX_FEATURES})"
-		)
-		return None
 	X_train, y_train, X_test, y_test = _masked_arrays(dataset)
+	print(f"n_labels: {len(np.unique(y_train))}, n_train: {X_train.shape[0]}, n_test: {X_test.shape[0]}")
 	train_mask = dataset.train_mask.detach().cpu().numpy().astype(bool)
 	test_mask = dataset.test_mask.detach().cpu().numpy().astype(bool)
 
@@ -183,6 +175,8 @@ def evaluate_dataset(
 		gat_mode=gat_mode,
 		gat_num_iterations=gat_num_iterations,
 		gat_entry_layer=gat_entry_layer,
+		feature_reduction="ensemble",
+		n_components=100,
 	)
 	classifier.fit(X_train, y_train)
 	graph_set = _dataset_graph_set(dataset, classifier, train_mask, test_mask)

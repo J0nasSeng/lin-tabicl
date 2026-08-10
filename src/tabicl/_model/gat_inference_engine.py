@@ -93,6 +93,7 @@ class GATInferenceEngine(nn.Module):
 
 		self.model_path_ = checkpoint_path
 		self.inference_config_ = InferenceConfig()
+		self.max_features = self.model.max_features
 
 		gat = self.model.icl_predictor.gat_icl
 		self.num_layers = len(gat.graph_blocks)
