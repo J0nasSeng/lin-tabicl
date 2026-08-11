@@ -301,7 +301,7 @@ class GraphAttentionBlock(nn.Module):
         x = self.norm2(x + self._ff_block(x))
         return x
 
-class GraphAttentionTransformer(nn.Module):
+class Graph2DAttentionTransformer(nn.Module):
     """Graph-column transformer with sparse graph attention and intra-row attention."""
 
     def __init__(
@@ -456,3 +456,105 @@ class GraphAttentionTransformer(nn.Module):
         if self.out_proj is None:
             return cls_out
         return self.out_proj(cls_out)
+
+
+class Graph1DAttentionTransformer(nn.Module):
+    """Sparse graph transformer for compressed ``(B, T, D)`` representations.
+
+    Unlike :class:`Graph2DAttentionTransformer`, this path has no feature
+    column axis and therefore performs only graph attention and the block FFN.
+    """
+
+    def __init__(
+        self,
+        num_blocks: int,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int,
+        dropout: float = 0.0,
+        activation: str | Callable[[Tensor], Tensor] = "gelu",
+        norm_first: bool = True,
+        bias_free_ln: bool = False,
+        recompute: bool = False,
+        learnable_residual: bool = False,
+        num_graphs: int = 1,
+        max_chunk_size: int | None = None,
+    ):
+        super().__init__()
+        self.graph_blocks = nn.ModuleList([
+            GraphAttentionBlock(
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                activation=activation,
+                norm_first=norm_first,
+                bias_free_ln=bias_free_ln,
+                learnable_residual=learnable_residual,
+                max_chunk_size=max_chunk_size,
+            )
+            for _ in range(num_blocks)
+        ])
+        if num_blocks <= 0:
+            raise ValueError("num_blocks must be positive")
+        if num_graphs <= 0 or num_blocks % num_graphs != 0:
+            raise ValueError("num_graphs must be positive and divide num_blocks")
+        self.recompute = recompute
+        self.num_graphs = num_graphs
+        self.layers_per_graph = num_blocks // num_graphs
+
+    @staticmethod
+    def _compact_edges(graph_set: "CompactGraphSet", batch_size: int, device: torch.device) -> list[Tensor]:
+        compact_edges = graph_set.edge_index.to(device=device, dtype=torch.long)
+        result = []
+        for graph_idx in range(graph_set.num_graphs):
+            starts = graph_set.edge_offsets[graph_idx, :-1].to(device=device, dtype=torch.long)
+            ends = graph_set.edge_offsets[graph_idx, 1:].to(device=device, dtype=torch.long)
+            lengths = ends - starts
+            if int(lengths.sum().item()) == 0:
+                result.append(compact_edges[:, :0])
+                continue
+            dataset_ids = torch.repeat_interleave(torch.arange(batch_size, device=device), lengths)
+            positions = torch.cat([
+                torch.arange(start, end, device=device)
+                for start, end in zip(starts.tolist(), ends.tolist())
+            ])
+            result.append(compact_edges[:, positions] + (dataset_ids * graph_set.num_nodes).unsqueeze(0))
+        return result
+
+    def forward(
+        self,
+        src: Tensor,
+        edge_index_batch: Sequence[Tensor] | None = None,
+        graph_set: "CompactGraphSet" | None = None,
+    ) -> Tensor:
+        if src.ndim != 3:
+            raise ValueError("Graph1DAttentionTransformer expects src with shape (B, T, D)")
+        batch_size, nodes, _ = src.shape
+        edge_index_is_global = graph_set is not None
+        if graph_set is not None:
+            if edge_index_batch is not None:
+                raise ValueError("Provide either graph_set or edge_index_batch, not both")
+            if graph_set.num_graphs != self.num_graphs or graph_set.num_datasets != batch_size:
+                raise ValueError("Compact graph dimensions do not match the transformer input")
+            if graph_set.num_nodes != nodes:
+                raise ValueError("Compact graph node count does not match the transformer input")
+            edge_index_batch = self._compact_edges(graph_set, batch_size, src.device)
+        if edge_index_batch is None or len(edge_index_batch) != self.num_graphs:
+            raise ValueError(f"Expected {self.num_graphs} graph batches")
+
+        out = src.unsqueeze(2)
+        for block_idx, block in enumerate(self.graph_blocks):
+            edges = edge_index_batch[block_idx // self.layers_per_graph]
+            if self.recompute:
+                out = checkpoint(
+                    partial(block, edge_index_batch=edges, edge_index_is_global=edge_index_is_global),
+                    out, use_reentrant=False,
+                )
+            else:
+                out = block(out, edge_index_batch=edges, edge_index_is_global=edge_index_is_global)
+        return out.squeeze(2)
+
+
+# Backwards-compatible name for the original alternating sample/column model.
+GraphAttentionTransformer = Graph2DAttentionTransformer

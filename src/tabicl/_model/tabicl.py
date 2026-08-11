@@ -7,6 +7,11 @@ from torch import nn, Tensor
 from .embedding import ColEmbedding
 from .interaction import RowInteraction
 from .learning import ICLearning
+
+
+GRAPH_2D_BACKENDS = ("graph", "graph-pyg", "graph-2d", "graph-2d-pyg")
+GRAPH_1D_BACKENDS = ("graph-1d", "graph-1d-pyg")
+GRAPH_BACKENDS = GRAPH_2D_BACKENDS + GRAPH_1D_BACKENDS
 from .graph import (
     CompactGraphSet,
     SparseGraphBatch,
@@ -180,7 +185,9 @@ class TabICL(nn.Module):
         row_rope_interleaved: bool = False,
         icl_num_blocks: int = 12,
         icl_nhead: int = 8,
-        icl_backend: Literal["encoder", "graph", "graph-pyg"] = "graph",
+        icl_backend: Literal[
+            "encoder", "graph", "graph-pyg", "graph-2d", "graph-2d-pyg", "graph-1d", "graph-1d-pyg"
+        ] = "graph",
         icl_decoder_type: Literal["mlp", "soft_kmeans", "rbf", "euclidean"] = "mlp",
         icl_soft_kmeans_temperature: float = 0.1,
         graph_min_train_neighbors: int = 8,
@@ -279,7 +286,7 @@ class TabICL(nn.Module):
             max_classes=max_classes,
             max_features=max_features,
             reserve_cls_tokens=row_num_cls,
-            enable_column_identity_rotation=icl_backend in ("graph", "graph-pyg"),
+            enable_column_identity_rotation=icl_backend in GRAPH_BACKENDS,
             ssmax=col_ssmax,
             recompute=recompute,
         )
@@ -402,7 +409,7 @@ class TabICL(nn.Module):
         )
 
         # Column-wise embedding -> Row-wise interaction (encoder backend)
-        if self.icl_backend == "encoder":
+        if self.icl_backend not in GRAPH_2D_BACKENDS:
             representations = self.row_interactor(col_embeddings, d=d)
             icl_input = representations
         else:
@@ -420,8 +427,8 @@ class TabICL(nn.Module):
             icl_input,
             y_train=y_train,
             return_pre_decoder_repr=return_pre_decoder_repr,
-            pre_col_embeddings=pre_col_embeddings if self.icl_backend in ("graph", "graph-pyg") else None,
-            base_col_embeddings=col_embeddings if self.icl_backend in ("graph", "graph-pyg") else None,
+            pre_col_embeddings=pre_col_embeddings if self.icl_backend in GRAPH_2D_BACKENDS else None,
+            base_col_embeddings=col_embeddings if self.icl_backend in GRAPH_2D_BACKENDS else None,
             graph_set=graph_set,
         )
 
@@ -486,7 +493,7 @@ class TabICL(nn.Module):
         if inference_config is None:
             inference_config = InferenceConfig()
 
-        if self.icl_backend in ("graph", "graph-pyg") and len(torch.unique(y_train[0])) > self.max_classes:
+        if self.icl_backend in GRAPH_2D_BACKENDS and len(torch.unique(y_train[0])) > self.max_classes:
             probabilities = self._graph_hierarchical_inference(
                 X=X,
                 y_train=y_train,
@@ -507,7 +514,7 @@ class TabICL(nn.Module):
             mgr_config=inference_config.COL_CONFIG,
         )
 
-        if self.icl_backend == "encoder":
+        if self.icl_backend not in GRAPH_2D_BACKENDS:
             icl_input = self.row_interactor(col_embeddings, mgr_config=inference_config.ROW_CONFIG)
         else:
             pre_col_embeddings = self.col_embedder.project_input(X)
@@ -526,8 +533,8 @@ class TabICL(nn.Module):
             return_logits=return_logits,
             softmax_temperature=softmax_temperature,
             mgr_config=inference_config.ICL_CONFIG,
-            pre_col_embeddings=pre_col_embeddings if self.icl_backend in ("graph", "graph-pyg") else None,
-            base_col_embeddings=col_embeddings if self.icl_backend in ("graph", "graph-pyg") else None,
+            pre_col_embeddings=pre_col_embeddings if self.icl_backend in GRAPH_2D_BACKENDS else None,
+            base_col_embeddings=col_embeddings if self.icl_backend in GRAPH_2D_BACKENDS else None,
             graph_set=graph_set,
         )
 

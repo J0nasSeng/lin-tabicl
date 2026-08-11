@@ -266,7 +266,9 @@ def build_parser():
         "--icl_backend",
         type=str,
         default="graph",
-        choices=["encoder", "graph", "graph-pyg"],
+        choices=[
+            "encoder", "graph", "graph-pyg", "graph-2d", "graph-2d-pyg", "graph-1d", "graph-1d-pyg"
+        ],
         help="ICL backbone type: encoder, legacy graph, or PyTorch Geometric graph",
     )
     parser.add_argument(

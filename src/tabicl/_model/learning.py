@@ -9,8 +9,19 @@ import torch.nn.functional as F
 
 from .layers import ClassNode, OneHotAndLinear
 from .encoders import Encoder
-from .gat import GraphAttentionTransformer
-from .gat_pyg import GraphAttentionTransformer as PyGGraphAttentionTransformer
+from .gat import (
+    Graph2DAttentionTransformer,
+    Graph1DAttentionTransformer,
+)
+from .gat_pyg import (
+    Graph2DAttentionTransformer as PyGGraph2DAttentionTransformer,
+    Graph1DAttentionTransformer as PyGGraph1DAttentionTransformer,
+)
+
+
+GRAPH_BACKENDS = ("graph", "graph-pyg", "graph-2d", "graph-2d-pyg", "graph-1d", "graph-1d-pyg")
+GRAPH_2D_BACKENDS = ("graph", "graph-pyg", "graph-2d", "graph-2d-pyg")
+GRAPH_1D_BACKENDS = ("graph-1d", "graph-1d-pyg")
 from .graph import (
     CompactGraphSet,
     SparseGraphBatch,
@@ -95,7 +106,9 @@ class ICLearning(nn.Module):
         bias_free_ln: bool = False,
         ssmax: Union[bool, str] = False,
         recompute: bool = False,
-        icl_backend: Literal["encoder", "graph"] = "graph",
+        icl_backend: Literal[
+            "encoder", "graph", "graph-pyg", "graph-2d", "graph-2d-pyg", "graph-1d", "graph-1d-pyg"
+        ] = "graph",
         graph_min_train_neighbors: int = 8,
         graph_max_train_neighbors: int = 15,
         graph_cross_label_fraction: float = 0.1,
@@ -131,9 +144,12 @@ class ICLearning(nn.Module):
         self.learnable_residual = bool(learnable_residual)
         self.graph_max_chunk_size = graph_max_chunk_size
 
-        if self.icl_backend not in ("encoder", "graph", "graph-pyg"):
+        valid_backends = (
+            "encoder", "graph", "graph-pyg", "graph-2d", "graph-2d-pyg", "graph-1d", "graph-1d-pyg"
+        )
+        if self.icl_backend not in valid_backends:
             raise ValueError(
-                f"Unknown icl_backend={self.icl_backend}. Expected 'encoder', 'graph', or 'graph-pyg'."
+                f"Unknown icl_backend={self.icl_backend}. Expected one of {valid_backends}."
             )
 
         if self.decoder_type not in ("mlp", "soft_kmeans", "rbf", "euclidean"):
@@ -147,7 +163,7 @@ class ICLearning(nn.Module):
         if self.graph_num_graphs <= 0:
             raise ValueError("graph_num_graphs must be positive")
 
-        if self.icl_backend in ("graph", "graph-pyg") and max_classes <= 0:
+        if self.icl_backend in GRAPH_BACKENDS and max_classes <= 0:
             raise ValueError("Graph ICL backend is currently supported for classification only (max_classes > 0).")
 
         if self.icl_backend == "encoder":
@@ -164,34 +180,53 @@ class ICLearning(nn.Module):
                 recompute=recompute,
             )
         else:
-            if d_model % self.graph_num_cls != 0:
+            is_1d = self.icl_backend in GRAPH_1D_BACKENDS
+            is_pyg = self.icl_backend in ("graph-pyg", "graph-2d-pyg", "graph-1d-pyg")
+            if not is_1d and d_model % self.graph_num_cls != 0:
                 raise ValueError(
                     f"d_model ({d_model}) must be divisible by graph_num_cls ({self.graph_num_cls}) for graph path"
                 )
-            self.graph_col_dim = d_model // self.graph_num_cls
+            self.graph_col_dim = d_model // self.graph_num_cls if not is_1d else d_model
             self.graph_cls_tokens = nn.Parameter(torch.empty(self.graph_num_cls, self.graph_col_dim))
             nn.init.trunc_normal_(self.graph_cls_tokens, std=0.02)
             gat_class = (
-                PyGGraphAttentionTransformer
-                if self.icl_backend == "graph-pyg"
-                else GraphAttentionTransformer
+                PyGGraph1DAttentionTransformer if is_pyg and is_1d else
+                PyGGraph2DAttentionTransformer if is_pyg else
+                Graph1DAttentionTransformer if is_1d else
+                Graph2DAttentionTransformer
             )
-            self.gat_icl = gat_class(
-                num_blocks=num_blocks,
-                d_model=self.graph_col_dim,
-                nhead=nhead,
-                dim_feedforward=max(self.graph_col_dim * 2, dim_feedforward // max(self.graph_num_cls, 1)),
-                dropout=dropout,
-                activation=activation,
-                norm_first=norm_first,
-                bias_free_ln=bias_free_ln,
-                recompute=recompute,
-                num_output_cls=self.graph_num_cls,
-                out_dim=d_model,
-                learnable_residual=self.learnable_residual,
-                num_graphs=self.graph_num_graphs,
-                max_chunk_size=self.graph_max_chunk_size,
-            )
+            if is_1d:
+                self.gat_icl = gat_class(
+                    num_blocks=num_blocks,
+                    d_model=d_model,
+                    nhead=nhead,
+                    dim_feedforward=dim_feedforward,
+                    dropout=dropout,
+                    activation=activation,
+                    norm_first=norm_first,
+                    bias_free_ln=bias_free_ln,
+                    recompute=recompute,
+                    learnable_residual=self.learnable_residual,
+                    num_graphs=self.graph_num_graphs,
+                    max_chunk_size=self.graph_max_chunk_size,
+                )
+            else:
+                self.gat_icl = gat_class(
+                    num_blocks=num_blocks,
+                    d_model=self.graph_col_dim,
+                    nhead=nhead,
+                    dim_feedforward=max(self.graph_col_dim * 2, dim_feedforward // max(self.graph_num_cls, 1)),
+                    dropout=dropout,
+                    activation=activation,
+                    norm_first=norm_first,
+                    bias_free_ln=bias_free_ln,
+                    recompute=recompute,
+                    num_output_cls=self.graph_num_cls,
+                    out_dim=d_model,
+                    learnable_residual=self.learnable_residual,
+                    num_graphs=self.graph_num_graphs,
+                    max_chunk_size=self.graph_max_chunk_size,
+                )
         if self.norm_first:
             self.ln = nn.LayerNorm(d_model, bias=not bias_free_ln)
 
@@ -527,7 +562,7 @@ class ICLearning(nn.Module):
             Graph-ready tensor of shape (B, T, C + graph_num_cls, D).
         """
 
-        if self.icl_backend not in ("graph", "graph-pyg"):
+        if self.icl_backend not in GRAPH_2D_BACKENDS:
             raise ValueError("prepare_graph_input is supported only for graph ICL backend")
         if col_embeddings.ndim != 4:
             raise ValueError("col_embeddings must have shape (B, T, C, D)")
@@ -587,7 +622,15 @@ class ICLearning(nn.Module):
         """
 
         train_size = y_train.shape[1]
-        if self.icl_backend in ("graph", "graph-pyg"):
+        if self.icl_backend in GRAPH_1D_BACKENDS:
+            if R.ndim != 3:
+                raise ValueError("Graph 1D backend expects R with shape (B, T, D).")
+            if self.max_classes > 0:
+                R[:, :train_size] = R[:, :train_size] + self.y_encoder(y_train.float())
+            else:
+                R[:, :train_size] = R[:, :train_size] + self.y_encoder(y_train.unsqueeze(-1))
+            src = self.gat_icl(R, graph_set=graph_set)
+        elif self.icl_backend in GRAPH_2D_BACKENDS:
             if R.ndim != 4:
                 raise ValueError(
                     "Graph backend expects R with shape (B, T, C, D). "
@@ -650,7 +693,7 @@ class ICLearning(nn.Module):
         softmax_temperature: float = 0.9,
     ) -> Tensor:
         """Run hierarchy inference with a local graph label encoding per node."""
-        if self.icl_backend not in ("graph", "graph-pyg"):
+        if self.icl_backend not in GRAPH_BACKENDS:
             raise ValueError("Graph hierarchical inference requires the graph backend")
         if base_col_embeddings.ndim != 4:
             raise ValueError("base_col_embeddings must have shape (B, T, C, D)")
@@ -1125,7 +1168,7 @@ class ICLearning(nn.Module):
             Predictions of shape (B, T, out_dim).
         """
 
-        if self.icl_backend in ("graph", "graph-pyg"):
+        if self.icl_backend in GRAPH_BACKENDS:
             raise ValueError("Representation-cache path is not supported for graph ICL backend.")
         if self.decoder_type != "mlp":
             raise ValueError("Representation-cache path currently supports decoder_type='mlp' only.")
@@ -1184,7 +1227,7 @@ class ICLearning(nn.Module):
                 If return_logits=False: Probabilities of shape (B, test_size, num_classes)
         """
 
-        if self.icl_backend in ("graph", "graph-pyg"):
+        if self.icl_backend in GRAPH_BACKENDS:
             raise ValueError("Representation-cache path is not supported for graph ICL backend.")
 
         if mgr_config is None:
@@ -1241,7 +1284,7 @@ class ICLearning(nn.Module):
             - For regression (max_classes=0): out_dim = num_quantiles
             - For classification (max_classes>0): out_dim = max_classes
         """
-        if self.icl_backend in ("graph", "graph-pyg"):
+        if self.icl_backend in GRAPH_BACKENDS:
             raise ValueError("KV cache path is not supported for graph ICL backend.")
         if self.decoder_type != "mlp":
             raise ValueError("KV cache path currently supports decoder_type='mlp' only.")
@@ -1330,7 +1373,7 @@ class ICLearning(nn.Module):
                 If return_logits=False: Probabilities of shape (B, test_size, num_classes)
         """
 
-        if self.icl_backend in ("graph", "graph-pyg"):
+        if self.icl_backend in GRAPH_BACKENDS:
             raise ValueError("KV cache path is not supported for graph ICL backend.")
 
         if use_col_embeddings:

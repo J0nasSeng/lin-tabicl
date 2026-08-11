@@ -39,6 +39,9 @@ except ImportError:
 from tabicl._model.tabicl import TabICL
 from tabicl._model.nanotabicl import NanoTabICLv2
 from tabicl._model.graph import CompactGraphSet, slice_graph_sets
+
+
+GRAPH_BACKENDS = {"graph", "graph-pyg", "graph-2d", "graph-2d-pyg", "graph-1d", "graph-1d-pyg"}
 from tabicl.prior._dataset import PriorDataset
 from tabicl.prior._genload import LoadPriorDataset
 from tabicl.train._optim import get_scheduler
@@ -419,7 +422,7 @@ class Trainer:
                 device=self.config.prior_device,
                 n_jobs=1,  # Set to 1 to avoid nested parallelism during DDP
                 normalization=getattr(self.config, "normalization", "none"),
-                graph_backend=getattr(self.config, "icl_backend", None) == "graph",
+                graph_backend=getattr(self.config, "icl_backend", None) in GRAPH_BACKENDS,
                 graph_num_graphs=getattr(self.config, "graph_num_graphs", None) or self.config.icl_num_blocks,
                 graph_min_train_neighbors=self.config.graph_min_train_neighbors,
                 graph_max_train_neighbors=self.config.graph_max_train_neighbors,
@@ -442,7 +445,7 @@ class Trainer:
             delete_after_load=(self.config.delete_after_load if not is_validation else False),
             device=self.config.prior_device,
             normalization=getattr(self.config, "normalization", "none"),
-            graph_backend=getattr(self.config, "icl_backend", None) == "graph",
+            graph_backend=getattr(self.config, "icl_backend", None) in GRAPH_BACKENDS,
         )
 
     def _build_prior_dataloader(self, dataset):
@@ -1160,7 +1163,7 @@ class Trainer:
             entropy_weight = float(getattr(self.config, "entropy_weight", 0.0))
             capture_pre_decoder_repr = collect_artifacts or (supcon_weight > 0)
             model_kwargs = {"return_pre_decoder_repr": capture_pre_decoder_repr}
-            if getattr(self.raw_model, "icl_backend", None) == "graph":
+            if getattr(self.raw_model, "icl_backend", None) in GRAPH_BACKENDS:
                 if graph_set is None:
                     raise ValueError("Graph backend requires precomputed graph metadata in the prior batch")
                 model_kwargs["graph_set"] = graph_set

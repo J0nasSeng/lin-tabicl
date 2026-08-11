@@ -84,8 +84,8 @@ class GATInferenceEngine(nn.Module):
 			config["learnable_residual"] = any(
 				key.endswith("attn.alpha") for key in checkpoint["state_dict"]
 			)
-		if config.get("icl_backend", "graph") not in {"graph", "graph-pyg"}:
-			raise ValueError("GATInferenceEngine requires a graph or graph-pyg checkpoint.")
+		if config.get("icl_backend", "graph") not in {"graph", "graph-pyg", "graph-2d", "graph-2d-pyg"}:
+			raise ValueError("GATInferenceEngine requires a 2D graph checkpoint.")
 
 		self.model_config_ = config
 		self.model = TabICL(**config)
