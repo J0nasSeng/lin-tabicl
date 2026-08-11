@@ -180,7 +180,7 @@ class TabICL(nn.Module):
         row_rope_interleaved: bool = False,
         icl_num_blocks: int = 12,
         icl_nhead: int = 8,
-        icl_backend: Literal["encoder", "graph"] = "graph",
+        icl_backend: Literal["encoder", "graph", "graph-pyg"] = "graph",
         icl_decoder_type: Literal["mlp", "soft_kmeans", "rbf", "euclidean"] = "mlp",
         icl_soft_kmeans_temperature: float = 0.1,
         graph_min_train_neighbors: int = 8,
@@ -279,7 +279,7 @@ class TabICL(nn.Module):
             max_classes=max_classes,
             max_features=max_features,
             reserve_cls_tokens=row_num_cls,
-            enable_column_identity_rotation=icl_backend == "graph",
+            enable_column_identity_rotation=icl_backend in ("graph", "graph-pyg"),
             ssmax=col_ssmax,
             recompute=recompute,
         )
@@ -420,8 +420,8 @@ class TabICL(nn.Module):
             icl_input,
             y_train=y_train,
             return_pre_decoder_repr=return_pre_decoder_repr,
-            pre_col_embeddings=pre_col_embeddings if self.icl_backend == "graph" else None,
-            base_col_embeddings=col_embeddings if self.icl_backend == "graph" else None,
+            pre_col_embeddings=pre_col_embeddings if self.icl_backend in ("graph", "graph-pyg") else None,
+            base_col_embeddings=col_embeddings if self.icl_backend in ("graph", "graph-pyg") else None,
             graph_set=graph_set,
         )
 
@@ -486,7 +486,7 @@ class TabICL(nn.Module):
         if inference_config is None:
             inference_config = InferenceConfig()
 
-        if self.icl_backend == "graph" and len(torch.unique(y_train[0])) > self.max_classes:
+        if self.icl_backend in ("graph", "graph-pyg") and len(torch.unique(y_train[0])) > self.max_classes:
             probabilities = self._graph_hierarchical_inference(
                 X=X,
                 y_train=y_train,
@@ -526,8 +526,8 @@ class TabICL(nn.Module):
             return_logits=return_logits,
             softmax_temperature=softmax_temperature,
             mgr_config=inference_config.ICL_CONFIG,
-            pre_col_embeddings=pre_col_embeddings if self.icl_backend == "graph" else None,
-            base_col_embeddings=col_embeddings if self.icl_backend == "graph" else None,
+            pre_col_embeddings=pre_col_embeddings if self.icl_backend in ("graph", "graph-pyg") else None,
+            base_col_embeddings=col_embeddings if self.icl_backend in ("graph", "graph-pyg") else None,
             graph_set=graph_set,
         )
 

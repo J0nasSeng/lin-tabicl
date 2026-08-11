@@ -19,6 +19,7 @@ from .graph import (
 from .inference_config import InferenceConfig
 from .tabicl import TabICL
 from .gat import GraphMultiheadAttention
+from .gat_pyg import GraphMultiheadAttention as PyGGraphMultiheadAttention
 
 
 class GATInferenceEngine(nn.Module):
@@ -83,8 +84,8 @@ class GATInferenceEngine(nn.Module):
 			config["learnable_residual"] = any(
 				key.endswith("attn.alpha") for key in checkpoint["state_dict"]
 			)
-		if config.get("icl_backend", "graph") != "graph":
-			raise ValueError("GATInferenceEngine requires a checkpoint with icl_backend='graph'.")
+		if config.get("icl_backend", "graph") not in {"graph", "graph-pyg"}:
+			raise ValueError("GATInferenceEngine requires a graph or graph-pyg checkpoint.")
 
 		self.model_config_ = config
 		self.model = TabICL(**config)
@@ -93,7 +94,7 @@ class GATInferenceEngine(nn.Module):
 			if max_chunk_size <= 0:
 				raise ValueError("max_chunk_size must be > 0 when provided")
 			for module in self.model.modules():
-				if isinstance(module, GraphMultiheadAttention):
+				if isinstance(module, (GraphMultiheadAttention, PyGGraphMultiheadAttention)):
 					module.max_chunk_size = int(max_chunk_size)
 		self.model.to(self.device_).eval()
 		for parameter in self.model.parameters():

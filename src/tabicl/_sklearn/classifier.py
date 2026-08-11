@@ -435,7 +435,7 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
         assert "state_dict" in checkpoint, "The checkpoint doesn't contain the model state."
 
         self.model_path_ = model_path_
-        if checkpoint["config"].get("icl_backend", "encoder") == "graph":
+        if checkpoint["config"].get("icl_backend", "encoder") in {"graph", "graph-pyg"}:
             if self.kv_cache:
                 raise ValueError("KV caching is not currently supported for graph-backend inference.")
             self.model_ = GATInferenceEngine(
