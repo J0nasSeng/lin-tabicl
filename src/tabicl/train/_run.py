@@ -38,7 +38,6 @@ except ImportError:
 
 from tabicl._model.tabicl import TabICL
 from tabicl._model.nanotabicl import NanoTabICLv2
-from tabicl._model.graph import CompactGraphSet, slice_graph_sets
 
 
 GRAPH_BACKENDS = {"graph", "graph-pyg", "graph-2d", "graph-2d-pyg", "graph-1d", "graph-1d-pyg"}
@@ -46,7 +45,6 @@ from tabicl.prior._dataset import PriorDataset
 from tabicl.prior._genload import LoadPriorDataset
 from tabicl.train._optim import get_scheduler
 from tabicl.train._losses import entropy_regularizer, supervised_contrastive_loss
-from tabicl.train._scheduled_dataloader import ScheduledDataLoader, parse_step_size_schedule
 from tabicl.train._train_config import build_parser
 from tabicl.train._umap_logging import build_test_umap_wandb_images
 from rtpt import RTPT
@@ -145,15 +143,15 @@ class Trainer:
 
     def __init__(self, config):
         self.config = config
-        if getattr(self.config, "gradient_accum", 1) <= 0:
-            raise ValueError("--gradient_accum must be a positive integer")
-        if not hasattr(self.config, "gradient_accum"):
-            self.config.gradient_accum = 1
-        self._gradient_accum_count = 0
         self.train_col_embed_only = bool(getattr(config, "train_col_embed_only", False))
         if self.train_col_embed_only:
             self._validate_column_embedding_only_mode()
         self.configure_ddp()
+        if self.config.batch_size <= 0 or self.config.micro_batch_size <= 0:
+            raise ValueError("batch_size and micro_batch_size must be positive")
+        if self.config.batch_size % self.config.micro_batch_size != 0:
+            raise ValueError("batch_size must be divisible by micro_batch_size")
+        self.accumulation_steps = self.config.batch_size // self.config.micro_batch_size
         self.build_model()
         self.configure_prior()
         self.configure_optimizer()
@@ -406,7 +404,7 @@ class Trainer:
 
         if self.config.prior_dir is None:
             return PriorDataset(
-                batch_size=self.config.batch_size,
+                batch_size=self.config.micro_batch_size,
                 batch_size_per_gp=self.config.batch_size_per_gp,
                 min_features=self.config.min_features,
                 max_features=self.config.max_features,
@@ -438,7 +436,7 @@ class Trainer:
         start_from = self.config.load_prior_start + (val_start_offset if is_validation else 0)
         return LoadPriorDataset(
             data_dir=self.config.prior_dir,
-            batch_size=self.config.batch_size,
+            batch_size=self.config.micro_batch_size,
             ddp_world_size=self.ddp_world_size,
             ddp_rank=self.ddp_rank,
             start_from=start_from,
@@ -470,24 +468,6 @@ class Trainer:
             print(train_dataset)
 
         self.train_dataloader = self._build_prior_dataloader(train_dataset)
-        #loader_schedule = parse_step_size_schedule(
-        #    steps_csv=self.config.scheduled_loader_steps,
-        #    sizes_csv=self.config.scheduled_loader_sizes,
-        #)
-        #if self.config.micro_batch_size != self.config.batch_size_per_gp and self.master_process:
-        #    warnings.warn(
-        #        "micro_batch_size != batch_size_per_gp: ScheduledDataLoader will preserve prior groups in each "
-        #        "returned batch, but trainer micro-batch splits may still mix groups.",
-        #        stacklevel=2,
-        #    )
-        #self.train_dataloader = ScheduledDataLoader(
-        #    dataloader=train_dataloader,
-        #    batch_size=self.config.batch_size,
-        #    batch_size_per_gp=self.config.batch_size_per_gp,
-        #    schedule=loader_schedule,
-        #    step_getter=lambda: self.curr_step,
-        #    seed=self.config.np_seed + self.ddp_rank,
-        #)
         self.val_dataloader = self._build_prior_dataloader(val_dataset)
 
     def configure_optimizer(self):
@@ -713,26 +693,14 @@ class Trainer:
         train_dataloader = iter(self.train_dataloader)
         val_dataloader = iter(self.val_dataloader)
         for step in step_progress:
-            # Get the next batch
-            with Timer() as prior_timer:
-                try:
-                    batch = next(train_dataloader)
-                except StopIteration:
-                    train_dataloader = iter(self.train_dataloader)
-                    batch = next(train_dataloader)
-            prior_time = prior_timer.elapsed
-
-            # Train the model on the batch
+            # Consume a logical batch as a stream of prefetched micro-batches.
             with Timer() as train_timer:
-                results = self.run_batch(batch)
+                results, prior_time, train_dataloader = self.run_batch(train_dataloader)
 
                 if self._should_log_conf_mat_now():
-                    try:
-                        val_batch = next(val_dataloader)
-                    except StopIteration:
-                        val_dataloader = iter(self.val_dataloader)
-                        val_batch = next(val_dataloader)
-                    results.update(self.run_validation_logging_batch(val_batch))
+                    val_results, val_prior_time, val_dataloader = self.run_validation_logging_batch(val_dataloader)
+                    results.update(val_results)
+                    results["val_prior_time"] = val_prior_time
             train_time = train_timer.elapsed
 
             # Clear CUDA cache to free memory
@@ -807,23 +775,6 @@ class Trainer:
             t.to_padded_tensor(padding=0.0) if hasattr(t, "is_nested") and t.is_nested else t
             for t in batch
         ]
-
-    def _split_micro_batches(self, batch):
-        num_micro_batches = math.ceil(self.config.batch_size / self.config.micro_batch_size)
-        graph_mode = len(batch) == 6
-        tensor_fields = batch[:-1] if graph_mode else batch
-        tensor_splits = [torch.split(t, self.config.micro_batch_size, dim=0) for t in tensor_fields]
-        micro_batches = [tuple(parts) for parts in zip(*tensor_splits)]
-        if graph_mode:
-            graph_payload = batch[-1]
-            if not isinstance(graph_payload, CompactGraphSet):
-                raise TypeError("Graph batches must use CompactGraphSet")
-            graph_splits = [
-                slice_graph_sets(graph_payload, slice(start, start + self.config.micro_batch_size))
-                for start in range(0, graph_payload.num_datasets, self.config.micro_batch_size)
-            ]
-            micro_batches = [parts + (graphs,) for parts, graphs in zip(micro_batches, graph_splits)]
-        return num_micro_batches, micro_batches
 
     def _prepare_micro_batch_tensors(self, micro_batch):
         micro_X, micro_y, micro_d, micro_seq_len, micro_train_size = micro_batch[:5]
@@ -1263,54 +1214,37 @@ class Trainer:
 
         return micro_results
 
-    def run_batch(self, batch):
-        """Train the model on a batch of datasets.
-
-        Handles gradient accumulation by splitting the batch into micro-batches.
-        Supports variable-sized datasets by padding. Skips micro-batches on CUDA
-        OOM errors. Updates model parameters and returns loss and accuracy metrics.
-
-        Parameters
-        ----------
-        batch : tuple
-            Contains tensors (X, y, d, seq_len, train_size) for the batch.
-            X and y can be Tensors or NestedTensors (for variable sequence
-            lengths).
-
-        Returns
-        -------
-        dict
-            Dictionary containing 'ce' (cross-entropy loss) and 'accuracy'.
-
-        Raises
-        ------
-        RuntimeError
-            If more than 10% of micro-batches fail due to OOM errors.
-        """
+    def run_batch(self, dataloader_iterator):
+        """Run one logical batch from streamed micro-batches and update once."""
         self.model.train()
-        accumulation_steps = self.config.gradient_accum
-        is_accumulation_start = self._gradient_accum_count == 0
-        if is_accumulation_start:
-            self.optimizer.zero_grad(set_to_none=True)
-
-        batch = self._prepare_padded_batch(batch)
-        num_micro_batches, micro_batches = self._split_micro_batches(batch)
+        self.optimizer.zero_grad(set_to_none=True)
 
         results = {"ce": 0.0, "accuracy": 0.0}
-        failed_batches = 0
+        prior_time = 0.0
 
-        for idx, micro_batch in enumerate(micro_batches):
+        for idx in range(self.accumulation_steps):
+            with Timer() as prior_timer:
+                try:
+                    micro_batch = next(dataloader_iterator)
+                except StopIteration:
+                    dataloader_iterator = iter(self.train_dataloader)
+                    micro_batch = next(dataloader_iterator)
+            prior_time += prior_timer.elapsed
+            micro_batch = self._prepare_padded_batch(micro_batch)
+            if micro_batch[0].shape[0] != self.config.micro_batch_size:
+                raise RuntimeError(
+                    f"DataLoader returned {micro_batch[0].shape[0]} datasets; "
+                    f"expected micro_batch_size={self.config.micro_batch_size}"
+                )
             try:
                 micro_results = self.run_micro_batch(
                     micro_batch,
                     idx,
-                    num_micro_batches,
+                    self.accumulation_steps,
                     collect_artifacts=False,
                     do_backward=True,
-                    sync_gradients=(
-                        self._gradient_accum_count == accumulation_steps - 1
-                    ),
-                    accumulation_divisor=accumulation_steps,
+                    sync_gradients=idx == self.accumulation_steps - 1,
+                    accumulation_divisor=self.accumulation_steps,
                 )
                 for k, v in micro_results.items():
                     if k in {
@@ -1323,38 +1257,26 @@ class Trainer:
                     if k not in results:
                         results[k] = 0.0
                     results[k] += v
-            except torch.cuda.OutOfMemoryError:
+            except torch.cuda.OutOfMemoryError as exc:
                 print(
-                    f"Warning: OOM error in micro-batch {idx+1}/{num_micro_batches} at step {self.curr_step}. Skipping."
+                    f"Warning: OOM error in micro-batch {idx+1}/{self.accumulation_steps} "
+                    f"at step {self.curr_step}; aborting logical step."
                 )
                 torch.cuda.empty_cache()
-                failed_batches += 1
-                continue
+                self.optimizer.zero_grad(set_to_none=True)
+                raise RuntimeError("A logical batch failed due to CUDA OOM") from exc
 
-        failure_ratio = failed_batches / num_micro_batches
-        if failure_ratio > 0.1:
-            raise RuntimeError(
-                f"({failure_ratio:.1%}) of micro-batches failed due to OOM at step {self.curr_step}. "
-                f"Please check configuration to reduce memory consumption."
-            )
+        results["grad_norm"] = self._apply_optimizer_updates()
+        return results, prior_time, dataloader_iterator
 
-        self._gradient_accum_count += 1
-        if self._gradient_accum_count == accumulation_steps:
-            results["grad_norm"] = self._apply_optimizer_updates()
-            self._gradient_accum_count = 0
-
-        return results
-
-    def run_validation_logging_batch(self, batch):
-        """Run no-grad validation logging/evaluation on a fresh prior batch."""
+    def run_validation_logging_batch(self, dataloader_iterator):
+        """Evaluate one logical validation batch from streamed micro-batches."""
 
         was_training = self.model.training
         self.model.eval()
 
-        batch = self._prepare_padded_batch(batch)
-        num_micro_batches, micro_batches = self._split_micro_batches(batch)
-
         results = {"val_ce": 0.0, "val_accuracy": 0.0}
+        prior_time = 0.0
         payload_state = {
             "confusion_y_true_payload": [],
             "confusion_y_pred_payload": [],
@@ -1365,11 +1287,19 @@ class Trainer:
         }
 
         with torch.no_grad():
-            for idx, micro_batch in enumerate(micro_batches):
+            for idx in range(self.accumulation_steps):
+                with Timer() as prior_timer:
+                    try:
+                        micro_batch = next(dataloader_iterator)
+                    except StopIteration:
+                        dataloader_iterator = iter(self.val_dataloader)
+                        micro_batch = next(dataloader_iterator)
+                prior_time += prior_timer.elapsed
+                micro_batch = self._prepare_padded_batch(micro_batch)
                 micro_results = self.run_micro_batch(
                     micro_batch,
                     idx,
-                    num_micro_batches,
+                    self.accumulation_steps,
                     collect_artifacts=True,
                     dataset_results_to_log=payload_state["dataset_results_remaining"],
                     dataset_results_start_index=payload_state["dataset_results_next_index"],
@@ -1392,7 +1322,7 @@ class Trainer:
         if was_training:
             self.model.train()
 
-        return results
+        return results, prior_time, dataloader_iterator
 
 
 if __name__ == "__main__":

@@ -58,27 +58,17 @@ def build_parser():
     parser.add_argument("--np_seed", type=int, default=42, help="Random seed for numpy")
     parser.add_argument("--torch_seed", type=int, default=42, help="Random seed for torch")
     parser.add_argument("--max_steps", type=int, default=60000, help="Training steps")
-    parser.add_argument("--batch_size", type=int, default=512, help="Batch size")
     parser.add_argument(
-        "--micro_batch_size", type=int, default=8, help="Size of micro-batches for gradient accumulation"
-    )
-    parser.add_argument(
-        "--gradient_accum",
+        "--batch_size",
         type=int,
-        default=1,
-        help="Number of generated batches to accumulate before an optimizer update",
+        default=512,
+        help="Logical number of datasets processed per optimizer update",
     )
     parser.add_argument(
-        "--scheduled_loader_steps",
-        type=str,
-        default="0",
-        help="Comma-separated schedule steps for train reservoir loader (must start with 0)",
-    )
-    parser.add_argument(
-        "--scheduled_loader_sizes",
-        type=str,
-        default="inf",
-        help="Comma-separated schedule sizes (positive ints or inf). Must include inf.",
+        "--micro_batch_size",
+        type=int,
+        default=8,
+        help="Number of datasets generated and processed per DataLoader item",
     )
     parser.add_argument(
         "--log_conf_mat_every",

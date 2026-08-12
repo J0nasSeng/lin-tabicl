@@ -47,7 +47,6 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --max_steps 2000 \
             --batch_size 8 \
             --micro_batch_size 1 \
-            --gradient_accum 64 \
             --log_conf_mat_every ${LOG_CONF_MAT_EVERY} \
             --lr 2e-5 \
             --supcon_weight 0.1 \

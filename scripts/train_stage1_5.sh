@@ -87,8 +87,6 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --graph_num_graphs 6 \
             --recompute False \
             --train_col_embed_only True \
-            #--scheduled_loader_steps 0,300,600,1000,2000 \
-            #--scheduled_loader_sizes 64,256,1024,2048,inf
             #--model_type nanotabicl
 
 

@@ -387,12 +387,19 @@ class LoadPriorDataset(IterableDataset):
             self.buffer_graph_sets = graph_sets
             self.buffer_size = file_batch_size
 
-        # Keep loading files until we have enough data or no more files
+        # Keep loading files until we have a complete streamed micro-batch.
         while self.buffer_size < self.batch_size:
             # Check if we've reached max_batches
             if self.max_batches is not None and self.current_idx >= self.max_batches:
-                # If we can't get a full batch, return what we have
-                break
+                # Do not expose a partial item at finite stream exhaustion.
+                self.buffer_X = None
+                self.buffer_y = None
+                self.buffer_d = None
+                self.buffer_seq_lens = None
+                self.buffer_train_sizes = None
+                self.buffer_graph_sets = None
+                self.buffer_size = 0
+                raise StopIteration
 
             try:
                 # Load another batch and append to buffer
@@ -427,12 +434,16 @@ class LoadPriorDataset(IterableDataset):
                             self.buffer_graph_sets.extend(graph_sets or [])
                     self.buffer_size += file_batch_size
             except Exception as e:
-                # If we can't load more files, use what we have
-                print(f"Warning: Could not load more files: {str(e)}")
-                break
+                if self.max_batches is not None and self.current_idx >= self.max_batches:
+                    raise StopIteration from e
+                raise RuntimeError(
+                    f"Could not load enough datasets for a complete micro-batch of "
+                    f"{self.batch_size}: {e}"
+                ) from e
 
-        # Extract batch_size datasets (or all if we have fewer)
-        output_size = min(self.batch_size, self.buffer_size)
+        # A loader item is always a complete micro-batch. Never return a
+        # partial item because the trainer relies on fixed accumulation steps.
+        output_size = self.batch_size
 
         # Prepare output
         X_out = self.buffer_X[:output_size]
