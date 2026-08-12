@@ -25,7 +25,7 @@ class GraphMultiheadAttention(nn.Module):
         d_model: int,
         nhead: int,
         dropout: float = 0.0,
-        max_parallel_edges: int = 2**12,
+        max_parallel_edges: int = 2**18,
         learnable_residual: bool = False,
         max_chunk_size: int | None = None,
     ):
@@ -198,7 +198,11 @@ class GraphMultiheadAttention(nn.Module):
         for start, end in chunks:
             dst, logits = chunk_logits(start, end)
             group_index = chunk_group_index(dst)
-            max_per_group.scatter_reduce_(
+            # Keep this out of place. The backward pass for scatter-reduce
+            # may retain the input tensor; updating the same accumulator in
+            # place on the next chunk invalidates that saved version when a
+            # graph spans multiple chunks.
+            max_per_group = max_per_group.scatter_reduce(
                 0, group_index, logits.reshape(-1), reduce="amax", include_self=True
             )
 
@@ -207,7 +211,7 @@ class GraphMultiheadAttention(nn.Module):
             dst, logits = chunk_logits(start, end)
             group_index = chunk_group_index(dst)
             exp_logits = torch.exp(logits.reshape(-1) - max_per_group[group_index])
-            sum_per_group.index_add_(0, group_index, exp_logits)
+            sum_per_group = sum_per_group.index_add(0, group_index, exp_logits)
 
         # Pass 3: normalize and accumulate messages directly into destinations.
         for start, end in chunks:
@@ -218,7 +222,7 @@ class GraphMultiheadAttention(nn.Module):
                 end - start, C, self.nhead
             )
             edge_weight = self.dropout(edge_weight)
-            agg.index_add_(0, dst, values * edge_weight.unsqueeze(-1))
+            agg = agg.index_add(0, dst, values * edge_weight.unsqueeze(-1))
 
         attn_out = self.out_proj(agg.view(B, T, C, self.d_model))
         if alpha is None:
@@ -459,11 +463,7 @@ class Graph2DAttentionTransformer(nn.Module):
 
 
 class Graph1DAttentionTransformer(nn.Module):
-    """Sparse graph transformer for compressed ``(B, T, D)`` representations.
-
-    Unlike :class:`Graph2DAttentionTransformer`, this path has no feature
-    column axis and therefore performs only graph attention and the block FFN.
-    """
+    """Sparse graph transformer for compressed ``(B, T, D)`` representations."""
 
     def __init__(
         self,

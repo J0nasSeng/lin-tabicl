@@ -46,7 +46,7 @@ def main() -> None:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--samples", type=int, default=32_768)
     parser.add_argument("--features", type=int, default=512)
-    parser.add_argument("--edges-per-node", type=int, default=3)
+    parser.add_argument("--edges-per-node", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--nhead", type=int, default=8)
@@ -57,6 +57,11 @@ def main() -> None:
     parser.add_argument("--edge-block-size", type=int, default=2_000_000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--repeats", type=int, default=1)
+    parser.add_argument(
+        "--training-pass",
+        action="store_true",
+        help="Benchmark a training pass (forward plus backward) instead of inference only.",
+    )
     args = parser.parse_args()
     device = torch.device(args.device)
     dtype = {"float32": torch.float32, "bfloat16": torch.bfloat16}[args.dtype]
@@ -145,14 +150,25 @@ def main() -> None:
             if dtype == torch.bfloat16 and device.type in {"cuda", "cpu"}
             else nullcontext()
         )
-        with torch.inference_mode(), autocast:
+        model.train(args.training_pass)
+        context = torch.enable_grad() if args.training_pass else torch.inference_mode()
+        with context, autocast:
+            def run_pass():
+                output = measure_source(model)
+                if args.training_pass:
+                    if isinstance(output, tuple):
+                        output = output[0]
+                    output.sum().backward()
+                    model.zero_grad(set_to_none=True)
+                return output
+
             for _ in range(2):
-                measure_source(model)
+                run_pass()
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             start = time.perf_counter()
             for _ in range(args.repeats):
-                output = measure_source(model)
+                output = run_pass()
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             peak = torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None

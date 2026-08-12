@@ -455,7 +455,7 @@ class Trainer:
             batch_size=None,  # No additional batching since prior dataset handles batching internally
             shuffle=False,
             num_workers=4,
-            prefetch_factor=4,
+            prefetch_factor=64,
             pin_memory=True if self.config.prior_device == "cpu" else False,
             pin_memory_device=self.config.device if self.config.prior_device == "cpu" else "",
             persistent_workers=True,

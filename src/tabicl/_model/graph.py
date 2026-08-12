@@ -606,6 +606,7 @@ class GraphPrior:
             y.device,
         )
         if mode == "v1":
+            print(f"Sampling graph for batch with mode {mode}")
             return build_class_conditioned_graphs(
                 y_train=y[:, :n_train].long(), total_nodes=y.shape[1], num_graphs=num_graphs,
                 min_train_neighbors=self.min_train_neighbors, max_train_neighbors=self.max_train_neighbors,
@@ -614,6 +615,7 @@ class GraphPrior:
             )
         per_dataset: list[list[Tensor]] = []
         for batch_index in range(y.shape[0]):
+            print(f"Sampling graph for batch index {batch_index} with mode {mode}")
             generator = torch.Generator(device=y.device)
             if self.seed is not None:
                 generator.manual_seed(self.seed + batch_index)

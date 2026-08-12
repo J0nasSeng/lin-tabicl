@@ -90,6 +90,7 @@ def benchmark_case(args: argparse.Namespace, num_workers: int, batch_size: int) 
 		"num_workers": num_workers,
 		"pin_memory": args.pin_memory,
 		"persistent_workers": num_workers > 0,
+		"in_order": False,
 	}
 	if num_workers > 0:
 		loader_kwargs["prefetch_factor"] = args.prefetch_factor
@@ -152,9 +153,9 @@ def main() -> None:
 	parser.add_argument("--graph-max-train-neighbors", type=int, default=4)
 	parser.add_argument("--graph-cross-label-fraction", type=float, default=0.25)
 	parser.add_argument("--graph-train-neighbors-per-test", type=int, default=2)
-	parser.add_argument("--graph-v1-prob", type=float, default=1.0)
-	parser.add_argument("--graph-v2-prob", type=float, default=0.0)
-	parser.add_argument("--graph-prob", type=float, default=0.0)
+	parser.add_argument("--graph-v1-prob", type=float, default=0.4)
+	parser.add_argument("--graph-v2-prob", type=float, default=0.4)
+	parser.add_argument("--graph-prob", type=float, default=0.2)
 	parser.add_argument("--prefetch-factor", type=int, default=2)
 	parser.add_argument("--pin-memory", action="store_true")
 	parser.add_argument("--seed", type=int, default=42)
