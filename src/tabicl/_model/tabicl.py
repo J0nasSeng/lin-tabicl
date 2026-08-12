@@ -286,7 +286,7 @@ class TabICL(nn.Module):
             max_classes=max_classes,
             max_features=max_features,
             reserve_cls_tokens=row_num_cls,
-            enable_column_identity_rotation=icl_backend in GRAPH_BACKENDS,
+            enable_column_identity_rotation=icl_backend in GRAPH_2D_BACKENDS,
             ssmax=col_ssmax,
             recompute=recompute,
         )

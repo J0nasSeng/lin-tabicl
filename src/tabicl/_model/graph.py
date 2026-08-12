@@ -126,6 +126,94 @@ class CompactGraphBatch:
     num_nodes: int
 
 
+def _class_index(labels: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Return reusable class indexing tensors for a one-dimensional label vector."""
+    classes, inverse = torch.unique(labels, sorted=True, return_inverse=True)
+    counts = torch.bincount(inverse, minlength=classes.numel()).long()
+    starts = counts.cumsum(0) - counts
+    order = torch.argsort(inverse, stable=True)
+    members = torch.full(
+        (classes.numel(), int(counts.max().item()) if counts.numel() else 0),
+        -1,
+        dtype=torch.long,
+        device=labels.device,
+    )
+    if order.numel():
+        positions = torch.arange(labels.numel(), device=labels.device) - starts[inverse[order]]
+        members[inverse[order], positions] = order
+    local_positions = torch.empty_like(inverse)
+    if order.numel():
+        local_positions[order] = positions
+    return classes, inverse, counts, members, local_positions
+
+
+def _unique_directed_edges(edge_index: Tensor, num_nodes: int) -> Tensor:
+    """Deduplicate edges using one-dimensional integer keys."""
+    if edge_index.numel() == 0:
+        return edge_index.reshape(2, 0).long()
+    valid = edge_index[0] != edge_index[1]
+    keys = edge_index[0, valid].long() * num_nodes + edge_index[1, valid].long()
+    keys = torch.unique(keys)
+    return torch.stack((keys // num_nodes, keys.remainder(num_nodes)))
+
+
+def _sample_unordered_pairs(
+    counts: Tensor,
+    members: Tensor,
+    count: int,
+    same_class: bool,
+    generator: torch.Generator,
+) -> Tensor:
+    """Sample unique unordered pairs with tensor operations only.
+
+    The old implementation converted every candidate to a Python tuple and
+    inserted it into a set.  Candidates are now generated in batches and
+    deduplicated by integer pair keys.  As with the old rejection sampler,
+    the returned number can be smaller when the requested budget is close to
+    the available capacity.
+    """
+    if count <= 0 or counts.numel() == 0:
+        return torch.empty((2, 0), dtype=torch.long, device=members.device)
+    if same_class:
+        eligible = torch.where(counts >= 2)[0]
+        if eligible.numel() == 0:
+            return torch.empty((2, 0), dtype=torch.long, device=members.device)
+    else:
+        eligible = torch.where(counts > 0)[0]
+        if eligible.numel() < 2:
+            return torch.empty((2, 0), dtype=torch.long, device=members.device)
+
+    combined = torch.empty((2, 0), dtype=torch.long, device=members.device)
+    base = members.shape[1] * max(1, int(counts.numel()))
+    for _ in range(4):
+        remaining = count - combined.shape[1]
+        if remaining <= 0:
+            break
+        candidate_count = max(64, min(max(remaining * 2, count), count * 4))
+        if same_class:
+            class_ids = eligible[torch.randint(eligible.numel(), (candidate_count,), generator=generator, device=members.device)]
+            positions = torch.randint(2**31 - 1, (candidate_count, 2), generator=generator, device=members.device)
+            positions = positions.remainder(counts[class_ids, None])
+            left = members[class_ids, positions[:, 0]]
+            right = members[class_ids, positions[:, 1]]
+        else:
+            class_pos = torch.empty((candidate_count, 2), dtype=torch.long, device=members.device)
+            class_pos[:, 0] = torch.randint(eligible.numel(), (candidate_count,), generator=generator, device=members.device)
+            class_pos[:, 1] = torch.randint(eligible.numel() - 1, (candidate_count,), generator=generator, device=members.device)
+            class_pos[:, 1] += (class_pos[:, 1] >= class_pos[:, 0]).long()
+            class_ids = eligible[class_pos]
+            positions = torch.rand(candidate_count, 2, generator=generator, device=members.device)
+            positions = (positions * counts[class_ids]).long()
+            left = members[class_ids[:, 0], positions[:, 0]]
+            right = members[class_ids[:, 1], positions[:, 1]]
+        pairs = torch.stack((torch.minimum(left, right), torch.maximum(left, right)))
+        pairs = pairs[:, pairs[0] != pairs[1]]
+        if pairs.numel():
+            keys = torch.unique(torch.cat((combined[0] * base + combined[1], pairs[0] * base + pairs[1])))
+            combined = torch.stack((keys // base, keys.remainder(base)))
+    return combined[:, :count]
+
+
 def induce_graph_set(
     graph_set: SparseGraphSet | CompactGraphSet,
     train_mask: Tensor,
@@ -295,24 +383,35 @@ class GraphPrior:
                     matrix[source, source] = 1.0
         return matrix
 
-    def _sample_transition_edges(self, labels: Tensor, matrix: Tensor, generator: torch.Generator) -> Tensor:
-        classes = torch.unique(labels)
-        class_indices = [torch.where(labels == value)[0] for value in classes]
-        neighbors = int(torch.randint(self.min_train_neighbors, self.max_train_neighbors + 1, (1,), generator=generator, device=labels.device))
-        sources: list[int] = []
-        destinations: list[int] = []
-        for source, label in enumerate(labels.tolist()):
-            class_index = int(torch.where(classes == label)[0][0])
-            target_classes = torch.multinomial(matrix[class_index], neighbors, replacement=True, generator=generator)
-            for target_class in target_classes.tolist():
-                candidates = class_indices[target_class][class_indices[target_class] != source]
-                if candidates.numel():
-                    destination = int(candidates[torch.randint(candidates.numel(), (1,), generator=generator, device=labels.device)])
-                    sources.append(source)
-                    destinations.append(destination)
-        if not sources:
-            return torch.empty((2, 0), dtype=torch.uint16, device=labels.device)
-        return torch.unique(torch.tensor([sources, destinations], dtype=torch.long, device=labels.device), dim=1).to(torch.uint16)
+    def _sample_transition_edges(
+        self,
+        labels: Tensor,
+        matrix: Tensor,
+        generator: torch.Generator,
+        class_info: Optional[tuple[Tensor, Tensor, Tensor, Tensor, Tensor]] = None,
+    ) -> Tensor:
+        if class_info is None:
+            _, inverse, counts, members, local_positions = _class_index(labels)
+        else:
+            _, inverse, counts, members, local_positions = class_info
+        neighbors = int(torch.randint(self.min_train_neighbors, self.max_train_neighbors + 1, (1,), generator=generator, device=labels.device).item())
+        target_classes = torch.multinomial(
+            matrix[inverse], neighbors, replacement=True, generator=generator
+        )
+        target_counts = counts[target_classes]
+        same_class = target_classes == inverse[:, None]
+        available = target_counts - same_class.long()
+        positions = (
+            torch.rand(target_classes.shape, generator=generator, device=labels.device)
+            * available.clamp_min(1)
+        ).long()
+        # Skip the source itself when a transition selects its own class. A
+        # singleton class cannot contribute a valid self-class edge.
+        positions += same_class & (positions >= local_positions[:, None])
+        valid = (~same_class) | (counts[inverse] > 1)[:, None]
+        destinations = members[target_classes, positions]
+        sources = torch.arange(labels.numel(), device=labels.device)[:, None].expand_as(destinations)
+        return _unique_directed_edges(torch.stack((sources[valid], destinations[valid])), labels.numel()).to(torch.uint16)
 
     def _sample_random_pairs(
         self,
@@ -326,37 +425,19 @@ class GraphPrior:
         if count <= 0:
             return torch.empty((2, 0), dtype=torch.long, device=labels.device)
 
-        classes = torch.unique(labels)
-        pools = [torch.where(labels == value)[0] for value in classes]
+        _, _, counts, members, _ = _class_index(labels)
         if class_index is not None:
-            pools = [pools[class_index]]
-        pairs: set[tuple[int, int]] = set()
-        max_attempts = max(100, count * 30)
-        for _ in range(max_attempts):
-            if len(pairs) >= count:
-                break
-            if same_class:
-                eligible = [pool for pool in pools if pool.numel() >= 2]
-                if not eligible:
-                    break
-                pool = eligible[int(torch.randint(len(eligible), (1,), generator=generator, device=labels.device))]
-                positions = torch.randperm(pool.numel(), generator=generator, device=labels.device)[:2]
-                left, right = int(pool[positions[0]]), int(pool[positions[1]])
-            else:
-                eligible = [pool for pool in pools if pool.numel() > 0]
-                if len(eligible) < 2:
-                    break
-                class_positions = torch.randperm(len(eligible), generator=generator, device=labels.device)[:2]
-                left_pool, right_pool = eligible[int(class_positions[0])], eligible[int(class_positions[1])]
-                left = int(left_pool[torch.randint(left_pool.numel(), (1,), generator=generator, device=labels.device)])
-                right = int(right_pool[torch.randint(right_pool.numel(), (1,), generator=generator, device=labels.device)])
-            pairs.add((min(left, right), max(left, right)))
+            selected = torch.zeros_like(counts)
+            selected[class_index] = counts[class_index]
+            counts = selected
+        return _sample_unordered_pairs(counts, members, count, same_class, generator)
 
-        if not pairs:
-            return torch.empty((2, 0), dtype=torch.long, device=labels.device)
-        return torch.tensor(list(pairs), dtype=torch.long, device=labels.device).T
-
-    def _sample_tabular_train_edges(self, labels: Tensor, generator: torch.Generator) -> Tensor:
+    def _sample_tabular_train_edges(
+        self,
+        labels: Tensor,
+        generator: torch.Generator,
+        class_info: Optional[tuple[Tensor, Tensor, Tensor, Tensor, Tensor]] = None,
+    ) -> Tensor:
         """Sample v2 tabular train edges from explicit intra/inter budgets.
 
         Intra-class budgets are proportional to the number of possible pairs in
@@ -364,10 +445,10 @@ class GraphPrior:
         classes while using class frequency to determine each class budget.
         """
         train_size = labels.numel()
-        classes = torch.unique(labels)
-        class_sizes = torch.bincount(
-            torch.searchsorted(classes, labels), minlength=classes.numel()
-        ).to(dtype=torch.long)
+        if class_info is None:
+            _, _, class_sizes, members, _ = _class_index(labels)
+        else:
+            _, _, class_sizes, members, _ = class_info
         intra_capacities = class_sizes * (class_sizes - 1) // 2
         inter_capacity = sum(
             int(class_sizes[i]) * int(class_sizes[j])
@@ -425,15 +506,11 @@ class GraphPrior:
         for class_index, budget in enumerate(class_budgets.tolist()):
             if budget <= 0:
                 continue
-            intra_parts.append(
-                self._sample_random_pairs(
-                    labels,
-                    budget,
-                    same_class=True,
-                    generator=generator,
-                    class_index=class_index,
-                )
-            )
+            selected_counts = torch.zeros_like(class_sizes)
+            selected_counts[class_index] = class_sizes[class_index]
+            intra_parts.append(_sample_unordered_pairs(
+                selected_counts, members, budget, same_class=True, generator=generator
+            ))
 
         # Sample inter-class pairs from the full label pool, then mirror all
         # train-train pairs to retain the directed graph convention.
@@ -444,24 +521,44 @@ class GraphPrior:
         pairs = torch.cat(pair_parts, dim=1)
         return torch.cat([pairs, pairs.flip(0)], dim=1)
 
-    def _sample_v2_single(self, labels: Tensor, n_train: int, generator: torch.Generator, tabular: bool) -> Tensor:
+    def _sample_v2_single(
+        self,
+        labels: Tensor,
+        n_train: int,
+        generator: torch.Generator,
+        tabular: bool,
+        train_class_info: Optional[tuple[Tensor, Tensor, Tensor, Tensor, Tensor]] = None,
+        label_class_info: Optional[tuple[Tensor, Tensor, Tensor, Tensor, Tensor]] = None,
+    ) -> Tensor:
         if tabular:
             train_labels = labels[:n_train]
-            edges = self._sample_tabular_train_edges(train_labels, generator)
+            edges = self._sample_tabular_train_edges(train_labels, generator, train_class_info)
             if n_train < labels.numel():
-                classes = torch.unique(train_labels)
                 test_nodes = torch.arange(n_train, labels.numel(), device=labels.device)
-                parts = []
-                for class_value in classes:
-                    pool = torch.where(train_labels == class_value)[0]
-                    positions = torch.randint(pool.numel(), (test_nodes.numel(), self.train_neighbors_per_test), generator=generator, device=labels.device)
-                    parts.append(torch.stack([pool[positions].reshape(-1), test_nodes[:, None].expand(-1, self.train_neighbors_per_test).reshape(-1)]))
-                if parts:
-                    edges = torch.cat([edges, torch.cat(parts, dim=1)], dim=1)
+                if train_class_info is None:
+                    _, _, counts, members, _ = _class_index(train_labels)
+                else:
+                    _, _, counts, members, _ = train_class_info
+                num_classes = counts.numel()
+                positions = (
+                    torch.rand(
+                        (num_classes, test_nodes.numel(), self.train_neighbors_per_test),
+                        generator=generator,
+                        device=labels.device,
+                    )
+                    * counts[:, None, None].clamp_min(1)
+                ).long()
+                sources = members[:, None, :].expand(
+                    -1, test_nodes.numel(), -1
+                ).gather(2, positions).reshape(-1)
+                destinations = test_nodes[None, :, None].expand(
+                    num_classes, -1, self.train_neighbors_per_test
+                ).reshape(-1)
+                edges = torch.cat([edges, torch.stack((sources, destinations))], dim=1)
         else:
             homophilic = bool(torch.rand((), generator=generator, device=labels.device) < self.homophily_prob)
             matrix = self._transition_matrix(labels, generator, homophilic=homophilic)
-            edges = self._sample_transition_edges(labels, matrix, generator).long()
+            edges = self._sample_transition_edges(labels, matrix, generator, label_class_info).long()
         return torch.unique(edges, dim=1).to(torch.uint16)
 
     def __call__(self, y: Tensor, n_train: int, num_graphs: int = 1) -> CompactGraphSet:
@@ -482,7 +579,20 @@ class GraphPrior:
             if self.seed is not None:
                 generator.manual_seed(self.seed + batch_index)
             tabular = bool(torch.rand((), generator=generator, device=y.device) < self.mode_prob)
-            sampled = [self._sample_v2_single(y[batch_index].long(), n_train, generator, tabular) for _ in range(num_graphs if tabular else 1)]
+            labels = y[batch_index].long()
+            train_class_info = _class_index(labels[:n_train]) if tabular else None
+            label_class_info = None if tabular else _class_index(labels)
+            sampled = [
+                self._sample_v2_single(
+                    labels,
+                    n_train,
+                    generator,
+                    tabular,
+                    train_class_info,
+                    label_class_info,
+                )
+                for _ in range(num_graphs if tabular else 1)
+            ]
             if not tabular:
                 sampled *= num_graphs
             per_dataset.append(sampled)
@@ -595,6 +705,7 @@ def build_class_conditioned_graph(
     cross_label_fraction: float = 0.1,
     train_neighbors_per_test: int = 3,
     seed: int | None = None,
+    _class_infos: Optional[list[tuple[Tensor, Tensor, Tensor, Tensor, Tensor]]] = None,
 ) -> SparseGraphBatch:
     """Build sparse directed graphs for graph-based in-context learning.
 
@@ -652,11 +763,12 @@ def build_class_conditioned_graph(
         gen.manual_seed(seed)
 
     def _build_single_graph(labels: Tensor) -> Tensor:
-        train_indices = torch.arange(train_size, device=labels.device, dtype=torch.long)
-        classes = torch.unique(labels)
-        class_to_indices = {int(c.item()): train_indices[labels == c] for c in classes}
-        class_pools = [class_to_indices[int(c.item())] for c in classes]
-        num_classes = len(class_pools)
+        batch_index = len(edge_index_batch)
+        if _class_infos is None:
+            _, _, class_counts, class_members, _ = _class_index(labels)
+        else:
+            _, _, class_counts, class_members, _ = _class_infos[batch_index]
+        num_classes = class_counts.numel()
         num_test = max(0, total_nodes - train_size)
 
         src_edges: list[Tensor] = []
@@ -668,29 +780,13 @@ def build_class_conditioned_graph(
         def _sample_pairs(kind: str, count: int) -> Tensor:
             if count <= 0:
                 return torch.empty((2, 0), dtype=torch.long, device=labels.device)
-            eligible = [pool for pool in class_pools if pool.numel() >= 2] if kind == "same" else class_pools
-            if kind == "cross":
-                eligible = [pool for pool in class_pools if pool.numel() > 0]
-                if len(eligible) < 2:
-                    return torch.empty((2, 0), dtype=torch.long, device=labels.device)
-            pairs: set[tuple[int, int]] = set()
-            max_attempts = max(100, count * 20)
-            for _ in range(max_attempts):
-                if len(pairs) >= count:
-                    break
-                if kind == "same":
-                    pool = eligible[int(torch.randint(len(eligible), (1,), generator=gen, device=labels.device))]
-                    positions = torch.randperm(pool.numel(), generator=gen, device=labels.device)[:2]
-                    left, right = int(pool[positions[0]]), int(pool[positions[1]])
-                else:
-                    class_ids = torch.randperm(len(eligible), generator=gen, device=labels.device)[:2]
-                    left_pool, right_pool = eligible[int(class_ids[0])], eligible[int(class_ids[1])]
-                    left = int(left_pool[torch.randint(left_pool.numel(), (1,), generator=gen, device=labels.device)])
-                    right = int(right_pool[torch.randint(right_pool.numel(), (1,), generator=gen, device=labels.device)])
-                pairs.add((min(left, right), max(left, right)))
-            if not pairs:
-                return torch.empty((2, 0), dtype=torch.long, device=labels.device)
-            return torch.tensor(list(pairs), dtype=torch.long, device=labels.device).T
+            return _sample_unordered_pairs(
+                class_counts,
+                class_members,
+                count,
+                same_class=kind == "same",
+                generator=gen,
+            )
 
         total_pair_budget = int(
             torch.randint(
@@ -706,11 +802,9 @@ def build_class_conditioned_graph(
 
         # Compute capacities analytically so an exhausted category can donate
         # its remaining budget without constructing candidate pairs.
-        same_capacity = sum(int(pool.numel()) * (int(pool.numel()) - 1) // 2 for pool in class_pools)
-        cross_capacity = sum(
-            int(class_pools[i].numel()) * int(class_pools[j].numel())
-            for i in range(num_classes)
-            for j in range(i + 1, num_classes)
+        same_capacity = int((class_counts * (class_counts - 1) // 2).sum().item())
+        cross_capacity = int(
+            ((class_counts.sum() ** 2 - (class_counts**2).sum()) // 2).item()
         )
         same_count = min(requested_same, same_capacity)
         cross_count = min(requested_cross, cross_capacity)
@@ -733,29 +827,30 @@ def build_class_conditioned_graph(
 
         # 3) Train->test edges only: test nodes are consumers and do not send to train nodes.
         if num_test > 0 and num_classes > 0:
-            src_test_parts: list[Tensor] = []
-            dst_test_parts: list[Tensor] = []
             test_nodes = torch.arange(train_size, total_nodes, device=labels.device, dtype=torch.long)
-            for class_pool in class_pools:
-                pool_size = class_pool.numel()
-                if pool_size < train_neighbors_per_test:
+            # The final integer-key deduplication removes accidental repeated
+            # edges. For classes large enough
+            # to provide distinct neighbors, top-k avoids the old full sort;
+            # small classes retain replacement sampling.
+            src_test_parts: list[Tensor] = []
+            for class_index in range(num_classes):
+                class_size = int(class_counts[class_index].item())
+                if class_size < train_neighbors_per_test:
                     positions = torch.randint(
-                        pool_size,
+                        class_size,
                         (num_test, train_neighbors_per_test),
                         generator=gen,
                         device=labels.device,
                     )
                 else:
-                    # A separate permutation per test node avoids the nested
-                    # Python loop while retaining sampling without replacement.
-                    positions = torch.argsort(
-                        torch.rand((num_test, pool_size), generator=gen, device=labels.device), dim=1
-                    )[:, :train_neighbors_per_test]
-                src_test_parts.append(class_pool[positions].reshape(-1))
-                dst_test_parts.append(test_nodes[:, None].expand(-1, train_neighbors_per_test).reshape(-1))
-
-            src_test = torch.cat(src_test_parts, dim=0)
-            dst_test = torch.cat(dst_test_parts, dim=0)
+                    positions = torch.rand(
+                        (num_test, class_size), generator=gen, device=labels.device
+                    ).topk(train_neighbors_per_test, dim=1, largest=False).indices
+                src_test_parts.append(class_members[class_index, positions].reshape(-1))
+            src_test = torch.cat(src_test_parts)
+            dst_test = test_nodes[None, :, None].expand(
+                num_classes, -1, train_neighbors_per_test
+            ).reshape(-1)
             src_edges.append(src_test)
             dst_edges.append(dst_test)
 
@@ -794,6 +889,8 @@ def build_class_conditioned_graphs(
     if num_graphs <= 0:
         raise ValueError("num_graphs must be positive")
 
+    class_infos = [_class_index(row.long()) for row in y_train]
+
     if share_graph_across_batch:
         labels_identical = y_train.shape[0] <= 1 or bool((y_train == y_train[0]).all().item())
         if labels_identical:
@@ -806,6 +903,7 @@ def build_class_conditioned_graphs(
                     cross_label_fraction=cross_label_fraction,
                     train_neighbors_per_test=train_neighbors_per_test,
                     seed=None if seed is None else seed + graph_idx,
+                    _class_infos=class_infos[:1],
                 )
                 for graph_idx in range(num_graphs)
             ]
@@ -829,6 +927,7 @@ def build_class_conditioned_graphs(
             cross_label_fraction=cross_label_fraction,
             train_neighbors_per_test=train_neighbors_per_test,
             seed=None if seed is None else seed + graph_idx,
+            _class_infos=class_infos,
         )
         for graph_idx in range(num_graphs)
     ]

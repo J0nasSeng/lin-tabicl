@@ -1176,6 +1176,7 @@ class PriorDataset(IterableDataset):
         train_sizes : Tensor
             Position for train/test split for each dataset of shape ``(batch_size,)``.
         """
+
         batch = self.prior.get_batch(batch_size)
         if self.graph_backend:
             X, y, d, seq_lens, train_sizes, graph_sets = batch
