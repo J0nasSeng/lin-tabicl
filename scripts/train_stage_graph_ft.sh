@@ -60,7 +60,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --prior_type nanotabicl \
             --prior_device cpu \
             --normalization std \
-            --batch_size_per_gp 8 \
+            --batch_size_per_gp 4 \
             --min_features 2 \
             --max_features 100 \
             --max_classes 10 \
@@ -92,8 +92,9 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --graph_train_neighbors_per_test 2 \
             --graph_cross_label_fraction 0.25 \
             --graph_num_graphs 6 \
-            --tab_graphs v2 \
-            --mode_prob 0.3 \
+            --graph_v1_prob 0.0 \
+            --graph_v2_prob 0.3 \
+            --graph_prob 0.7 \
             --recompute False \
             #--model_type nanotabicl
 

@@ -71,13 +71,10 @@ class NanoTabICLPrior:
         x_keys = sorted((k for k in tensors if k.startswith("x_")), key=lambda name: int(name.split("_")[1]))
         X = torch.cat([tensors[k].float() for k in x_keys], dim=-1)
 
-        # Match SCMPrior expectations: each generated dataset must have width
-        # max_features so batches can be stacked across varying sampled d.
-        if X.shape[-1] < self.max_features:
-            pad = torch.zeros(X.shape[0], self.max_features - X.shape[-1], dtype=X.dtype, device=X.device)
-            X = torch.cat([X, pad], dim=-1)
-        elif X.shape[-1] > self.max_features:
-            X = X[:, : self.max_features]
+        if X.shape[-1] > self.max_features:
+            raise ValueError(
+                f"NanoTabICL generated {X.shape[-1]} features, exceeding max_features={self.max_features}"
+            )
 
         y = tensors["y_0"].squeeze(-1)
         if self.num_classes > 0:

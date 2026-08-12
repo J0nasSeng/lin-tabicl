@@ -148,7 +148,12 @@ def build_parser():
         type=str2bool,
         help="Delete prior data after loading. Only used when prior_dir is set.",
     )
-    parser.add_argument("--batch_size_per_gp", type=int, default=4, help="Batch size per group")
+    parser.add_argument(
+        "--batch_size_per_gp",
+        type=int,
+        default=8,
+        help="Datasets per generated group; must equal micro_batch_size",
+    )
     parser.add_argument("--min_features", type=int, default=5, help="The minimum number of features")
     parser.add_argument("--max_features", type=int, default=100, help="The maximum number of features")
     parser.add_argument(
@@ -324,19 +329,9 @@ def build_parser():
         type=str2bool,
         help="If True, reuse one graph for all items in a batch",
     )
-    parser.add_argument(
-        "--tab_graphs",
-        type=str,
-        choices=["v1", "v2"],
-        default="v1",
-        help="Tabular graph prior version",
-    )
-    parser.add_argument(
-        "--mode_prob",
-        type=float,
-        default=1.0,
-        help="Probability that GraphPrior samples tabular mode",
-    )
+    parser.add_argument("--graph_v1_prob", type=float, default=1.0, help="Weight for the legacy v1 graph prior")
+    parser.add_argument("--graph_v2_prob", type=float, default=0.0, help="Weight for the tabular v2 graph prior")
+    parser.add_argument("--graph_prob", type=float, default=0.0, help="Weight for the full graph prior")
     parser.add_argument("--freeze_icl", default=False, type=str2bool, help="Whether to freeze the ICL predictor")
 
     # Shared Architecture Config

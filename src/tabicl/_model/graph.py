@@ -273,14 +273,16 @@ class GraphPrior:
 
     ``y`` passed to :meth:`__call__` contains labels for all nodes and
     ``n_train`` identifies the train/test boundary. ``v1`` delegates to the
-    historical class-conditioned sampler; ``v2`` supports tabular and full
-    graph sampling modes.
+    historical class-conditioned sampler. ``v2`` and ``graph`` select the
+    tabular and full-transition samplers respectively. One mode is sampled
+    for the complete input batch.
     """
 
     def __init__(
         self,
-        tab_graphs: str = "v1",
-        mode_prob: float = 1.0,
+        graph_v1_prob: float = 1.0,
+        graph_v2_prob: float = 0.0,
+        graph_prob: float = 0.0,
         homophily_prob: float = 0.7,
         transition_scope_prob: float = 0.5,
         remain_prob_range: tuple[float, float] = (0.7, 0.99),
@@ -293,10 +295,9 @@ class GraphPrior:
         seed: Optional[int] = None,
         share_graph_across_batch: bool = False,
     ):
-        if tab_graphs not in ("v1", "v2"):
-            raise ValueError("tab_graphs must be either 'v1' or 'v2'")
-        if not 0.0 <= mode_prob <= 1.0:
-            raise ValueError("mode_prob must be between 0 and 1")
+        mode_probs = (float(graph_v1_prob), float(graph_v2_prob), float(graph_prob))
+        if any(prob < 0.0 for prob in mode_probs) or sum(mode_probs) <= 0.0:
+            raise ValueError("graph mode probabilities must be non-negative with positive total")
         if not 0.0 <= homophily_prob <= 1.0 or not 0.0 <= transition_scope_prob <= 1.0:
             raise ValueError("homophily_prob and transition_scope_prob must be between 0 and 1")
         if len(remain_prob_range) != 2 or not 0.0 <= remain_prob_range[0] <= remain_prob_range[1] <= 1.0:
@@ -307,8 +308,12 @@ class GraphPrior:
             raise ValueError("train_neighbors_per_test must be positive")
         if not 0.0 <= cross_label_fraction <= 1.0:
             raise ValueError("cross_label_fraction must be between 0 and 1")
-        self.tab_graphs = tab_graphs
-        self.mode_prob = float(mode_prob)
+        total = sum(mode_probs)
+        self.graph_mode_probs = {
+            "v1": mode_probs[0] / total,
+            "v2": mode_probs[1] / total,
+            "graph": mode_probs[2] / total,
+        }
         self.homophily_prob = float(homophily_prob)
         self.transition_scope_prob = float(transition_scope_prob)
         self.remain_prob_range = tuple(float(value) for value in remain_prob_range)
@@ -561,12 +566,46 @@ class GraphPrior:
             edges = self._sample_transition_edges(labels, matrix, generator, label_class_info).long()
         return torch.unique(edges, dim=1).to(torch.uint16)
 
+    def _sample_graph_task_edges(
+        self,
+        labels: Tensor,
+        n_train: int,
+        generator: torch.Generator,
+        label_class_info: Optional[tuple[Tensor, Tensor, Tensor, Tensor, Tensor]],
+        num_graphs: int,
+    ) -> list[Tensor]:
+        """Sample one graph-task topology and reuse it for every GAT slot.
+
+        ``num_graphs`` is a model-shape compatibility parameter: the GAT stack
+        maps consecutive layer groups to these slots. A graph task has one
+        underlying node graph, so all slots must contain the same edge set.
+        ``graph_share_across_batch`` is intentionally handled by the caller and
+        remains independent of this per-dataset slot replication.
+        """
+        graph_edges = self._sample_v2_single(
+            labels,
+            n_train,
+            generator,
+            tabular=False,
+            label_class_info=label_class_info,
+        )
+        return [graph_edges] * num_graphs
+
     def __call__(self, y: Tensor, n_train: int, num_graphs: int = 1) -> CompactGraphSet:
         if y.ndim != 2 or not 0 < n_train <= y.shape[1]:
             raise ValueError("y must have shape (batch, total_nodes) and n_train must be valid")
         if num_graphs <= 0:
             raise ValueError("num_graphs must be positive")
-        if self.tab_graphs == "v1":
+        mode_generator = torch.Generator(device=y.device)
+        if self.seed is not None:
+            mode_generator.manual_seed(self.seed)
+        mode = self._weighted_choice(
+            ["v1", "v2", "graph"],
+            [self.graph_mode_probs[name] for name in ("v1", "v2", "graph")],
+            mode_generator,
+            y.device,
+        )
+        if mode == "v1":
             return build_class_conditioned_graphs(
                 y_train=y[:, :n_train].long(), total_nodes=y.shape[1], num_graphs=num_graphs,
                 min_train_neighbors=self.min_train_neighbors, max_train_neighbors=self.max_train_neighbors,
@@ -578,23 +617,30 @@ class GraphPrior:
             generator = torch.Generator(device=y.device)
             if self.seed is not None:
                 generator.manual_seed(self.seed + batch_index)
-            tabular = bool(torch.rand((), generator=generator, device=y.device) < self.mode_prob)
+            tabular = mode == "v2"
             labels = y[batch_index].long()
             train_class_info = _class_index(labels[:n_train]) if tabular else None
             label_class_info = None if tabular else _class_index(labels)
-            sampled = [
-                self._sample_v2_single(
+            if tabular:
+                sampled = [
+                    self._sample_v2_single(
+                        labels,
+                        n_train,
+                        generator,
+                        tabular=True,
+                        train_class_info=train_class_info,
+                        label_class_info=label_class_info,
+                    )
+                    for _ in range(num_graphs)
+                ]
+            else:
+                sampled = self._sample_graph_task_edges(
                     labels,
                     n_train,
                     generator,
-                    tabular,
-                    train_class_info,
                     label_class_info,
+                    num_graphs,
                 )
-                for _ in range(num_graphs if tabular else 1)
-            ]
-            if not tabular:
-                sampled *= num_graphs
             per_dataset.append(sampled)
         graphs = [
             SparseGraphBatch(

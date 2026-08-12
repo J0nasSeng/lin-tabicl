@@ -119,8 +119,11 @@ class ICLearning(nn.Module):
         graph_share_across_batch: bool = False,
         graph_num_cls: int = 4,
         graph_num_graphs: int = 1,
-        tab_graphs: str = "v1",
-        mode_prob: float = 1.0,
+        graph_v1_prob: float = 1.0,
+        graph_v2_prob: float = 0.0,
+        graph_prob: float = 0.0,
+        tab_graphs: str | None = None,
+        mode_prob: float | None = None,
         learnable_residual: bool = False,
         graph_max_chunk_size: int | None = None,
     ):
@@ -139,8 +142,15 @@ class ICLearning(nn.Module):
         self.graph_share_across_batch = graph_share_across_batch
         self.graph_num_cls = graph_num_cls
         self.graph_num_graphs = int(graph_num_graphs)
-        self.tab_graphs = tab_graphs
-        self.mode_prob = float(mode_prob)
+        if tab_graphs is not None:
+            graph_v1_prob, graph_v2_prob, graph_prob = (
+                (1.0, 0.0, 0.0) if tab_graphs == "v1" else
+                (0.0, float(mode_prob if mode_prob is not None else 1.0),
+                 float(1.0 - (mode_prob if mode_prob is not None else 1.0)))
+            )
+        self.graph_v1_prob = float(graph_v1_prob)
+        self.graph_v2_prob = float(graph_v2_prob)
+        self.graph_prob = float(graph_prob)
         self.learnable_residual = bool(learnable_residual)
         self.graph_max_chunk_size = graph_max_chunk_size
 

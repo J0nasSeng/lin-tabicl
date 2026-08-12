@@ -60,8 +60,8 @@ def benchmark_case(args: argparse.Namespace, num_workers: int, batch_size: int) 
 	graph_backend = args.icl_backend in GRAPH_BACKENDS
 	dataset = PriorDataset(
 		batch_size=batch_size,
-		batch_size_per_gp=min(args.batch_size_per_gp, batch_size),
-		batch_size_per_subgp=min(args.batch_size_per_subgp, batch_size),
+		batch_size_per_gp=batch_size,
+		batch_size_per_subgp=batch_size,
 		min_features=args.min_features,
 		max_features=args.max_features,
 		max_classes=args.max_classes,
@@ -81,7 +81,9 @@ def benchmark_case(args: argparse.Namespace, num_workers: int, batch_size: int) 
 		graph_cross_label_fraction=args.graph_cross_label_fraction,
 		graph_train_neighbors_per_test=args.graph_train_neighbors_per_test,
 		graph_seed=args.seed,
-		tab_graphs=args.tab_graphs,
+		graph_v1_prob=args.graph_v1_prob,
+		graph_v2_prob=args.graph_v2_prob,
+		graph_prob=args.graph_prob,
 	)
 	loader_kwargs = {
 		"batch_size": None,
@@ -150,7 +152,9 @@ def main() -> None:
 	parser.add_argument("--graph-max-train-neighbors", type=int, default=4)
 	parser.add_argument("--graph-cross-label-fraction", type=float, default=0.25)
 	parser.add_argument("--graph-train-neighbors-per-test", type=int, default=2)
-	parser.add_argument("--tab-graphs", choices=("v1", "v2"), default="v1")
+	parser.add_argument("--graph-v1-prob", type=float, default=1.0)
+	parser.add_argument("--graph-v2-prob", type=float, default=0.0)
+	parser.add_argument("--graph-prob", type=float, default=0.0)
 	parser.add_argument("--prefetch-factor", type=int, default=2)
 	parser.add_argument("--pin-memory", action="store_true")
 	parser.add_argument("--seed", type=int, default=42)

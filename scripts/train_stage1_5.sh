@@ -54,7 +54,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --prior_type nanotabicl \
             --prior_device cpu \
             --normalization std \
-            --batch_size_per_gp 8 \
+            --batch_size_per_gp 2 \
             --min_features 2 \
             --max_features 512 \
             --max_classes 10 \

@@ -2,6 +2,7 @@ import torch
 import pytest
 
 from src.tabicl._model.graph import (
+    GraphPrior,
     SparseGraphBatch,
     SparseGraphSet,
     build_class_conditioned_graph,
@@ -110,6 +111,25 @@ def test_graph_builder_multiple_graphs_are_reproducible_and_independent():
     assert not torch.equal(
         graph_set_a.graphs[0].edge_index[0], graph_set_a.graphs[1].edge_index[0]
     )
+
+
+def test_graph_prior_graph_tasks_reuse_one_topology_across_gat_slots():
+    labels = _build_labels(batch_size=2, train_size=15, num_classes=3)
+    graph_set = GraphPrior(
+        graph_v1_prob=0.0,
+        graph_v2_prob=0.0,
+        graph_prob=1.0,
+        min_train_neighbors=1,
+        max_train_neighbors=3,
+        train_neighbors_per_test=2,
+        seed=11,
+    )(labels, n_train=15, num_graphs=3)
+
+    assert graph_set.num_graphs == 3
+    for dataset_idx in range(labels.shape[0]):
+        reference = graph_set.graphs[0].edge_index[dataset_idx]
+        for graph_idx in range(1, graph_set.num_graphs):
+            assert torch.equal(reference, graph_set.graphs[graph_idx].edge_index[dataset_idx])
 
 
 def test_induce_graph_set_preserves_topology_and_all_test_nodes():

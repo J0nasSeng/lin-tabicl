@@ -119,8 +119,9 @@ class GATInferenceEngine(nn.Module):
 	def _make_graph_set(self, y_train: Tensor, total_nodes: int) -> SparseGraphSet:
 		predictor = self.model.icl_predictor
 		prior = GraphPrior(
-			tab_graphs=getattr(predictor, "tab_graphs", "v1"),
-			mode_prob=getattr(predictor, "mode_prob", 1.0),
+			graph_v1_prob=getattr(predictor, "graph_v1_prob", 1.0),
+			graph_v2_prob=getattr(predictor, "graph_v2_prob", 0.0),
+			graph_prob=getattr(predictor, "graph_prob", 0.0),
 			min_train_neighbors=predictor.graph_min_train_neighbors,
 			max_train_neighbors=predictor.graph_max_train_neighbors,
 			cross_label_fraction=predictor.graph_cross_label_fraction,

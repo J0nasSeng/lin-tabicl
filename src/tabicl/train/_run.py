@@ -151,6 +151,8 @@ class Trainer:
             raise ValueError("batch_size and micro_batch_size must be positive")
         if self.config.batch_size % self.config.micro_batch_size != 0:
             raise ValueError("batch_size must be divisible by micro_batch_size")
+        if self.config.batch_size_per_gp != self.config.micro_batch_size:
+            raise ValueError("batch_size_per_gp must equal micro_batch_size for homogeneous feature batches")
         self.accumulation_steps = self.config.batch_size // self.config.micro_batch_size
         self.build_model()
         self.configure_prior()
@@ -428,8 +430,9 @@ class Trainer:
                 graph_train_neighbors_per_test=self.config.graph_train_neighbors_per_test,
                 graph_seed=self.config.graph_seed,
                 graph_share_across_batch=self.config.graph_share_across_batch,
-                tab_graphs=getattr(self.config, "tab_graphs", "v1"),
-                mode_prob=getattr(self.config, "mode_prob", 1.0),
+                graph_v1_prob=getattr(self.config, "graph_v1_prob", 1.0),
+                graph_v2_prob=getattr(self.config, "graph_v2_prob", 0.0),
+                graph_prob=getattr(self.config, "graph_prob", 0.0),
             )
 
         val_start_offset = max(1, int(self.config.max_steps))
@@ -452,8 +455,8 @@ class Trainer:
             batch_size=None,  # No additional batching since prior dataset handles batching internally
             shuffle=False,
             num_workers=4,
-            prefetch_factor=2,
-            pin_memory=False, #True if self.config.prior_device == "cpu" else False,
+            prefetch_factor=4,
+            pin_memory=True if self.config.prior_device == "cpu" else False,
             pin_memory_device=self.config.device if self.config.prior_device == "cpu" else "",
             persistent_workers=True,
         )
@@ -781,9 +784,9 @@ class Trainer:
         seq_len, train_size = self.validate_micro_batch(micro_seq_len, micro_train_size)
         micro_X, micro_y = self.align_micro_batch(micro_X, micro_y, micro_d, seq_len)
 
-        micro_X = micro_X.to(self.config.device)
-        micro_y = micro_y.to(self.config.device)
-        micro_d = micro_d.to(self.config.device)
+        micro_X = micro_X.to(self.config.device, non_blocking=True)
+        micro_y = micro_y.to(self.config.device, non_blocking=True)
+        micro_d = micro_d.to(self.config.device, non_blocking=True)
 
         y_train = micro_y[:, :train_size]
         y_test = micro_y[:, train_size:]
@@ -881,6 +884,14 @@ class Trainer:
                 results[k] = 0.0
             results[k] += v
 
+    @staticmethod
+    def _finalize_metric_results(results, divisor: int):
+        """Average accumulated tensor metrics and materialize Python scalars once."""
+        for key, value in list(results.items()):
+            if isinstance(value, torch.Tensor):
+                results[key] = (value / divisor).item()
+        return results
+
     def _finalize_confusion_payload(self, payload_state):
         payload = {}
         y_true_payload = payload_state["confusion_y_true_payload"]
@@ -915,12 +926,13 @@ class Trainer:
         # reflect true (unscaled) gradients when AMP GradScaler is enabled.
         self.scaler.unscale_(self.optimizer)
 
-        grad_sq_sum = 0.0
+        grad_sq_sum = None
         for param in self.model.parameters():
             if param.grad is None:
                 continue
-            grad_sq_sum += param.grad.detach().float().pow(2).sum().item()
-        global_grad_norm = grad_sq_sum**0.5
+            param_grad_sq_sum = param.grad.detach().float().pow(2).sum()
+            grad_sq_sum = param_grad_sq_sum if grad_sq_sum is None else grad_sq_sum + param_grad_sq_sum
+        global_grad_norm = grad_sq_sum.sqrt().item() if grad_sq_sum is not None else 0.0
 
         if self.config.gradient_clipping > 0:
             nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clipping)
@@ -1136,21 +1148,15 @@ class Trainer:
 
             pred = pred_3d.flatten(end_dim=-2)
             true = y_test.long().flatten()
-            num_classes = pred_3d.shape[-1]
-            ce_losses = []
-            for ds_idx in range(pred_3d.shape[0]):
-                ds_logits = pred_3d[ds_idx]
-                ds_targets = y_test[ds_idx].long()
-                ce_losses.append(
-                    F.cross_entropy(
-                        ds_logits,
-                        ds_targets,
-                        label_smoothing=float(getattr(self.config, "label_smoothing", 0.1)),
-                        reduction="mean",
-                    )
-                )
-
-            ce_loss = torch.stack(ce_losses).mean()
+            # All datasets have the same sequence length within a micro-batch,
+            # so flattening preserves the previous mean-over-datasets reduction
+            # while avoiding one cross-entropy kernel and Python loop per dataset.
+            ce_loss = F.cross_entropy(
+                pred,
+                true,
+                label_smoothing=float(getattr(self.config, "label_smoothing", 0.1)),
+                reduction="mean",
+            )
 
             supcon_raw_loss = pred.new_zeros(())
             if supcon_weight > 0 and pre_decoder_repr_test is not None:
@@ -1183,22 +1189,22 @@ class Trainer:
             loss = ce_loss + supcon_weight * supcon_raw_loss - entropy_weight * entropy_raw_loss
 
         if do_backward:
-            scaled_loss = loss / (num_micro_batches * accumulation_divisor)
+            scaled_loss = loss / accumulation_divisor
             self.scaler.scale(scaled_loss).backward()
 
         with torch.no_grad():
             micro_results = {}
-            micro_results["ce"] = (ce_loss / num_micro_batches).item()
-            micro_results["loss"] = loss.item() / num_micro_batches
-            micro_results["scale"] = self.scaler.get_scale() / num_micro_batches
-            accuracy = (pred.argmax(dim=1) == true).sum() / len(true)
-            micro_results["accuracy"] = accuracy.item() / num_micro_batches
+            micro_results["ce"] = ce_loss.detach()
+            micro_results["loss"] = loss.detach()
+            micro_results["scale"] = pred.new_tensor(self.scaler.get_scale())
+            accuracy = (pred.argmax(dim=1) == true).float().mean()
+            micro_results["accuracy"] = accuracy.detach()
             if supcon_weight > 0:
-                micro_results["supcon"] = (supcon_weight * supcon_raw_loss / num_micro_batches).item()
-                micro_results["supcon_raw"] = (supcon_raw_loss / num_micro_batches).item()
+                micro_results["supcon"] = (supcon_weight * supcon_raw_loss).detach()
+                micro_results["supcon_raw"] = supcon_raw_loss.detach()
             if entropy_weight > 0:
-                micro_results["entropy"] = (-entropy_weight * entropy_raw_loss / num_micro_batches).item()
-                micro_results["entropy_raw"] = (entropy_raw_loss / num_micro_batches).item()
+                micro_results["entropy"] = (-entropy_weight * entropy_raw_loss).detach()
+                micro_results["entropy_raw"] = entropy_raw_loss.detach()
 
             if collect_artifacts:
                 micro_results.update(
@@ -1266,6 +1272,7 @@ class Trainer:
                 self.optimizer.zero_grad(set_to_none=True)
                 raise RuntimeError("A logical batch failed due to CUDA OOM") from exc
 
+        results = self._finalize_metric_results(results, self.accumulation_steps)
         results["grad_norm"] = self._apply_optimizer_updates()
         return results, prior_time, dataloader_iterator
 
@@ -1319,6 +1326,7 @@ class Trainer:
             del val_artifacts[key]
 
         results.update(val_artifacts)
+        results = self._finalize_metric_results(results, self.accumulation_steps)
         if was_training:
             self.model.train()
 

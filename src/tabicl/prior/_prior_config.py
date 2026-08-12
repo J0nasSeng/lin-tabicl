@@ -18,11 +18,14 @@ DEFAULT_FIXED_HP = {
     "permute_features": True,
     "permute_labels": True,
     # GraphPrior v2 distributions.
-    "graph_homophily_prob": 0.7,
+    "graph_homophily_prob": 0.5,
     "graph_transition_scope_prob": 0.5,
     "graph_remain_prob_range": (0.7, 0.99),
     "graph_heterophily_structure_probs": {"bipartite": 1 / 3, "cyclic": 1 / 3, "grouped": 1 / 3},
     "graph_group_count_range": (2, 4),
+    "graph_v1_prob": 0.4,
+    "graph_v2_prob": 0.4,
+    "graph_prob": 0.2,
     #"multiclass_type": "quantile",
     #"is_causal": True,
 }

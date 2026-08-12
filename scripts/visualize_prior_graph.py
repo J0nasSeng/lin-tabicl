@@ -372,8 +372,9 @@ def main() -> None:
     # differences in topology attributable to GraphPrior rather than the SCM.
     priors = {
         "tabular v1": GraphPrior(
-            tab_graphs="v1",
-            mode_prob=1.0,
+            graph_v1_prob=1.0,
+            graph_v2_prob=0.0,
+            graph_prob=0.0,
             min_train_neighbors=args.graph_min_train_neighbors,
             max_train_neighbors=args.graph_max_train_neighbors,
             cross_label_fraction=args.graph_cross_label_fraction,
@@ -381,8 +382,9 @@ def main() -> None:
             seed=args.seed,
         ),
         "tabular v2": GraphPrior(
-            tab_graphs="v2",
-            mode_prob=1.0,
+            graph_v1_prob=0.0,
+            graph_v2_prob=1.0,
+            graph_prob=0.0,
             min_train_neighbors=args.graph_min_train_neighbors,
             max_train_neighbors=args.graph_max_train_neighbors,
             cross_label_fraction=args.graph_cross_label_fraction,
@@ -390,8 +392,9 @@ def main() -> None:
             seed=args.seed + 1,
         ),
         "graph mode": GraphPrior(
-            tab_graphs="v2",
-            mode_prob=0.0,
+            graph_v1_prob=0.0,
+            graph_v2_prob=0.0,
+            graph_prob=1.0,
             min_train_neighbors=args.graph_min_train_neighbors,
             max_train_neighbors=args.graph_max_train_neighbors,
             cross_label_fraction=args.graph_cross_label_fraction,
