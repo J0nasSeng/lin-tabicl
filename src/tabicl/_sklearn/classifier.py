@@ -317,6 +317,7 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
         feature_reduction: str | None = None,
         n_components: int | None = None,
         max_chunk_size: int | None = None,
+        decoder_chunk_size: int = 5000,
     ):
         self.n_estimators = n_estimators
         self.norm_methods = norm_methods
@@ -344,6 +345,9 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
         self.gat_num_iterations = gat_num_iterations
         self.gat_entry_layer = gat_entry_layer
         self.max_chunk_size = max_chunk_size
+        if decoder_chunk_size <= 0:
+            raise ValueError("decoder_chunk_size must be positive")
+        self.decoder_chunk_size = int(decoder_chunk_size)
         self.feature_reduction = feature_reduction
         self.n_components = n_components
 
@@ -436,7 +440,8 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
 
         self.model_path_ = model_path_
         if checkpoint["config"].get("icl_backend", "encoder") in {
-            "graph", "graph-pyg", "graph-2d", "graph-2d-pyg"
+            "graph", "graph-pyg", "graph-2d", "graph-2d-pyg",
+            "graph-1d", "graph-1d-pyg",
         }:
             if self.kv_cache:
                 raise ValueError("KV caching is not currently supported for graph-backend inference.")
@@ -447,6 +452,7 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
                 num_iterations=self.gat_num_iterations,
                 entry_layer=self.gat_entry_layer,
                 max_chunk_size=self.max_chunk_size,
+                decoder_chunk_size=self.decoder_chunk_size,
             )
         else:
             self.model_ = TabICL(**checkpoint["config"], icl_backend="encoder")

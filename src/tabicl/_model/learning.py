@@ -115,6 +115,7 @@ class ICLearning(nn.Module):
         graph_train_neighbors_per_test: int = 8,
         decoder_type: Literal["mlp", "soft_kmeans", "rbf", "euclidean"] = "mlp",
         soft_kmeans_temperature: float = 1.0,
+        decoder_chunk_size: int = 5000,
         graph_seed: Optional[int] = None,
         graph_share_across_batch: bool = False,
         graph_num_cls: int = 4,
@@ -138,6 +139,9 @@ class ICLearning(nn.Module):
         self.graph_train_neighbors_per_test = graph_train_neighbors_per_test
         self.decoder_type = decoder_type
         self.soft_kmeans_temperature = float(soft_kmeans_temperature)
+        if decoder_chunk_size <= 0:
+            raise ValueError("decoder_chunk_size must be positive")
+        self.decoder_chunk_size = int(decoder_chunk_size)
         self.graph_seed = graph_seed
         self.graph_share_across_batch = graph_share_across_batch
         self.graph_num_cls = graph_num_cls
@@ -259,12 +263,15 @@ class ICLearning(nn.Module):
         y_train: Tensor,
     ) -> Tensor:
         """Aggregate train-row kernel assignments into log probabilities."""
-        y_one_hot = F.one_hot(y_train.long(), num_classes=self.max_classes).bool()
-        class_mask = y_one_hot.unsqueeze(1)
-        log_class_mass = torch.logsumexp(
-            log_kernel.unsqueeze(-1).masked_fill(~class_mask, float("-inf")),
-            dim=2,
-        )
+        class_masses = []
+        for class_index in range(self.max_classes):
+            class_mask = (y_train == class_index).unsqueeze(1)
+            class_masses.append(
+                torch.logsumexp(
+                    log_kernel.masked_fill(~class_mask, float("-inf")), dim=-1
+                )
+            )
+        log_class_mass = torch.stack(class_masses, dim=-1)
         # A dataset may use fewer classes than max_classes. Give absent classes a
         # finite machine-small mass so cross_entropy with label smoothing remains
         # well-defined, then renormalize in log space.
@@ -281,17 +288,16 @@ class ICLearning(nn.Module):
         if train_size <= 0:
             raise ValueError("soft_kmeans decoder requires train_size > 0")
 
-        train_repr = src[:, :train_size, :]
-
-        # Compute similarities and the row-wise assignment distribution in float32.
-        # Keeping this path in float32 avoids underflow before class aggregation.
-        src_float = src.float()
-        train_repr_float = train_repr.float()
-        sim = torch.matmul(src_float, train_repr_float.transpose(1, 2))
-        sim = sim / math.sqrt(src.shape[-1]) / self.soft_kmeans_temperature
-        log_assign = torch.log_softmax(sim, dim=-1)
-
-        return self._aggregate_kernel_assignments(log_assign, y_train)
+        train_repr_float = src[:, :train_size, :].float()
+        outputs = []
+        for start in range(0, src.shape[1], self.decoder_chunk_size):
+            src_chunk = src[:, start : start + self.decoder_chunk_size].float()
+            sim = torch.matmul(src_chunk, train_repr_float.transpose(1, 2))
+            sim = sim / math.sqrt(src.shape[-1]) / self.soft_kmeans_temperature
+            outputs.append(
+                self._aggregate_kernel_assignments(torch.log_softmax(sim, dim=-1), y_train)
+            )
+        return torch.cat(outputs, dim=1)
 
     def _rbf_decoder(
         self, src: Tensor, y_train: Tensor, train_size: int
@@ -305,16 +311,19 @@ class ICLearning(nn.Module):
 
         d = torch.tensor(src.shape[-1], dtype=src.dtype, device=src.device)
 
-        train_repr = src[:, :train_size, :]
-        src_float = src.float()
-        train_repr_float = train_repr.float()
-        src_sq = torch.sum(src_float.square(), dim=-1, keepdim=True)
+        train_repr_float = src[:, :train_size, :].float()
         train_sq = torch.sum(train_repr_float.square(), dim=-1, keepdim=True).transpose(1, 2)
-        interaction = torch.matmul(src_float, train_repr_float.transpose(1, 2))
-        sq_dist = (src_sq + train_sq - 2.0 * interaction).clamp_min(0.0)
-        sim = -sq_dist / (2.0 * (self.soft_kmeans_temperature * torch.sqrt(d))**2)
-        log_assign = torch.log_softmax(sim, dim=-1)
-        return self._aggregate_kernel_assignments(log_assign, y_train)
+        outputs = []
+        for start in range(0, src.shape[1], self.decoder_chunk_size):
+            src_chunk = src[:, start : start + self.decoder_chunk_size].float()
+            src_sq = torch.sum(src_chunk.square(), dim=-1, keepdim=True)
+            interaction = torch.matmul(src_chunk, train_repr_float.transpose(1, 2))
+            sq_dist = (src_sq + train_sq - 2.0 * interaction).clamp_min(0.0)
+            sim = -sq_dist / (2.0 * (self.soft_kmeans_temperature * torch.sqrt(d))**2)
+            outputs.append(
+                self._aggregate_kernel_assignments(torch.log_softmax(sim, dim=-1), y_train)
+            )
+        return torch.cat(outputs, dim=1)
 
     def _euclidean_decoder(
         self, src: Tensor, y_train: Tensor, train_size: int
@@ -326,16 +335,21 @@ class ICLearning(nn.Module):
         if train_size <= 0:
             raise ValueError("euclidean decoder requires train_size > 0")
 
-        train_repr = src[:, :train_size, :]
-        src_float = src.float()
-        train_repr_float = train_repr.float()
-        src_sq = torch.sum(src_float.square(), dim=-1, keepdim=True)
+        train_repr_float = src[:, :train_size, :].float()
         train_sq = torch.sum(train_repr_float.square(), dim=-1, keepdim=True).transpose(1, 2)
-        interaction = torch.matmul(src_float, train_repr_float.transpose(1, 2))
-        sq_dist = (src_sq + train_sq - 2.0 * interaction).clamp_min(0.0)
-        sim = -torch.sqrt(sq_dist.clamp_min(torch.finfo(src_float.dtype).eps))
-        log_assign = torch.log_softmax(sim / self.soft_kmeans_temperature, dim=-1)
-        return self._aggregate_kernel_assignments(log_assign, y_train)
+        outputs = []
+        for start in range(0, src.shape[1], self.decoder_chunk_size):
+            src_chunk = src[:, start : start + self.decoder_chunk_size].float()
+            src_sq = torch.sum(src_chunk.square(), dim=-1, keepdim=True)
+            interaction = torch.matmul(src_chunk, train_repr_float.transpose(1, 2))
+            sq_dist = (src_sq + train_sq - 2.0 * interaction).clamp_min(0.0)
+            sim = -torch.sqrt(sq_dist.clamp_min(torch.finfo(src_chunk.dtype).eps))
+            outputs.append(
+                self._aggregate_kernel_assignments(
+                    torch.log_softmax(sim / self.soft_kmeans_temperature, dim=-1), y_train
+                )
+            )
+        return torch.cat(outputs, dim=1)
 
     def _apply_icl_backbone(self, R: Tensor, train_size: int, y_train: Optional[Tensor] = None) -> Tensor:
         """Apply encoder ICL backbone."""

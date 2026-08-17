@@ -54,12 +54,15 @@ class GATInferenceEngine(nn.Module):
 		num_iterations: int = 1,
 		entry_layer: int | str | None = None,
 		max_chunk_size: int | None = None,
+		decoder_chunk_size: int | None = None,
 	) -> None:
 		super().__init__()
 		if mode not in {"ensemble", "reasoning"}:
 			raise ValueError("mode must be 'ensemble' or 'reasoning'")
 		if num_iterations <= 0:
 			raise ValueError("num_iterations must be positive")
+		if decoder_chunk_size is not None and decoder_chunk_size <= 0:
+			raise ValueError("decoder_chunk_size must be positive")
 
 		self.mode = mode
 		self.num_iterations = int(num_iterations)
@@ -84,12 +87,18 @@ class GATInferenceEngine(nn.Module):
 			config["learnable_residual"] = any(
 				key.endswith("attn.alpha") for key in checkpoint["state_dict"]
 			)
-		if config.get("icl_backend", "graph") not in {"graph", "graph-pyg", "graph-2d", "graph-2d-pyg"}:
-			raise ValueError("GATInferenceEngine requires a 2D graph checkpoint.")
+		if config.get("icl_backend", "graph") not in {
+			"graph", "graph-pyg", "graph-2d", "graph-2d-pyg",
+			"graph-1d", "graph-1d-pyg",
+		}:
+			raise ValueError("GATInferenceEngine requires a graph checkpoint.")
 
 		self.model_config_ = config
 		self.model = TabICL(**config)
 		self.model.load_state_dict(checkpoint["state_dict"])
+		if decoder_chunk_size is not None:
+			self.model.decoder_chunk_size = int(decoder_chunk_size)
+			self.model.icl_predictor.decoder_chunk_size = int(decoder_chunk_size)
 		if max_chunk_size is not None:
 			if max_chunk_size <= 0:
 				raise ValueError("max_chunk_size must be > 0 when provided")
@@ -147,6 +156,11 @@ class GATInferenceEngine(nn.Module):
 			feature_shuffles=feature_shuffles,
 			mgr_config=inference_config.COL_CONFIG,
 		)
+		if self.model.icl_backend in {"graph-1d", "graph-1d-pyg"}:
+			return self.model.row_interactor(
+				col_embeddings,
+				mgr_config=inference_config.ROW_CONFIG,
+			)
 		pre_col_embeddings = self.model.col_embedder.project_input(X)
 		return self.model.icl_predictor.prepare_graph_input(
 			col_embeddings=col_embeddings,
@@ -182,7 +196,23 @@ class GATInferenceEngine(nn.Module):
 				for graph in graph_set.graphs
 			]
 
-		out = graph_input
+		# The sklearn/AutoGluon adapter assembles inputs as float32, while some
+		# checkpoints are loaded with half-precision GAT weights. Match the
+		# activations to the graph stack before invoking LayerNorm or attention.
+		gat_dtype = next(gat.parameters()).dtype
+		out = graph_input.to(dtype=gat_dtype)
+		if self.model.icl_backend in {"graph-1d", "graph-1d-pyg"}:
+			for block_idx in range(start):
+				out = gat.graph_blocks[block_idx](
+					out.unsqueeze(2), graph_edges[block_idx // layers_per_graph]
+				).squeeze(2)
+			for _ in range(self.num_iterations):
+				for block_idx in range(start, len(gat.graph_blocks)):
+					out = gat.graph_blocks[block_idx](
+						out.unsqueeze(2), graph_edges[block_idx // layers_per_graph]
+					).squeeze(2)
+			return out
+
 		# Establish the representation at the requested entry point once.
 		for block_idx in range(start):
 			out = gat.graph_blocks[block_idx](out, graph_edges[block_idx // layers_per_graph])
@@ -299,7 +329,11 @@ class GATInferenceEngine(nn.Module):
 			graph_set = self._compact_graph_set(graph_set, X.shape[0])
 			self._validate_graph_set(graph_set, X.shape[1], X.shape[0])
 
-		if self.mode == "ensemble" or self.num_iterations == 1 and self.entry_layer is None:
+		is_graph_1d = self.model.icl_backend in {"graph-1d", "graph-1d-pyg"}
+		if (
+			(self.mode == "ensemble" and not is_graph_1d)
+			or (self.num_iterations == 1 and self.entry_layer is None and not is_graph_1d)
+		):
 			if return_repr:
 				graph_input = self._graph_input(X, y_train, inference_config, feature_shuffles)
 				representation = self._run_refinement(graph_input, graph_set)

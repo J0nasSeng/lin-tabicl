@@ -114,6 +114,8 @@ def _forward_with_full_repr_tabicl(model: TabICL, x_i, y_train, d_i, graph_set):
 
     if model.icl_backend == "encoder":
         icl_input = model.row_interactor(col_embeddings, d=d_eff)
+    elif model.icl_backend in ("graph-1d", "graph-1d-pyg"):
+        icl_input = model.row_interactor(col_embeddings)
     else:
         pre_col_embeddings = model.col_embedder.project_input(x_i, d=d_eff)
         # Some feature-embedding paths keep the projected input on the source

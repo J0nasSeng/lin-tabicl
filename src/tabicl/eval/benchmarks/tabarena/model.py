@@ -25,6 +25,17 @@ else:
 
 from tabicl import TabICLClassifier
 
+
+GRAPH_BACKENDS = {
+	"graph",
+	"graph-pyg",
+	"graph-1d",
+	"graph-1d-pyg",
+	"graph-2d",
+	"graph-2d-pyg",
+}
+
+
 if TYPE_CHECKING:
 	import pandas as pd
 	from tabarena.utils.config_utils import ConfigGenerator  # pyright: ignore[reportMissingImports]
@@ -76,6 +87,7 @@ class TabICLGraphModel(AbstractModelBase):
 			"gat_num_iterations": 1,
 			"gat_entry_layer": None,
 			"max_chunk_size": None,
+			"decoder_chunk_size": 5000,
 			"device": None,
 		}.items():
 			self._set_default_param_value(parameter, value)
@@ -103,8 +115,11 @@ class TabICLGraphModel(AbstractModelBase):
 		config = checkpoint["config"]
 		if str(config.get("model_type", "tabicl")).lower() != "tabicl":
 			raise ValueError("TabICLGraphModel requires a TabICL checkpoint")
-		if config.get("icl_backend", "encoder") != "graph":
-			raise ValueError("TabICLGraphModel requires a checkpoint with icl_backend='graph'")
+		if config.get("icl_backend", "encoder") not in GRAPH_BACKENDS:
+			raise ValueError(
+				"TabICLGraphModel requires a checkpoint with a graph backend "
+				"(graph, graph-1d, or graph-2d)"
+			)
 
 	def _tabicl_kwargs(self) -> dict[str, Any]:
 		params = self.params.copy()
@@ -122,6 +137,7 @@ class TabICLGraphModel(AbstractModelBase):
 		params["offload_mode"] = "cpu"
 		params["batch_size"] = 1
 		params["max_chunk_size"] = self.params.get("max_chunk_size")
+		params["decoder_chunk_size"] = self.params.get("decoder_chunk_size", 5000)
 		params["n_estimators"] = 1
 		params["feature_reduction"] = "ensemble"
 		params["n_components"] = 100
@@ -156,6 +172,7 @@ class TabICLGraphModel(AbstractModelBase):
 		num_cpus: int = 64,
 		num_gpus: int = 1,
 		max_chunk_size: int | None = None,
+		decoder_chunk_size: int = 5000,
 	) -> "ConfigGenerator":
 		"""Return a TabArena config generator for the supplied checkpoint."""
 		from tabarena.utils.config_utils import ConfigGenerator  # pyright: ignore[reportMissingImports]
@@ -167,6 +184,9 @@ class TabICLGraphModel(AbstractModelBase):
 			config["device"] = str(device)
 		if max_chunk_size is not None:
 			config["max_chunk_size"] = max_chunk_size
+		if decoder_chunk_size <= 0:
+			raise ValueError("decoder_chunk_size must be positive")
+		config["decoder_chunk_size"] = decoder_chunk_size
 		config["ag_args_fit"] = {
 			"num_cpus": num_cpus,
 			"num_gpus": num_gpus,
@@ -217,6 +237,12 @@ def build_parser() -> argparse.ArgumentParser:
 		help="Maximum number of destination-sorted graph edges processed per attention chunk.",
 	)
 	parser.add_argument(
+		"--decoder-chunk-size",
+		type=int,
+		default=5000,
+		help="Number of query rows processed at once by kernel decoders (default: 5000).",
+	)
+	parser.add_argument(
 		"--debug-mode",
 		action=argparse.BooleanOptionalAction,
 		default=True,
@@ -231,6 +257,8 @@ def compare_against_leaderboard(args: argparse.Namespace) -> Any:
 	from tabarena.contexts import TabArenaContext  # pyright: ignore[reportMissingImports]
 
 	model_path = args.model_path.expanduser().resolve()
+	if args.decoder_chunk_size <= 0:
+		raise ValueError("--decoder-chunk-size must be positive")
 	if not model_path.is_file():
 		raise FileNotFoundError(f"TabICL checkpoint not found: {model_path}")
 
@@ -243,6 +271,7 @@ def compare_against_leaderboard(args: argparse.Namespace) -> Any:
 				model_path,
 				device=args.device,
 				max_chunk_size=args.max_chunk_size,
+				decoder_chunk_size=args.decoder_chunk_size,
 				num_cpus=args.num_cpus,
 				num_gpus=args.num_gpus,
 			),

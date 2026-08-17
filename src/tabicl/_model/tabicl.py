@@ -190,6 +190,7 @@ class TabICL(nn.Module):
         ] = "graph",
         icl_decoder_type: Literal["mlp", "soft_kmeans", "rbf", "euclidean"] = "mlp",
         icl_soft_kmeans_temperature: float = 0.1,
+        decoder_chunk_size: int = 5000,
         graph_min_train_neighbors: int = 8,
         graph_max_train_neighbors: int = 15,
         graph_cross_label_fraction: float = 0.1,
@@ -256,6 +257,7 @@ class TabICL(nn.Module):
         self.icl_backend = icl_backend
         self.icl_decoder_type = icl_decoder_type
         self.icl_soft_kmeans_temperature = icl_soft_kmeans_temperature
+        self.decoder_chunk_size = decoder_chunk_size
         self.graph_min_train_neighbors = graph_min_train_neighbors
         self.graph_max_train_neighbors = graph_max_train_neighbors
         self.graph_cross_label_fraction = graph_cross_label_fraction
@@ -332,6 +334,7 @@ class TabICL(nn.Module):
             icl_backend=icl_backend,
             decoder_type=icl_decoder_type,
             soft_kmeans_temperature=icl_soft_kmeans_temperature,
+            decoder_chunk_size=decoder_chunk_size,
             graph_min_train_neighbors=graph_min_train_neighbors,
             graph_max_train_neighbors=graph_max_train_neighbors,
             graph_cross_label_fraction=graph_cross_label_fraction,

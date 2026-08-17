@@ -25,6 +25,16 @@ from tabicl.prior._dataset import PriorDataset
 from tabicl import TabICLClassifier
 
 
+GRAPH_BACKENDS = {
+	"graph",
+	"graph-pyg",
+	"graph-1d",
+	"graph-1d-pyg",
+	"graph-2d",
+	"graph-2d-pyg",
+}
+
+
 # Registries make adding another baseline or score a local change rather than
 # requiring changes to the evaluation loop and plotting code.
 BASELINE_FACTORIES: dict[str, Callable[[int, int], object]] = {
@@ -1289,14 +1299,20 @@ def main() -> None:
 	torch.manual_seed(args.seed)
 	device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
 	model, model_type = _build_model_from_checkpoint(str(args.checkpoint), device)
-	if model_type != "tabicl" or getattr(model, "icl_backend", None) != "graph":
-		raise ValueError("The checkpoint must contain a TabICL model with icl_backend='graph'.")
+	if model_type != "tabicl" or getattr(model, "icl_backend", None) not in GRAPH_BACKENDS:
+		raise ValueError(
+			"The checkpoint must contain a TabICL model with a graph backend "
+			"(graph, graph-1d, or graph-2d)."
+		)
 
 	checkpoint_config = torch.load(args.checkpoint, map_location="cpu", weights_only=True).get("config", {})
 	if str(checkpoint_config.get("model_type", "tabicl")).lower() != "tabicl":
 		raise ValueError("The supplied checkpoint must contain a TabICL model.")
-	if checkpoint_config.get("icl_backend") != "graph":
-		raise ValueError("The supplied checkpoint must contain a TabICL model with icl_backend='graph'.")
+	if checkpoint_config.get("icl_backend") not in GRAPH_BACKENDS:
+		raise ValueError(
+			"The supplied checkpoint must contain a TabICL model with a graph backend "
+			"(graph, graph-1d, or graph-2d)."
+		)
 	if args.refinement_ablation:
 		run_refinement_ablation(model, args.checkpoint, args, device)
 		return

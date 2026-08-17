@@ -520,6 +520,44 @@ def test_iclearning_rbf_decoder_rejects_nonpositive_temperature():
         )
 
 
+@pytest.mark.parametrize("decoder_type", ["soft_kmeans", "rbf", "euclidean"])
+def test_iclearning_kernel_decoder_chunking_matches_full(decoder_type):
+    torch.manual_seed(14)
+    y_train = torch.tensor([[0, 1, 0, 2, 1]], dtype=torch.long)
+    src = torch.randn(1, 9, 8)
+    model = ICLearning(
+        max_classes=4,
+        out_dim=4,
+        d_model=8,
+        num_blocks=1,
+        nhead=2,
+        dim_feedforward=16,
+        icl_backend="encoder",
+        decoder_type=decoder_type,
+        decoder_chunk_size=2,
+    )
+
+    decoder = getattr(model, f"_{decoder_type}_decoder")
+    chunked = decoder(src, y_train, train_size=5)
+    model.decoder_chunk_size = src.shape[1]
+    full = decoder(src, y_train, train_size=5)
+
+    assert torch.allclose(chunked, full, atol=1e-6, rtol=1e-6)
+
+
+def test_iclearning_rejects_nonpositive_decoder_chunk_size():
+    with pytest.raises(ValueError, match="decoder_chunk_size must be positive"):
+        ICLearning(
+            max_classes=3,
+            out_dim=3,
+            d_model=8,
+            num_blocks=1,
+            nhead=2,
+            dim_feedforward=16,
+            decoder_chunk_size=0,
+        )
+
+
 def test_iclearning_euclidean_decoder_matches_reference():
     torch.manual_seed(4)
     y_train = torch.tensor([[0, 1, 0, 2]], dtype=torch.long)
