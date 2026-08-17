@@ -7,6 +7,9 @@ import torch
 from torch import Tensor
 
 
+_GRAPH_INDEX_DTYPE = torch.int32
+
+
 @dataclass
 class SparseGraphBatch:
     """Container for a batch of sparse directed graphs.
@@ -416,7 +419,7 @@ class GraphPrior:
         valid = (~same_class) | (counts[inverse] > 1)[:, None]
         destinations = members[target_classes, positions]
         sources = torch.arange(labels.numel(), device=labels.device)[:, None].expand_as(destinations)
-        return _unique_directed_edges(torch.stack((sources[valid], destinations[valid])), labels.numel()).to(torch.uint16)
+        return _unique_directed_edges(torch.stack((sources[valid], destinations[valid])), labels.numel()).to(_GRAPH_INDEX_DTYPE)
 
     def _sample_random_pairs(
         self,
@@ -564,7 +567,7 @@ class GraphPrior:
             homophilic = bool(torch.rand((), generator=generator, device=labels.device) < self.homophily_prob)
             matrix = self._transition_matrix(labels, generator, homophilic=homophilic)
             edges = self._sample_transition_edges(labels, matrix, generator, label_class_info).long()
-        return torch.unique(edges, dim=1).to(torch.uint16)
+        return torch.unique(edges, dim=1).to(_GRAPH_INDEX_DTYPE)
 
     def _sample_graph_task_edges(
         self,
@@ -663,7 +666,7 @@ def _compact_from_graph_batches(graphs: list[SparseGraphBatch | CompactGraphBatc
             running += edge_index.shape[1]
             row.append(running)
         offset_rows.append(row)
-    edge_index = torch.cat(parts, dim=1) if parts else torch.empty((2, 0), dtype=torch.uint16)
+    edge_index = torch.cat(parts, dim=1) if parts else torch.empty((2, 0), dtype=_GRAPH_INDEX_DTYPE)
     return CompactGraphSet(
         edge_index=edge_index,
         edge_offsets=torch.tensor(offset_rows, dtype=torch.long, device=edge_index.device),
@@ -801,8 +804,8 @@ def build_class_conditioned_graph(
     batch_size, train_size = y_train.shape
     if total_nodes < train_size:
         raise ValueError("total_nodes must be >= train_size")
-    if total_nodes > torch.iinfo(torch.uint16).max:
-        raise ValueError("total_nodes must fit in an unsigned 16-bit integer")
+    if total_nodes > torch.iinfo(_GRAPH_INDEX_DTYPE).max:
+        raise ValueError("total_nodes must fit in a signed 32-bit integer")
 
     gen = torch.Generator(device=y_train.device)
     if seed is not None:
@@ -903,7 +906,7 @@ def build_class_conditioned_graph(
         edge_src = torch.cat(src_edges, dim=0)
         edge_dst = torch.cat(dst_edges, dim=0)
         edge_index = torch.stack([edge_src, edge_dst], dim=0)
-        return torch.unique(edge_index, dim=1).to(dtype=torch.uint16)
+        return torch.unique(edge_index, dim=1).to(dtype=_GRAPH_INDEX_DTYPE)
 
     edge_index_batch: list[Tensor] = []
     for b in range(batch_size):

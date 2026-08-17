@@ -1,6 +1,8 @@
 In development
 ==============
 
+- Store generated graph edge indices as signed 32-bit integers, removing the previous 65,535-node limit for class-conditioned graphs. Existing model checkpoints remain compatible, and legacy serialized graph batches are normalized when loaded. Large graphs remain subject to available memory and attention limits.
+
 2.1.0
 =====
 

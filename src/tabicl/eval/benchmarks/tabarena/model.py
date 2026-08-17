@@ -279,10 +279,6 @@ def compare_against_leaderboard(args: argparse.Namespace) -> Any:
 		)]
 	).build_experiments(time_limit=1*60*60)
 
-	print(len(experiments), "experiments built; running...")
-	print(experiments)
-	print("===========================================")
-
 	context = TabArenaContext()
 	context.build_and_run_jobs(
 		experiments,

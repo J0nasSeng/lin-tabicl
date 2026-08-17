@@ -113,6 +113,40 @@ def test_graph_builder_multiple_graphs_are_reproducible_and_independent():
     )
 
 
+def test_graph_builder_uses_int32_edge_indices():
+    y_train = torch.tensor([[0, 1, 0, 1]], dtype=torch.long)
+    graph_set = build_class_conditioned_graphs(
+        y_train=y_train,
+        total_nodes=8,
+        num_graphs=2,
+        min_train_neighbors=1,
+        max_train_neighbors=1,
+        train_neighbors_per_test=1,
+        seed=13,
+    )
+
+    assert graph_set.edge_index.dtype == torch.int32
+    assert all(edge.dtype == torch.int32 for graph in graph_set.graphs for edge in graph.edge_index)
+
+
+def test_graph_builder_supports_more_than_uint16_nodes():
+    y_train = torch.tensor([[0, 1]], dtype=torch.long)
+    graph_set = build_class_conditioned_graphs(
+        y_train=y_train,
+        total_nodes=65_536,
+        num_graphs=1,
+        min_train_neighbors=1,
+        max_train_neighbors=1,
+        train_neighbors_per_test=1,
+        seed=17,
+    )
+    edge_index = graph_set.edge_index
+
+    assert edge_index.dtype == torch.int32
+    assert int(edge_index.max()) == 65_535
+    assert int(edge_index.min()) >= 0
+
+
 def test_graph_prior_graph_tasks_reuse_one_topology_across_gat_slots():
     labels = _build_labels(batch_size=2, train_size=15, num_classes=3)
     graph_set = GraphPrior(

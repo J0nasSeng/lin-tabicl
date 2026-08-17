@@ -329,11 +329,23 @@ class GATInferenceEngine(nn.Module):
 			graph_set = self._compact_graph_set(graph_set, X.shape[0])
 			self._validate_graph_set(graph_set, X.shape[1], X.shape[0])
 
+		if self.model.max_classes > 0 and int(torch.unique(y_train[0]).numel()) > self.model.max_classes:
+			if return_repr:
+				raise ValueError("return_repr is not supported for hierarchical graph inference")
+			out = self.model._inference_forward(
+				X=X,
+				y_train=y_train,
+				feature_shuffles=feature_shuffles,
+				embed_with_test=embed_with_test,
+				return_logits=return_logits,
+				softmax_temperature=softmax_temperature,
+				inference_config=inference_config,
+				graph_set=graph_set,
+			)
+			return (out, None) if return_repr else out
+
 		is_graph_1d = self.model.icl_backend in {"graph-1d", "graph-1d-pyg"}
-		if (
-			(self.mode == "ensemble" and not is_graph_1d)
-			or (self.num_iterations == 1 and self.entry_layer is None and not is_graph_1d)
-		):
+		if self.mode == "ensemble" or (self.num_iterations == 1 and self.entry_layer is None):
 			if return_repr:
 				graph_input = self._graph_input(X, y_train, inference_config, feature_shuffles)
 				representation = self._run_refinement(graph_input, graph_set)

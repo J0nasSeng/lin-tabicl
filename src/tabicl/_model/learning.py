@@ -707,6 +707,50 @@ class ICLearning(nn.Module):
             return out.exp()
         return torch.softmax(out / softmax_temperature, dim=-1)
 
+    def _graph_1d_hierarchical_predictions(
+        self,
+        row_repr: Tensor,
+        y_train: Tensor,
+        graph_set: CompactGraphSet | SparseGraphSet,
+        softmax_temperature: float = 0.9,
+    ) -> Tensor:
+        """Run hierarchical inference for the row-wise graph backend."""
+        train_size = y_train.shape[1]
+        num_classes = int(torch.unique(y_train[0]).numel())
+        self._fit_hierarchical(row_repr[0, :train_size], y_train[0].long())
+        root = self.root
+
+        def process_node(node: ClassNode) -> Tensor:
+            classes = node.classes_.to(y_train.device, dtype=y_train.dtype)
+            mask = torch.isin(y_train[0], classes)
+            node_y = (
+                self._label_encoding(node.y.to(y_train.device).long())
+                if node.is_leaf
+                else node.group_indices.to(y_train.device).long()
+            )
+            node_rows = torch.cat([row_repr[0, :train_size][mask], row_repr[0, train_size:]], dim=0)
+            node_rows = node_rows.unsqueeze(0).clone()
+            node_rows[:, : node_y.numel()] += self.y_encoder(node_y.unsqueeze(0).float())
+            node_graph = induce_graph_set(graph_set, mask, train_size)
+            src = self.gat_icl(node_rows, graph_set=stack_graph_sets([node_graph]))
+            if self.norm_first:
+                src = self.ln(src)
+            local_probs = self._decode_node_probabilities(
+                src, node_y.unsqueeze(0), softmax_temperature
+            )[0]
+
+            if node.is_leaf:
+                result = torch.zeros((row_repr.shape[1] - train_size, num_classes), device=src.device)
+                result[:, classes.long()] = local_probs
+                return result
+
+            result = torch.zeros((row_repr.shape[1] - train_size, num_classes), device=src.device)
+            for group_idx, child in enumerate(node.child_nodes):
+                result += process_node(child) * local_probs[:, group_idx : group_idx + 1]
+            return result
+
+        return process_node(root).unsqueeze(0)
+
     def _graph_hierarchical_predictions(
         self,
         graph_input: Tensor,
@@ -1084,9 +1128,39 @@ class ICLearning(nn.Module):
             out = self._icl_predictions(R, y_train, graph_set=graph_set)
             out = out[:, train_size:]
         else:
-            if self.icl_backend in ("graph", "graph-pyg"):
+            if self.icl_backend in GRAPH_BACKENDS:
                 num_classes = len(torch.unique(y_train[0]))
                 if num_classes > self.max_classes:
+                    if self.icl_backend in GRAPH_1D_BACKENDS:
+                        if graph_set is None:
+                            raise ValueError("Graph hierarchical inference requires graph metadata")
+                        graph_outputs = []
+                        for batch_idx in range(y_train.shape[0]):
+                            node_graph_set = (
+                                graph_set.slice(batch_idx)
+                                if isinstance(graph_set, CompactGraphSet)
+                                else SparseGraphSet(
+                                    graphs=[
+                                        SparseGraphBatch(
+                                            edge_index=[graph.edge_index[batch_idx]],
+                                            num_nodes=graph.num_nodes,
+                                        )
+                                        for graph in graph_set.graphs
+                                    ]
+                                )
+                            )
+                            graph_outputs.append(
+                                self._graph_1d_hierarchical_predictions(
+                                    R[batch_idx : batch_idx + 1],
+                                    y_train[batch_idx : batch_idx + 1],
+                                    node_graph_set,
+                                    softmax_temperature,
+                                )
+                            )
+                        out = torch.cat(graph_outputs, dim=0)
+                        if return_logits:
+                            out = softmax_temperature * torch.log(out.clamp_min(1e-6))
+                        return out
                     if base_col_embeddings is None:
                         raise ValueError(
                             "Graph hierarchical inference requires the unlabelled base_col_embeddings input"

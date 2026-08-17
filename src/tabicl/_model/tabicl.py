@@ -615,12 +615,18 @@ class TabICL(nn.Module):
                 # pipeline and projected input must be assembled on the model
                 # device before adding them together.
                 node_features = node_features.to(device=X.device)
-                node_pre = self.col_embedder.project_input(node_X)
-                node_input = predictor.prepare_graph_input(
-                    node_features,
-                    node_y.unsqueeze(0),
-                    pre_col_embeddings=node_pre,
-                )
+                if self.icl_backend in GRAPH_2D_BACKENDS:
+                    node_pre = self.col_embedder.project_input(node_X)
+                    node_input = predictor.prepare_graph_input(
+                        node_features,
+                        node_y.unsqueeze(0),
+                        pre_col_embeddings=node_pre,
+                    )
+                else:
+                    node_pre = None
+                    node_input = self.row_interactor(
+                        node_features, mgr_config=inference_config.ROW_CONFIG
+                    )
 
                 if base_graph is None:
                     node_graph = build_class_conditioned_graphs(
@@ -637,9 +643,16 @@ class TabICL(nn.Module):
                 else:
                     node_graph = induce_graph_set(base_graph, node_mask, train_size)
                 compact_node_graph = stack_graph_sets([node_graph])
-                node_src = predictor._run_graph_column_pipeline(
-                    node_input, y_train=node_y.unsqueeze(0), graph_set=compact_node_graph
-                )
+                if self.icl_backend in GRAPH_2D_BACKENDS:
+                    node_src = predictor._run_graph_column_pipeline(
+                        node_input, y_train=node_y.unsqueeze(0), graph_set=compact_node_graph
+                    )
+                else:
+                    node_input = node_input.clone()
+                    node_input[:, : node_y.numel()] += predictor.y_encoder(node_y.unsqueeze(0).float())
+                    node_src = predictor.gat_icl(
+                        node_input, graph_set=compact_node_graph
+                    )
                 if predictor.norm_first:
                     node_src = predictor.ln(node_src)
                 local_probs = predictor._decode_node_probabilities(

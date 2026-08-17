@@ -23,6 +23,7 @@ from sklearn.metrics import (
 	recall_score,
 	roc_auc_score,
 )
+from tqdm.auto import tqdm
 
 from tabicl import TabICLClassifier
 from tabicl._model.graph import SparseGraphBatch, SparseGraphSet
@@ -142,6 +143,13 @@ def _dataset_graph_set(
 	)
 
 
+def _advance_dataset_progress(progress: tqdm | None, stage: str) -> None:
+	"""Advance the current-dataset progress bar, when one is active."""
+	if progress is not None:
+		progress.update()
+		progress.set_postfix_str(stage)
+
+
 def evaluate_dataset(
 	name: str,
 	source: str,
@@ -156,12 +164,14 @@ def evaluate_dataset(
 	gat_num_iterations: int = 1,
 	gat_entry_layer: int | str | None = None,
 	max_chunk_size: int | None = None,
+	progress: tqdm | None = None,
 ) -> dict[str, object] | None:
 	"""Load, run, and score one node-classification dataset."""
 	started = time.perf_counter()
 	dataset = _load_dataset(name, split, data_dir, device="cpu")
 	_print_dataset_size(name, dataset)
 	X_train, y_train, X_test, y_test = _masked_arrays(dataset)
+	_advance_dataset_progress(progress, "loaded")
 	print(f"n_labels: {len(np.unique(y_train))}, n_train: {X_train.shape[0]}, n_test: {X_test.shape[0]}")
 	train_mask = dataset.train_mask.detach().cpu().numpy().astype(bool)
 	test_mask = dataset.test_mask.detach().cpu().numpy().astype(bool)
@@ -180,9 +190,10 @@ def evaluate_dataset(
 		gat_entry_layer=gat_entry_layer,
 		max_chunk_size=max_chunk_size,
 		feature_reduction="ensemble",
-		n_components=100,
+		decoder_chunk_size=2500
 	)
 	classifier.fit(X_train, y_train)
+	_advance_dataset_progress(progress, "fitted")
 	graph_set = _dataset_graph_set(dataset, classifier, train_mask, test_mask)
 	# The sklearn adapter already loads frozen weights in eval mode; make the
 	# benchmark invariant explicit for both the adapter and graph engine.
@@ -196,9 +207,11 @@ def evaluate_dataset(
 	with amp_context:
 		y_pred = np.asarray(classifier.predict(X_test, graph_set=graph_set))
 		probabilities = np.asarray(classifier.predict_proba(X_test, graph_set=graph_set))
+	_advance_dataset_progress(progress, "predicted")
 	if probabilities.shape[0] != y_test.shape[0]:
 		raise ValueError("TabICL returned a probability row count different from the test set")
 
+	_advance_dataset_progress(progress, "scored")
 	return {
 		"dataset": name,
 		"source": source,
@@ -255,24 +268,36 @@ def main() -> None:
 		tasks = [task for task in tasks if task[0] in requested]
 
 	rows: list[dict[str, object]] = []
-	for name, source in tasks:
-		try:
-			entry_layer: int | str | None = args.gat_entry_layer
-			if entry_layer is not None and entry_layer != "last":
-				entry_layer = int(entry_layer)
-			result = evaluate_dataset(
-				name, source, model_path, data_dir, split=args.split, device=args.device,
-				n_estimators=args.n_estimators, batch_size=args.batch_size,
-				gat_mode=args.gat_mode, gat_num_iterations=args.gat_num_iterations,
-				gat_entry_layer=entry_layer, max_chunk_size=args.max_chunk_size,
-			)
-			if result is not None:
-				rows.append(result)
-				print(f"completed {name}")
-		except Exception as error:
-			print(f"failed {name}: {error}")
-			if not args.continue_on_error:
-				raise
+	with tqdm(total=len(tasks), desc="Total datasets", unit="dataset", position=0) as total_progress:
+		for name, source in tasks:
+			with tqdm(
+				total=4,
+				desc=name,
+				unit="stage",
+				position=1,
+				leave=False,
+			) as dataset_progress:
+				try:
+					entry_layer: int | str | None = args.gat_entry_layer
+					if entry_layer is not None and entry_layer != "last":
+						entry_layer = int(entry_layer)
+					result = evaluate_dataset(
+						name, source, model_path, data_dir, split=args.split, device=args.device,
+						n_estimators=args.n_estimators, batch_size=args.batch_size,
+						gat_mode=args.gat_mode, gat_num_iterations=args.gat_num_iterations,
+						gat_entry_layer=entry_layer, max_chunk_size=args.max_chunk_size,
+						progress=dataset_progress,
+					)
+					if result is not None:
+						rows.append(result)
+						tqdm.write(f"completed {name}")
+				except Exception as error:
+					dataset_progress.set_postfix_str("failed")
+					tqdm.write(f"failed {name}: {error}")
+					if not args.continue_on_error:
+						raise
+				finally:
+					total_progress.update()
 
 	results = pd.DataFrame(rows)
 	output = args.output.expanduser().resolve()

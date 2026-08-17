@@ -46,6 +46,17 @@ warnings.filterwarnings(
 )
 
 
+def _normalize_graph_edge_index(edge_index: torch.Tensor) -> torch.Tensor:
+    """Load graph indices from any supported historical integer dtype."""
+    if not isinstance(edge_index, torch.Tensor):
+        raise TypeError("Serialized graph edge_index must be a torch.Tensor")
+    if edge_index.ndim != 2 or edge_index.shape[0] != 2:
+        raise ValueError("Serialized graph edge_index must have shape (2, E)")
+    if edge_index.dtype not in (torch.uint16, torch.int32, torch.int64):
+        raise TypeError(f"Serialized graph edge_index must be an integer tensor, got {edge_index.dtype}")
+    return edge_index.to(dtype=torch.int32)
+
+
 def dense2sparse(
     dense_tensor: torch.Tensor, row_lengths: torch.Tensor, dtype: torch.dtype = torch.float32
 ) -> torch.Tensor:
@@ -306,7 +317,7 @@ class LoadPriorDataset(IterableDataset):
             stored_graphs = batch["graph_sets"]
             if isinstance(stored_graphs, dict) and "edge_index" in stored_graphs:
                 graph_sets = CompactGraphSet(
-                    edge_index=stored_graphs["edge_index"],
+                    edge_index=_normalize_graph_edge_index(stored_graphs["edge_index"]),
                     edge_offsets=stored_graphs["edge_offsets"],
                     num_nodes=int(stored_graphs["num_nodes"]),
                 )
@@ -315,7 +326,7 @@ class LoadPriorDataset(IterableDataset):
                     SparseGraphSet(
                         graphs=[
                             SparseGraphBatch(
-                                edge_index=[edge.clone() for edge in graph["edge_index"]],
+                                edge_index=[_normalize_graph_edge_index(edge) for edge in graph["edge_index"]],
                                 num_nodes=int(graph["num_nodes"]),
                             )
                             for graph in graph_set
