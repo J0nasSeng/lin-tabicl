@@ -536,10 +536,10 @@ class SCMPrior(Prior):
 
         self.batch_size_per_gp = batch_size_per_gp
         self.batch_size_per_subgp = batch_size_per_subgp or batch_size_per_gp
-        if self.batch_size != self.batch_size_per_gp:
-            raise ValueError(
-                "batch_size must equal batch_size_per_gp so every generated batch is one homogeneous group"
-            )
+        if self.batch_size_per_gp <= 0:
+            raise ValueError("batch_size_per_gp must be positive")
+        if self.batch_size <= 0 or self.batch_size % self.batch_size_per_gp != 0:
+            raise ValueError("batch_size must be a positive multiple of batch_size_per_gp")
         self.seq_len_per_gp = seq_len_per_gp
         self.prior_type = prior_type
         self.fixed_hp = fixed_hp
@@ -589,7 +589,7 @@ class SCMPrior(Prior):
             Labels tensor of shape ``(seq_len,)``.
 
         d : Tensor
-            Number of active features after filtering (scalar Tensor).
+            Nominal sampled feature width for the group (scalar Tensor).
         """
         if params["prior_type"] == "mlp_scm":
             prior_cls = MLPSCM
@@ -607,12 +607,17 @@ class SCMPrior(Prior):
 
             # Add batch dim for single dataset to be compatible with delete_unique_features and sanity_check
             X, y = X.unsqueeze(0), y.unsqueeze(0)
-            d = torch.tensor([params["num_features"]], device=self.device, dtype=torch.long)
+            nominal_features = int(params["num_features"])
+            d = torch.tensor([nominal_features], device=self.device, dtype=torch.long)
 
             # Only keep valid datasets with sufficient features and balanced classes
-            X, d = self.delete_unique_features(X, d)
-            if (d > 0).all() and self.sanity_check(X, y, params["train_size"]):
-                X, y, d = X.squeeze(0), y.squeeze(0), d.squeeze(0)
+            X, filtered_d = self.delete_unique_features(X, d)
+            if (filtered_d > 0).all() and self.sanity_check(X, y, params["train_size"]):
+                # Keep the nominal group width in metadata. The tensor is
+                # already padded to that width by delete_unique_features;
+                # filtering only changes which columns contain information.
+                X, y = X.squeeze(0), y.squeeze(0)
+                d = torch.tensor(nominal_features, device=self.device, dtype=torch.long)
                 if params.get("graph_backend", False):
                     return X, y, d, _build_prior_graph(params, y)
                 return X, y, d
@@ -638,7 +643,7 @@ class SCMPrior(Prior):
             If seq_len_per_gp=True, returns a NestedTensor.
 
         d : Tensor
-            Number of active features per dataset after filtering, shape ``(batch_size,)``.
+            Nominal sampled feature width per dataset, shape ``(batch_size,)``.
 
         seq_lens : Tensor
             Sequence length for each dataset, shape ``(batch_size,)``.
@@ -768,11 +773,16 @@ class SCMPrior(Prior):
             y = nested_tensor([y.to(self.device) for y in y_list], device=self.device)
         else:
             # Stack into regular tensors for fixed sequence length
-            X = torch.stack(X_list).to(self.device)  # (B, T, H)
+            max_batch_features = max(int(x.shape[-1]) for x in X_list)
+            padded_X = [
+                F.pad(x, (0, max_batch_features - x.shape[-1])) if x.shape[-1] < max_batch_features else x
+                for x in X_list
+            ]
+            X = torch.stack(padded_X).to(self.device)  # (B, T, max_group_width)
             y = torch.stack(y_list).to(self.device)  # (B, T)
 
         # Metadata (always regular tensors)
-        d = torch.stack(d_list).to(self.device)  # Actual number of features after filtering out constant ones
+        d = torch.stack(d_list).to(self.device)  # Nominal homogeneous width for each generated group
         seq_lens = torch.tensor([params["seq_len"] for params in param_list], device=self.device, dtype=torch.long)
         train_sizes = torch.tensor(
             [params["train_size"] for params in param_list], device=self.device, dtype=torch.long

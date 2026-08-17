@@ -68,7 +68,7 @@ def build_parser():
         "--micro_batch_size",
         type=int,
         default=8,
-        help="Number of datasets generated and processed per DataLoader item",
+        help="Number of datasets generated and processed per streamed micro-batch",
     )
     parser.add_argument(
         "--log_conf_mat_every",
@@ -152,7 +152,7 @@ def build_parser():
         "--batch_size_per_gp",
         type=int,
         default=8,
-        help="Datasets per generated group; must equal micro_batch_size",
+        help="Datasets per generated homogeneous micro-batch; must equal micro_batch_size",
     )
     parser.add_argument("--min_features", type=int, default=5, help="The minimum number of features")
     parser.add_argument("--max_features", type=int, default=100, help="The maximum number of features")

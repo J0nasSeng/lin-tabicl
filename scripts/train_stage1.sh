@@ -4,11 +4,11 @@
 ICL_BACKEND=${ICL_BACKEND:-graph-1d}
 # Enable wandb logging by setting WAND_LOG=True (and optionally WAND_MODE=online)
 WAND_LOG=${WAND_LOG:-True}
-WAND_MODE=${WAND_MODE:-offline}
+WAND_MODE=${WAND_MODE:-online}
 # GPU selection controls
 DEVICE=${DEVICE:-cuda}
-NUM_GPUS=${NUM_GPUS:-2}
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
+NUM_GPUS=${NUM_GPUS:-5}
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4}
 # Confusion matrix logging interval
 LOG_CONF_MAT_EVERY=${LOG_CONF_MAT_EVERY:-200000} # effectively disables confusion matrix logging if set to a large number
 
@@ -29,8 +29,8 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --np_seed 42 \
             --torch_seed 42 \
             --max_steps 10000 \
-            --batch_size 512 \
-            --micro_batch_size 8 \
+            --batch_size 500 \
+            --micro_batch_size 5 \
             --log_conf_mat_every ${LOG_CONF_MAT_EVERY} \
             --lr 8e-4 \
             --weight_decay 1e-4 \
@@ -43,7 +43,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --prior_type nanotabicl \
             --prior_device cpu \
             --normalization std \
-            --batch_size_per_gp 8 \
+            --batch_size_per_gp 5 \
             --min_features 2 \
             --max_features 256 \
             --max_classes 10 \

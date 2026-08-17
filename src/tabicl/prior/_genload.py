@@ -387,7 +387,7 @@ class LoadPriorDataset(IterableDataset):
             self.buffer_graph_sets = graph_sets
             self.buffer_size = file_batch_size
 
-        # Keep loading files until we have a complete streamed micro-batch.
+        # Keep loading files until we have a complete full training batch.
         while self.buffer_size < self.batch_size:
             # Check if we've reached max_batches
             if self.max_batches is not None and self.current_idx >= self.max_batches:
@@ -437,12 +437,12 @@ class LoadPriorDataset(IterableDataset):
                 if self.max_batches is not None and self.current_idx >= self.max_batches:
                     raise StopIteration from e
                 raise RuntimeError(
-                    f"Could not load enough datasets for a complete micro-batch of "
+                    f"Could not load enough datasets for a complete batch of "
                     f"{self.batch_size}: {e}"
                 ) from e
 
-        # A loader item is always a complete micro-batch. Never return a
-        # partial item because the trainer relies on fixed accumulation steps.
+        # A loader item is always a complete logical batch. The Trainer splits
+        # it into homogeneous feature groups for gradient accumulation.
         output_size = self.batch_size
 
         # Prepare output

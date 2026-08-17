@@ -449,16 +449,31 @@ class Trainer:
             graph_backend=getattr(self.config, "icl_backend", None) in GRAPH_BACKENDS,
         )
 
-    def _build_prior_dataloader(self, dataset):
+    def _build_train_prior_dataloader(self, dataset):
         return DataLoader(
             dataset,
             batch_size=None,  # No additional batching since prior dataset handles batching internally
             shuffle=False,
-            num_workers=4,
-            prefetch_factor=64,
-            pin_memory=True if self.config.prior_device == "cpu" else False,
+            num_workers=12,
+            prefetch_factor=32,
+            pin_memory=self.config.prior_device == "cpu",
             pin_memory_device=self.config.device if self.config.prior_device == "cpu" else "",
             persistent_workers=True,
+        )
+
+    def _build_validation_prior_dataloader(self, dataset):
+        """Build a deliberately lightweight validation loader.
+
+        Validation is only consumed when validation logging is enabled, so it
+        must not reserve a second prefetched worker pool comparable to train.
+        """
+        return DataLoader(
+            dataset,
+            batch_size=None,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=False,
+            persistent_workers=False,
         )
 
     def configure_prior(self):
@@ -470,8 +485,8 @@ class Trainer:
         if self.master_process:
             print(train_dataset)
 
-        self.train_dataloader = self._build_prior_dataloader(train_dataset)
-        self.val_dataloader = self._build_prior_dataloader(val_dataset)
+        self.train_dataloader = self._build_train_prior_dataloader(train_dataset)
+        self.val_dataloader = self._build_validation_prior_dataloader(val_dataset)
 
     def configure_optimizer(self):
         """Configure optimizer and scheduler."""
@@ -696,7 +711,8 @@ class Trainer:
         train_dataloader = iter(self.train_dataloader)
         val_dataloader = iter(self.val_dataloader)
         for step in step_progress:
-            # Consume a logical batch as a stream of prefetched micro-batches.
+            # Consume one prefetched logical batch and split it into
+            # feature-homogeneous micro-batches in the main thread.
             with Timer() as train_timer:
                 results, prior_time, train_dataloader = self.run_batch(train_dataloader)
 
@@ -778,6 +794,41 @@ class Trainer:
             t.to_padded_tensor(padding=0.0) if hasattr(t, "is_nested") and t.is_nested else t
             for t in batch
         ]
+
+    def _split_full_batch(self, batch):
+        """Split one full generated batch into contiguous homogeneous groups."""
+        fields = list(batch)
+        if not fields or not hasattr(fields[0], "shape"):
+            raise ValueError("Invalid full batch payload")
+        batch_size = int(fields[0].shape[0])
+        group_size = int(self.config.batch_size_per_gp)
+        if batch_size != self.config.batch_size:
+            raise RuntimeError(
+                f"DataLoader returned {batch_size} datasets; expected full batch_size={self.config.batch_size}"
+            )
+        if batch_size % group_size:
+            raise RuntimeError("Full batch size must be divisible by batch_size_per_gp")
+
+        if len(fields) not in (5, 6):
+            raise ValueError("Expected five batch fields, optionally followed by graph metadata")
+        graph_set = fields[5] if len(fields) == 6 else None
+        groups = []
+        for start in range(0, batch_size, group_size):
+            end = start + group_size
+            x, y, d = fields[0][start:end], fields[1][start:end], fields[2][start:end]
+            seq_lens, train_sizes = fields[3][start:end], fields[4][start:end]
+            if not torch.all(d == d[0]):
+                raise ValueError("Generated group must have a homogeneous feature width")
+            if not torch.all(seq_lens == seq_lens[0]) or not torch.all(train_sizes == train_sizes[0]):
+                raise ValueError("Generated group must have homogeneous sequence and train sizes")
+            width = int(d[0].item())
+            if width <= 0 or width > x.shape[-1]:
+                raise ValueError(f"Invalid generated feature width {width} for tensor width {x.shape[-1]}")
+            group_fields = [x[..., :width], y, d, seq_lens, train_sizes]
+            if graph_set is not None:
+                group_fields.append(graph_set.slice(slice(start, end)))
+            groups.append(tuple(group_fields))
+        return groups
 
     def _prepare_micro_batch_tensors(self, micro_batch):
         micro_X, micro_y, micro_d, micro_seq_len, micro_train_size = micro_batch[:5]
@@ -944,7 +995,7 @@ class Trainer:
         return global_grad_norm
 
     def validate_micro_batch(self, micro_seq_len, micro_train_size):
-        """Validate consistent sequence length and train size within a micro batch.
+        """Validate homogeneous metadata within a streamed micro batch.
 
         Ensures all datasets in a micro batch share the same sequence length and
         train/test split position, required for efficient batch processing during
@@ -987,7 +1038,7 @@ class Trainer:
         """Truncate micro batch tensors to required dimensions.
 
         Truncates sequence length and feature dimensions to the validated `seq_len`
-        and the maximum active features (``micro_d.max()``) respectively. This
+        and the homogeneous feature width (``micro_d[0]``) respectively. This
         optimizes memory and computation by removing unused tensor elements.
 
         Parameters
@@ -1007,11 +1058,14 @@ class Trainer:
         Returns
         -------
         micro_X : Tensor
-            Truncated features of shape ``(B, seq_len, micro_d.max())``.
+            Truncated features of shape ``(B, seq_len, micro_d[0])``.
 
         micro_y : Tensor
             Truncated labels of shape ``(B, seq_len)``.
         """
+        if micro_d.numel() == 0 or not torch.all(micro_d == micro_d[0]):
+            raise ValueError("All datasets in the streamed micro batch must have the same feature width.")
+
         # Truncate sequence length
         if micro_X.shape[1] > seq_len:
             micro_X = micro_X[:, :seq_len]
@@ -1019,10 +1073,11 @@ class Trainer:
         if micro_y.shape[1] > seq_len:
             micro_y = micro_y[:, :seq_len]
 
-        # Truncate feature dimension
-        max_features = micro_d.max().item()
-        if micro_X.shape[-1] > max_features:
-            micro_X = micro_X[..., :max_features]
+        # Truncate feature dimension. The streamed prior contract guarantees
+        # one nominal width per item, so avoid scanning the whole metadata tensor.
+        feature_width = micro_d[0].item()
+        if micro_X.shape[-1] > feature_width:
+            micro_X = micro_X[..., :feature_width]
 
         return micro_X, micro_y
 
@@ -1221,7 +1276,7 @@ class Trainer:
         return micro_results
 
     def run_batch(self, dataloader_iterator):
-        """Run one logical batch from streamed micro-batches and update once."""
+        """Run one logical batch by accumulating streamed homogeneous groups."""
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
 
@@ -1277,7 +1332,7 @@ class Trainer:
         return results, prior_time, dataloader_iterator
 
     def run_validation_logging_batch(self, dataloader_iterator):
-        """Evaluate one logical validation batch from streamed micro-batches."""
+        """Evaluate one logical validation batch from streamed groups."""
 
         was_training = self.model.training
         self.model.eval()
@@ -1303,6 +1358,11 @@ class Trainer:
                         micro_batch = next(dataloader_iterator)
                 prior_time += prior_timer.elapsed
                 micro_batch = self._prepare_padded_batch(micro_batch)
+                if micro_batch[0].shape[0] != self.config.micro_batch_size:
+                    raise RuntimeError(
+                        f"DataLoader returned {micro_batch[0].shape[0]} datasets; "
+                        f"expected micro_batch_size={self.config.micro_batch_size}"
+                    )
                 micro_results = self.run_micro_batch(
                     micro_batch,
                     idx,
