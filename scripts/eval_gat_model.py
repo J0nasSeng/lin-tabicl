@@ -15,11 +15,17 @@ from typing import Callable
 
 import numpy as np
 import torch
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import log_loss, recall_score
 from sklearn.neighbors import KNeighborsClassifier
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import StandardScaler
 
-from tabicl.eval._run import _build_model_from_checkpoint, _evaluate_one_dataset
+from xgboost import XGBClassifier
+
+from tabicl.eval._run import EvalSample, _build_model_from_checkpoint, _evaluate_one_dataset
 from tabicl._preprocessing.normalizer import RobustScaler, Standardizer, infer_feature_types
 from tabicl.prior._dataset import PriorDataset
 from tabicl import TabICLClassifier
@@ -34,12 +40,41 @@ GRAPH_BACKENDS = {
 	"graph-2d-pyg",
 }
 
+GRAPH_EVALUATION_CONFIG = {
+	"graph_min_train_neighbors": 4,
+	"graph_max_train_neighbors": 4,
+	"graph_train_neighbors_per_test": 2,
+	"graph_cross_label_fraction": 0.25,
+	"graph_num_graphs": 6,
+	"graph_v1_prob": 0.5,
+	"graph_v2_prob": 0.5,
+	"graph_prob": 0.0,
+}
+
 
 # Registries make adding another baseline or score a local change rather than
 # requiring changes to the evaluation loop and plotting code.
 BASELINE_FACTORIES: dict[str, Callable[[int, int], object]] = {
 	"random_forest": lambda seed, n_estimators: RandomForestClassifier(
 		n_estimators=n_estimators, random_state=seed, n_jobs=1
+	),
+	"linear": lambda seed, _n_estimators: make_pipeline(
+		StandardScaler(),
+		LogisticRegression(max_iter=1000, random_state=seed),
+	),
+	"extra_trees": lambda seed, n_estimators: ExtraTreesClassifier(
+		n_estimators=n_estimators, random_state=seed, n_jobs=1
+	),
+	"xgboost": lambda seed, n_estimators: XGBClassifier(
+		n_estimators=n_estimators,
+		max_depth=6,
+		learning_rate=0.05,
+		subsample=0.8,
+		colsample_bytree=0.8,
+		eval_metric="logloss",
+		n_jobs=1,
+		random_state=seed,
+		verbosity=0,
 	),
 }
 SCORES: dict[str, Callable[[np.ndarray, np.ndarray, np.ndarray, np.ndarray], float]] = {
@@ -116,13 +151,19 @@ def build_parser() -> argparse.ArgumentParser:
 	parser = argparse.ArgumentParser(description=__doc__)
 	parser.add_argument("checkpoint", type=Path, nargs="?", help="TabICL checkpoint (.ckpt) to evaluate")
 	parser.add_argument("--num-datasets", type=int, default=1000, help="Datasets per class count")
-	parser.add_argument("--batch-size", type=int, default=32, help="Prior datasets generated per batch")
+	parser.add_argument("--batch-size", type=int, default=1, help="Prior datasets generated per batch")
+	parser.add_argument(
+		"--batch-size-per-gp",
+		type=int,
+		default=1,
+		help="Datasets sharing sampled prior settings; 5 matches Stage 1 training.",
+	)
 	parser.add_argument("--min-features", type=int, default=2)
-	parser.add_argument("--max-features", type=int, default=10)
-	parser.add_argument("--max-seq-len", type=int, default=1024)
+	parser.add_argument("--max-features", type=int, default=256)
+	parser.add_argument("--max-seq-len", type=int, default=2048)
 	parser.add_argument("--min-seq-len", type=int, default=None)
-	parser.add_argument("--min-train-size", type=float, default=0.2)
-	parser.add_argument("--max-train-size", type=float, default=0.6)
+	parser.add_argument("--min-train-size", type=float, default=0.1)
+	parser.add_argument("--max-train-size", type=float, default=0.9)
 	parser.add_argument("--prior-type", choices=["mlp_scm", "tree_scm", "mix_scm", "nanotabicl"], default="nanotabicl")
 	parser.add_argument("--prior-device", default="cpu")
 	parser.add_argument("--device", default=None, help="Inference device (default: cuda when available)")
@@ -130,8 +171,8 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument(
 		"--normalization",
 		choices=("none", "std", "robust"),
-		default="none",
-		help="Optional feature normalization applied before evaluation (default: none).",
+		default="std",
+		help="Optional feature normalization applied before evaluation (default: std, matching Stage 1 training).",
 	)
 	parser.add_argument(
 		"--normalize-features",
@@ -180,6 +221,28 @@ def build_parser() -> argparse.ArgumentParser:
 		"--refinement-ablation",
 		action="store_true",
 		help="Run a native GAT evaluation ablation over refinement iterations 1..10.",
+	)
+	parser.add_argument(
+		"--graph-mixture-ablation",
+		action="store_true",
+		help="Compare pure v1, pure v2, and pure graph-prior mixtures.",
+	)
+	parser.add_argument(
+		"--cross-label-fraction-ablation",
+		action="store_true",
+		help="Compare graph cross-label fractions 0, 0.1, and 0.25.",
+	)
+	parser.add_argument(
+		"--n-estimators-ablation",
+		action="store_true",
+		help="Compare sklearn ensemble sizes 1, 2, 4, and 8.",
+	)
+	parser.add_argument(
+		"--n-estimators-ablation-values",
+		type=int,
+		nargs="+",
+		default=[1, 2, 4, 8],
+		help="Estimator counts for --n-estimators-ablation.",
 	)
 	parser.add_argument(
 		"--refinement-ablation-num-datasets",
@@ -361,6 +424,54 @@ def _soft_knn_predictions_from_representation(
 	return predictions, probabilities, classes
 
 
+def _representation_probe_predictions(
+	representations: np.ndarray,
+	y_train: np.ndarray,
+	probe: object,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+	"""Fit a classifier on graph representations and predict test rows."""
+	representations = np.nan_to_num(
+		representations, nan=0.0, posinf=0.0, neginf=0.0
+	)
+	train_size = y_train.shape[0]
+	probe.fit(representations[:train_size], y_train)
+	probabilities = probe.predict_proba(representations[train_size:])
+	classes = np.asarray(probe.classes_)
+	predictions = classes[np.argmax(probabilities, axis=1)].astype(int)
+	return predictions, probabilities, classes
+
+
+def _baseline_predictions(
+	name: str,
+	baseline: object,
+	x_train: np.ndarray,
+	y_train: np.ndarray,
+	x_test: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+	"""Fit a raw-feature baseline and restore its original class labels."""
+	x_train = np.nan_to_num(x_train)
+	x_test = np.nan_to_num(x_test)
+	if name != "xgboost":
+		baseline.fit(x_train, y_train)
+		probabilities = baseline.predict_proba(x_test)
+		classes = np.asarray(baseline.classes_)
+	else:
+		# XGBoost requires labels encoded as [0, ..., n_classes - 1], while
+		# PriorDataset can produce arbitrary/non-contiguous class IDs.
+		encoder = LabelEncoder()
+		encoded_labels = encoder.fit_transform(y_train)
+		n_classes = len(encoder.classes_)
+		if n_classes == 2:
+			baseline.set_params(objective="binary:logistic")
+		else:
+			baseline.set_params(objective="multi:softprob", num_class=n_classes)
+		baseline.fit(x_train, encoded_labels)
+		probabilities = baseline.predict_proba(x_test)
+		classes = encoder.classes_
+	predictions = classes[np.argmax(probabilities, axis=1)].astype(int)
+	return predictions, probabilities, classes
+
+
 def _soft_knn_ensemble_probabilities(
 	gat_tabicl: TabICLClassifier,
 	x_test: np.ndarray,
@@ -468,6 +579,7 @@ def run_refinement_ablation(
 
 	prior = PriorDataset(
 		batch_size=args.batch_size,
+		batch_size_per_gp=args.batch_size_per_gp,
 		min_features=args.min_features,
 		max_features=args.max_features,
 		max_classes=num_classes,
@@ -585,6 +697,8 @@ def run_soft_knn_ablation(
 		raise ValueError("--soft-knn-ablation-num-datasets must be positive")
 	if args.soft_knn_ablation_num_classes < 2:
 		raise ValueError("--soft-knn-ablation-num-classes must be at least 2")
+	if any(value < 1 for value in args.n_estimators_ablation_values):
+		raise ValueError("--n-estimators-ablation-values must be positive")
 	if args.refinement_ablation_num_datasets < 1:
 		raise ValueError("--refinement-ablation-num-datasets must be positive")
 	if args.refinement_ablation_num_classes < 2:
@@ -601,6 +715,7 @@ def run_soft_knn_ablation(
 
 	prior = PriorDataset(
 		batch_size=args.batch_size,
+		batch_size_per_gp=args.batch_size_per_gp,
 		min_features=args.min_features,
 		max_features=args.max_features,
 		max_classes=args.soft_knn_ablation_num_classes,
@@ -642,6 +757,7 @@ def run_soft_knn_ablation(
 				args.seed + processed,
 				args.num_refinement_iter,
 				args.entry_layer,
+				graph_config=GRAPH_EVALUATION_CONFIG.copy(),
 			)
 			gat_tabicl.fit(x[:train_size], y_train)
 			ablation_outputs = _soft_knn_ensemble_probabilities(
@@ -761,6 +877,7 @@ def _build_gat_tabicl(
 	seed: int,
 	num_refinement_iter: int,
 	entry_layer: int | str | None,
+	graph_config: dict[str, object] | None = None,
 ):
 	"""Build the supplied graph checkpoint through the sklearn interface."""
 	return TabICLClassifier(
@@ -774,7 +891,133 @@ def _build_gat_tabicl(
 		gat_num_iterations=num_refinement_iter,
 		gat_entry_layer=entry_layer,
 		norm_methods="none",
+		graph_config=graph_config,
 	)
+
+
+def run_graph_ablation(
+	checkpoint: Path,
+	args: argparse.Namespace,
+	device: str,
+	name: str,
+	variants: list[tuple[str, dict[str, object], int]],
+) -> list[dict]:
+	"""Evaluate graph TabICL variants on identical prior datasets.
+
+	Each variant is a ``(label, graph_config, n_estimators)`` tuple. No
+	baselines are fitted; the resulting plot contains only graph TabICL.
+	"""
+	import matplotlib
+	matplotlib.use("Agg", force=True)
+	import matplotlib.pyplot as plt
+
+	if not variants:
+		raise ValueError("At least one ablation variant is required")
+	prior = PriorDataset(
+		batch_size=args.batch_size,
+		batch_size_per_gp=args.batch_size_per_gp,
+		min_features=args.min_features,
+		max_features=args.max_features,
+		max_classes=10,
+		min_seq_len=args.min_seq_len,
+		max_seq_len=args.max_seq_len,
+		min_train_size=args.min_train_size,
+		max_train_size=args.max_train_size,
+		prior_type=args.prior_type,
+		device=args.prior_device,
+		n_jobs=1,
+		normalization=("std" if args.normalize_features and args.normalization == "none" else args.normalization),
+	)
+	rows: list[dict] = []
+	processed = 0
+	batch_index = 0
+	while processed < args.num_datasets:
+		batch = _as_regular_tensors(prior.get_batch())
+		current_batch_index = batch_index
+		batch_index += 1
+		for index in range(int(batch[0].shape[0])):
+			if processed >= args.num_datasets:
+				break
+			seq_len = int(batch[3][index].item())
+			train_size = int(batch[4][index].item())
+			y = batch[1][index, :seq_len].numpy().astype(int)
+			y_train, y_test = y[:train_size], y[train_size:]
+			if not _has_complete_label_support(y_train, y_test):
+				processed += 1
+				continue
+			x = batch[0][index, :seq_len, : int(batch[2][index].item())].numpy()
+			for label, graph_config, n_estimators in variants:
+				classifier = _build_gat_tabicl(
+					checkpoint,
+					n_estimators,
+					device,
+					args.seed + processed,
+					1,
+					"last",
+					graph_config=graph_config,
+				)
+				classifier.fit(x[:train_size], y_train)
+				probabilities = classifier.predict_proba(x[train_size:])
+				predictions = classifier.classes_[np.argmax(probabilities, axis=1)].astype(int)
+				rows.append({
+					"ablation": name,
+					"variant": label,
+					"dataset": processed,
+					"batch": current_batch_index,
+					"n_features": x.shape[1],
+					"score": "balanced_accuracy",
+					"value": _balanced_accuracy(y_test, predictions),
+				})
+			processed += 1
+
+	args.output_dir.mkdir(parents=True, exist_ok=True)
+	results_output = args.output_dir / f"{name}_ablation.json"
+	results_output.write_text(json.dumps(rows, indent=2))
+	labels = [variant[0] for variant in variants]
+	values = [[row["value"] for row in rows if row["variant"] == label] for label in labels]
+	fig, ax = plt.subplots(figsize=(max(7, len(labels) * 1.8), 5), dpi=150)
+	boxplot = ax.boxplot(values, labels=labels, patch_artist=True, showmeans=True)
+	for patch in boxplot["boxes"]:
+		patch.set_facecolor("#4472C4")
+		patch.set_alpha(0.75)
+	ax.set(
+		title=f"GAT TabICL {name} ablation (datasets={args.num_datasets})",
+		ylabel="Balanced accuracy",
+		ylim=(0.0, 1.0),
+	)
+	ax.grid(axis="y", alpha=0.25)
+	fig.tight_layout()
+	plot_output = args.output_dir / f"{name}_ablation_balanced_accuracy.png"
+	fig.savefig(plot_output)
+	plt.close(fig)
+	print(f"Saved {name} ablation results to {results_output}")
+	print(f"Saved {name} ablation plot to {plot_output}")
+	return rows
+
+
+def run_requested_ablations(checkpoint: Path, args: argparse.Namespace, device: str) -> None:
+	"""Run each requested graph-only ablation independently."""
+	if args.graph_mixture_ablation:
+		base = GRAPH_EVALUATION_CONFIG.copy()
+		run_graph_ablation(checkpoint, args, device, "graph_mixture", [
+			("v1", {**base, "graph_v1_prob": 1.0, "graph_v2_prob": 0.0, "graph_prob": 0.0}, 1),
+			("v2", {**base, "graph_v1_prob": 0.0, "graph_v2_prob": 1.0, "graph_prob": 0.0}, 1),
+			("graph", {**base, "graph_v1_prob": 0.0, "graph_v2_prob": 0.0, "graph_prob": 1.0}, 1),
+		])
+	if args.cross_label_fraction_ablation:
+		base = GRAPH_EVALUATION_CONFIG.copy()
+		run_graph_ablation(checkpoint, args, device, "cross_label_fraction", [
+			(str(fraction), {**base, "graph_cross_label_fraction": fraction}, 1)
+			for fraction in (0.0, 0.1, 0.25)
+		])
+	if args.n_estimators_ablation:
+		base = GRAPH_EVALUATION_CONFIG.copy()
+		for value in args.n_estimators_ablation_values:
+			if value < 1:
+				raise ValueError("--n-estimators-ablation-values must be positive")
+		run_graph_ablation(checkpoint, args, device, "n_estimators", [
+			(str(value), base, value) for value in args.n_estimators_ablation_values
+		])
 
 
 def _plot_umap(
@@ -885,6 +1128,7 @@ def _evaluate_class_count(
 ) -> list[dict]:
 	prior = PriorDataset(
 		batch_size=args.batch_size,
+		batch_size_per_gp=args.batch_size_per_gp,
 		min_features=args.min_features,
 		max_features=args.max_features,
 		max_classes=num_classes,
@@ -925,6 +1169,8 @@ def _evaluate_class_count(
 			train_size = int(batch[4][index].item())
 			x_train, x_test = x[:train_size], x[train_size:]
 
+			print(f"Evaluating K={num_classes}, Shape={x.shape}, dataset={processed}...")
+
 			gat_tabicl = _build_gat_tabicl(
 				checkpoint,
 				gat_n_estimators,
@@ -932,6 +1178,11 @@ def _evaluate_class_count(
 				args.seed + processed,
 				args.num_refinement_iter,
 				args.entry_layer,
+				graph_config={
+					"graph_v1_prob": 1.0,
+					"graph_v2_prob": 0.0,
+					"graph_prob": 0.0,
+				},
 			)
 			gat_tabicl.fit(x_train, y_train)
 			gat_proba = gat_tabicl.predict_proba(x_test)
@@ -939,7 +1190,19 @@ def _evaluate_class_count(
 			gat_representation = gat_tabicl.predict_representation(x_test)
 
 			if args.skip_baselines:
-				sample = _evaluate_one_dataset(model, "tabicl", batch, index, device)
+				# Use the fitted GAT estimator's representation for the UMAP plot.
+				# Re-evaluating the raw checkpoint here passes the batched prior graph
+				# metadata to a shorter, single-dataset input, which can have a
+				# different ``num_nodes`` and triggers a graph-dimension mismatch.
+				sample = EvalSample(
+					x=torch.from_numpy(x),
+					y_full=torch.from_numpy(y),
+					y_pred_test=torch.from_numpy(gat_prediction),
+					y_logits_test=torch.from_numpy(gat_proba),
+					y_true_test=torch.from_numpy(y_test),
+					repr_full=torch.from_numpy(gat_representation),
+					train_size=train_size,
+				)
 				random_forest = BASELINE_FACTORIES["random_forest"](
 					args.seed + processed, args.rf_n_estimators
 				)
@@ -960,6 +1223,7 @@ def _evaluate_class_count(
 				else:
 					tabicl_scores = gat_proba
 				tabicl_entropy = _mean_entropy(tabicl_scores)
+				print("Plot UMAP...")
 				try:
 					_plot_umap(
 						sample,
@@ -992,17 +1256,34 @@ def _evaluate_class_count(
 			predictions = {
 				"gat_tabicl": (gat_prediction, gat_proba, gat_tabicl.classes_),
 			}
+			# Always include a representation kNN probe. The optional --knn
+			# argument remains available for requesting a different k explicitly.
+			probe_knn_prediction, probe_knn_proba, probe_knn_labels = (
+				_knn_predictions_from_representation(gat_representation, y_train, args.knn or 2)
+			)
+			predictions["knn_probe"] = (
+				probe_knn_prediction,
+				probe_knn_proba,
+				probe_knn_labels,
+			)
 			if knn_prediction is not None:
 				predictions["knn"] = (knn_prediction, knn_proba, knn_labels)
+			linear_probe = make_pipeline(
+				StandardScaler(),
+				LogisticRegression(max_iter=1000, random_state=args.seed + processed),
+			)
+			probe_prediction, probe_proba, probe_labels = _representation_probe_predictions(
+				gat_representation,
+				y_train,
+				linear_probe,
+			)
+			predictions["linear_probe"] = (probe_prediction, probe_proba, probe_labels)
 			for name, factory in BASELINE_FACTORIES.items():
 				baseline = factory(args.seed + processed, args.rf_n_estimators)
 				# RF versions differ in NaN support; replacing non-finite
 				# values keeps this baseline portable across sklearn versions.
-				baseline.fit(np.nan_to_num(x_train), y_train)
-				predictions[name] = (
-					baseline.predict(np.nan_to_num(x_test)).astype(int),
-					baseline.predict_proba(np.nan_to_num(x_test)),
-					baseline.classes_,
+				predictions[name] = _baseline_predictions(
+					name, baseline, x_train, y_train, x_test
 				)
 
 			# Use a fresh estimator and the public sklearn-compatible API for the
@@ -1012,13 +1293,17 @@ def _evaluate_class_count(
 				device,
 				args.seed + processed,
 			)
-			pretrained_tabicl.fit(x_train, y_train)
-			pretrained_proba = pretrained_tabicl.predict_proba(x_test)
-			predictions["pretrained_tabicl"] = (
-				pretrained_tabicl.classes_[np.argmax(pretrained_proba, axis=1)].astype(int),
-				pretrained_proba,
-				pretrained_tabicl.classes_,
-			)
+			try:
+				pretrained_tabicl.fit(x_train, y_train)
+				pretrained_proba = pretrained_tabicl.predict_proba(x_test)
+				predictions["pretrained_tabicl"] = (
+					pretrained_tabicl.classes_[np.argmax(pretrained_proba, axis=1)].astype(int),
+					pretrained_proba,
+					pretrained_tabicl.classes_,
+				)
+			except Exception as exc:
+				print(f"Warning: pretrained TabICL failed for K={num_classes}, dataset={processed}: {exc}")
+				continue
 
 			for model_name, (prediction, probabilities, class_labels) in predictions.items():
 				for score_name, score_fn in SCORES.items():
@@ -1252,6 +1537,10 @@ def main() -> None:
 	args = build_parser().parse_args()
 	if args.num_datasets < 1:
 		raise ValueError("--num-datasets must be positive")
+	if args.batch_size < 1 or args.batch_size_per_gp < 1:
+		raise ValueError("--batch-size and --batch-size-per-gp must be positive")
+	if args.batch_size % args.batch_size_per_gp != 0:
+		raise ValueError("--batch-size must be a multiple of --batch-size-per-gp")
 	if args.rf_n_estimators < 1:
 		raise ValueError("--rf-n-estimators must be positive")
 	if args.pretrained_tabicl_n_estimators < 1:
@@ -1313,6 +1602,9 @@ def main() -> None:
 			"The supplied checkpoint must contain a TabICL model with a graph backend "
 			"(graph, graph-1d, or graph-2d)."
 		)
+	if args.graph_mixture_ablation or args.cross_label_fraction_ablation or args.n_estimators_ablation:
+		run_requested_ablations(args.checkpoint, args, device)
+		return
 	if args.refinement_ablation:
 		run_refinement_ablation(model, args.checkpoint, args, device)
 		return
@@ -1321,7 +1613,7 @@ def main() -> None:
 		return
 
 	rows = []
-	for num_classes in range(10, 11):
+	for num_classes in [10]:
 		print(f"Evaluating {args.num_datasets} datasets for K={num_classes}...")
 		rows.extend(_evaluate_class_count(model, args.checkpoint, args, num_classes, device))
 	if args.skip_baselines:

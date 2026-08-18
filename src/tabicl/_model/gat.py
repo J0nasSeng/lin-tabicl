@@ -287,6 +287,13 @@ class GraphAttentionBlock(nn.Module):
         edge_index_batch: Sequence[Tensor] | Tensor,
         edge_index_is_global: bool = False,
     ) -> Tensor:
+        # Some benchmark checkpoints contain a half-precision GAT stack, while
+        # the sklearn/AutoGluon adapter supplies float32 activations. LayerNorm
+        # and the linear projections require matching dtypes.
+        target_dtype = self.norm1.weight.dtype
+        if src.dtype != target_dtype:
+            src = src.to(dtype=target_dtype)
+
         if self.norm_first:
             x = self.dropout1(
                 self.attn(

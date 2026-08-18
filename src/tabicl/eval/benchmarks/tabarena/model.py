@@ -9,6 +9,8 @@ are used unchanged.
 from __future__ import annotations
 
 import argparse
+import re
+import uuid
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
@@ -33,6 +35,20 @@ GRAPH_BACKENDS = {
 	"graph-1d-pyg",
 	"graph-2d",
 	"graph-2d-pyg",
+}
+
+# These values must match the graph prior used to fine-tune the checkpoint.
+# Keep them explicit here so a TabArena run cannot silently evaluate with a
+# different graph sampler because of missing or stale checkpoint metadata.
+EVALUATION_GRAPH_CONFIG = {
+	"graph_min_train_neighbors": 4,
+	"graph_max_train_neighbors": 4,
+	"graph_train_neighbors_per_test": 2,
+	"graph_cross_label_fraction": 0.25,
+	"graph_num_graphs": 6,
+	"graph_v1_prob": 1.0,
+	"graph_v2_prob": 0.0,
+	"graph_prob": 0.0,
 }
 
 
@@ -73,6 +89,9 @@ class TabICLGraphModel(AbstractModelBase):
 			kwargs["model_path"] = model_path
 		self.model_path = model_path
 		self._tabicl: TabICLClassifier | None = None
+		self._umap_plotted = False
+		self._train_X: Any = None
+		self._train_y: Any = None
 		super().__init__(**kwargs)
 
 	def _set_default_params(self) -> None:
@@ -120,6 +139,20 @@ class TabICLGraphModel(AbstractModelBase):
 				"TabICLGraphModel requires a checkpoint with a graph backend "
 				"(graph, graph-1d, or graph-2d)"
 			)
+		mismatches = {
+			parameter: (config.get(parameter), expected)
+			for parameter, expected in EVALUATION_GRAPH_CONFIG.items()
+			if parameter in config and config[parameter] != expected
+		}
+		if mismatches:
+			details = ", ".join(
+				f"{parameter}={actual!r} (expected {expected!r})"
+				for parameter, (actual, expected) in mismatches.items()
+			)
+			raise ValueError(
+				"Checkpoint graph configuration does not match the TabArena evaluation "
+				f"configuration: {details}"
+			)
 
 	def _tabicl_kwargs(self) -> dict[str, Any]:
 		params = self.params.copy()
@@ -130,6 +163,9 @@ class TabICLGraphModel(AbstractModelBase):
 		params.pop("ag_name", None)
 		params.pop("ag_key", None)
 		params.pop("ag_args_fit", None)
+		# These are TabArena wrapper settings, not TabICLClassifier arguments.
+		params.pop("plot_umap", None)
+		params.pop("umap_output_dir", None)
 		params["model_path"] = self.model_path or self.params.get("model_path")
 		params["allow_auto_download"] = False
 		params["kv_cache"] = False
@@ -139,20 +175,108 @@ class TabICLGraphModel(AbstractModelBase):
 		params["max_chunk_size"] = self.params.get("max_chunk_size")
 		params["decoder_chunk_size"] = self.params.get("decoder_chunk_size", 5000)
 		params["n_estimators"] = 1
-		params["feature_reduction"] = "ensemble"
-		params["n_components"] = 100
+		params["norm_methods"] = "none"
+		params["graph_config"] = EVALUATION_GRAPH_CONFIG.copy()
+		params["softmax_temperature"] = 0.2
 		return params
 
 	def _fit(self, X: "pd.DataFrame", y: "pd.Series", **kwargs: Any) -> None:
 		self._validate_checkpoint()
 		self._tabicl = TabICLClassifier(**self._tabicl_kwargs())
 		self._tabicl.fit(X, y)
+		self._train_X = X
+		self._train_y = np.asarray(y)
 		self.model = self._tabicl
+
+	def _plot_umap(
+		self,
+		X_test: "pd.DataFrame",
+		predicted_labels: np.ndarray | None = None,
+	) -> None:
+		if not self.params.get("plot_umap", False) or self._umap_plotted:
+			return
+		if self._tabicl is None or self._train_X is None or self._train_y is None:
+			return
+		try:
+			import matplotlib
+			matplotlib.use("Agg", force=True)
+			import matplotlib.pyplot as plt
+			from umap import UMAP
+		except ImportError as error:
+			raise ModuleNotFoundError(
+				"--plot-umap requires matplotlib and umap-learn"
+			) from error
+
+		# Each ensemble view contains the fitted training rows followed by the
+		# requested test rows. Averaging these complete views preserves the same
+		# representation semantics as TabICLClassifier.predict_representation().
+		X_test_array = np.asarray(X_test)
+		X_encoded = self._tabicl.X_encoder_.transform(X_test_array)
+		if self._tabicl.feature_reducer_ is not None:
+			X_encoded = self._tabicl.feature_reducer_.transform(X_encoded)
+		outputs = []
+		for subset, generator in zip(
+			self._tabicl.feature_subsets_, self._tabicl.ensemble_generators_
+		):
+			data = generator.transform(X_encoded[:, subset], mode="both")
+			for norm_method, (Xs, ys) in data.items():
+				feature_shuffles = generator.feature_shuffles_[norm_method]
+				outputs.append(
+					self._tabicl._batch_forward_with_repr(Xs, ys, feature_shuffles)
+				)
+		if not outputs:
+			raise RuntimeError("TabICL produced no representations for the UMAP plot")
+		representations = np.mean(np.concatenate(outputs, axis=0), axis=0)
+		train_size = len(self._train_y)
+		if representations.shape[0] <= train_size:
+			raise RuntimeError("TabICL UMAP representation does not contain test rows")
+
+		output_dir = Path(self.params.get("umap_output_dir", "eval"))
+		output_dir.mkdir(parents=True, exist_ok=True)
+		identity = str(getattr(self, "path", None) or getattr(self, "name", "model"))
+		identity = re.sub(r"[^A-Za-z0-9_.-]+", "_", identity).strip("_")[-160:]
+		if not identity:
+			identity = "model"
+		classes = np.asarray(self._tabicl.classes_)
+		class_indices = {label: index for index, label in enumerate(classes.tolist())}
+		try:
+			train_labels = np.asarray([class_indices[label] for label in self._train_y])
+			if predicted_labels is None:
+				predicted_labels = classes[np.argmax(self._tabicl.predict_proba(X_test_array), axis=1)]
+			test_labels = np.asarray([class_indices[label] for label in predicted_labels])
+		except KeyError as error:
+			raise RuntimeError("UMAP labels contain a class unknown to TabICL") from error
+		labels = np.concatenate((train_labels, test_labels))
+		coordinates = UMAP(
+			n_components=2,
+			n_neighbors=min(15, representations.shape[0] - 1),
+			min_dist=0.1,
+			random_state=0,
+		).fit_transform(representations)
+		fig, axes = plt.subplots(1, 2, figsize=(12, 5), dpi=150, constrained_layout=True)
+		for axis, name, sl in (
+			(axes[0], "Train", slice(0, train_size)),
+			(axes[1], "Test", slice(train_size, None)),
+		):
+			axis.scatter(
+				coordinates[sl, 0], coordinates[sl, 1], c=labels[sl], cmap="tab10", s=16, alpha=0.8
+			)
+			axis.set(title=name, xlabel="UMAP-1", ylabel="UMAP-2")
+			axis.grid(alpha=0.2)
+		fig.suptitle(f"Graph TabICL representations: {identity}")
+		# AutoGluon can reuse the same model name/path for separate benchmark
+		# jobs, so include a UUID rather than relying on the model identity alone.
+		plot_path = output_dir / f"{identity}_umap_{uuid.uuid4().hex[:12]}.png"
+		fig.savefig(plot_path)
+		plt.close(fig)
+		self._umap_plotted = True
 
 	def _predict_proba(self, X: "pd.DataFrame", **kwargs: Any) -> np.ndarray:
 		if self._tabicl is None:
 			raise RuntimeError("TabICLGraphModel has not been fitted")
 		probabilities = np.asarray(self._tabicl.predict_proba(X))
+		predicted_labels = self._tabicl.classes_[np.argmax(probabilities, axis=1)]
+		self._plot_umap(X, predicted_labels)
 		# AutoGluon uses a unified representation internally: binary models must
 		# return only the positive-class probability. Passing the full (N, 2)
 		# matrix makes bagged OOF accumulation broadcast against its (N,) buffer.
@@ -173,6 +297,8 @@ class TabICLGraphModel(AbstractModelBase):
 		num_gpus: int = 1,
 		max_chunk_size: int | None = None,
 		decoder_chunk_size: int = 5000,
+		plot_umap: bool = False,
+		umap_output_dir: str | Path | None = None,
 	) -> "ConfigGenerator":
 		"""Return a TabArena config generator for the supplied checkpoint."""
 		from tabarena.utils.config_utils import ConfigGenerator  # pyright: ignore[reportMissingImports]
@@ -191,6 +317,9 @@ class TabICLGraphModel(AbstractModelBase):
 			"num_cpus": num_cpus,
 			"num_gpus": num_gpus,
 		}
+		config["plot_umap"] = plot_umap
+		if umap_output_dir is not None:
+			config["umap_output_dir"] = str(umap_output_dir)
 		return ConfigGenerator(
 			model_cls=cls,
 			manual_configs=[config],
@@ -213,6 +342,18 @@ def build_parser() -> argparse.ArgumentParser:
 														  'tabpfn', 'tiny'])
 	parser.add_argument("--datasets", nargs="+", default=None)
 	parser.add_argument("--n-configs", type=int, default=0)
+	parser.add_argument(
+		"--mode",
+		"--benchmark-mode",
+		dest="benchmark_mode",
+		choices=("default", "tuned", "ensembled", "tuned+ensembled"),
+		default="default",
+		help=(
+			"TabArena evaluation protocol: default/tuned use a single full-data fit, "
+			"while ensembled/tuned+ensembled use bagged ensemble folds. "
+			"The tuned modes require --n-configs > 0."
+		),
+	)
 	parser.add_argument(
 		"--num-cpus",
 		type=int,
@@ -248,6 +389,11 @@ def build_parser() -> argparse.ArgumentParser:
 		default=True,
 		help="Run jobs in-process; use --no-debug-mode to enable the Ray-backed runner",
 	)
+	parser.add_argument(
+		"--plot-umap",
+		action="store_true",
+		help="Plot train/test graph TabICL representations as UMAP figures in --output-dir.",
+	)
 	return parser
 
 
@@ -261,21 +407,33 @@ def compare_against_leaderboard(args: argparse.Namespace) -> Any:
 		raise ValueError("--decoder-chunk-size must be positive")
 	if not model_path.is_file():
 		raise FileNotFoundError(f"TabICL checkpoint not found: {model_path}")
+	if args.n_configs < 0:
+		raise ValueError("--n-configs must be non-negative")
+	tuned = args.benchmark_mode in {"tuned", "tuned+ensembled"}
+	if tuned and args.n_configs <= 0:
+		raise ValueError(
+			f"--benchmark-mode={args.benchmark_mode} requires --n-configs > 0"
+		)
+	use_outer_experiments = args.benchmark_mode in {"default", "tuned"}
+	n_configs = args.n_configs if tuned else 0
 
 	experiments = TabArenaV0pt1ExperimentBundle(
 		# Reduce bagging folds on small or imbalanced classification datasets so
 		# every validation fold contains every class.
 		adapt_num_folds_to_n_classes=True,
+		outer_experiments=use_outer_experiments,
 		models=[(
 			TabICLGraphModel.config_generator(
 				model_path,
 				device=args.device,
 				max_chunk_size=args.max_chunk_size,
 				decoder_chunk_size=args.decoder_chunk_size,
+				plot_umap=args.plot_umap,
+				umap_output_dir=args.output_dir.expanduser().resolve(),
 				num_cpus=args.num_cpus,
 				num_gpus=args.num_gpus,
 			),
-			args.n_configs,
+			n_configs,
 		)]
 	).build_experiments(time_limit=1*60*60)
 

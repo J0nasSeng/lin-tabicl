@@ -55,6 +55,7 @@ class GATInferenceEngine(nn.Module):
 		entry_layer: int | str | None = None,
 		max_chunk_size: int | None = None,
 		decoder_chunk_size: int | None = None,
+		graph_config: dict[str, object] | None = None,
 	) -> None:
 		super().__init__()
 		if mode not in {"ensemble", "reasoning"}:
@@ -96,6 +97,12 @@ class GATInferenceEngine(nn.Module):
 		self.model_config_ = config
 		self.model = TabICL(**config)
 		self.model.load_state_dict(checkpoint["state_dict"])
+		if graph_config is not None:
+			predictor = self.model.icl_predictor
+			for parameter, value in graph_config.items():
+				if not hasattr(predictor, parameter):
+					raise ValueError(f"Unknown graph configuration parameter: {parameter}")
+				setattr(predictor, parameter, value)
 		if decoder_chunk_size is not None:
 			self.model.decoder_chunk_size = int(decoder_chunk_size)
 			self.model.icl_predictor.decoder_chunk_size = int(decoder_chunk_size)

@@ -4,7 +4,7 @@ import warnings
 from pathlib import Path
 import multiprocessing as mp
 from collections import OrderedDict
-from typing import Optional, List, Dict
+from typing import Any, Optional, List, Dict
 
 import numpy as np
 import torch
@@ -318,6 +318,7 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
         n_components: int | None = None,
         max_chunk_size: int | None = None,
         decoder_chunk_size: int = 5000,
+        graph_config: Optional[Dict[str, Any]] = None,
     ):
         self.n_estimators = n_estimators
         self.norm_methods = norm_methods
@@ -345,6 +346,7 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
         self.gat_num_iterations = gat_num_iterations
         self.gat_entry_layer = gat_entry_layer
         self.max_chunk_size = max_chunk_size
+        self.graph_config = graph_config
         if decoder_chunk_size <= 0:
             raise ValueError("decoder_chunk_size must be positive")
         self.decoder_chunk_size = int(decoder_chunk_size)
@@ -453,6 +455,7 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
                 entry_layer=self.gat_entry_layer,
                 max_chunk_size=self.max_chunk_size,
                 decoder_chunk_size=self.decoder_chunk_size,
+                graph_config=self.graph_config,
             )
         else:
             self.model_ = TabICL(**checkpoint["config"], icl_backend="encoder")
