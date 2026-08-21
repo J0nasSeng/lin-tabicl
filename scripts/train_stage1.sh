@@ -4,11 +4,11 @@
 ICL_BACKEND=${ICL_BACKEND:-graph-1d}
 # Enable wandb logging by setting WAND_LOG=True (and optionally WAND_MODE=online)
 WAND_LOG=${WAND_LOG:-True}
-WAND_MODE=${WAND_MODE:-online}
+WAND_MODE=${WAND_MODE:-offline}
 # GPU selection controls
 DEVICE=${DEVICE:-cuda}
-NUM_GPUS=${NUM_GPUS:-5}
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4}
+NUM_GPUS=${NUM_GPUS:-3}
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,2,3}
 # Confusion matrix logging interval
 LOG_CONF_MAT_EVERY=${LOG_CONF_MAT_EVERY:-200000} # effectively disables confusion matrix logging if set to a large number
 
@@ -29,12 +29,12 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --np_seed 42 \
             --torch_seed 42 \
             --max_steps 10000 \
-            --batch_size 500 \
+            --batch_size 60 \
             --micro_batch_size 5 \
             --log_conf_mat_every ${LOG_CONF_MAT_EVERY} \
             --lr 8e-4 \
             --weight_decay 1e-4 \
-            --supcon_weight 0.1 \
+            --supcon_weight 0.0 \
             --entropy_weight 0.0 \
             --icl_decoder_type soft_kmeans \
             --scheduler cosine_warmup \
@@ -58,21 +58,21 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --row_nhead 8 \
             --row_num_cls 4 \
             --row_rope_base 100000 \
-            --icl_num_blocks 12 \
+            --icl_num_blocks 4 \
             --icl_nhead 8 \
             --icl_backend ${ICL_BACKEND} \
             --ff_factor 2 \
             --norm_first True \
-            --checkpoint_dir /workspace/checkpoints_dyngraph_intraclass=0.25_compress_mixed_prior/stage1/ \
+            --checkpoint_dir /workspace/checkpoints_dyngraph_intraclass=0.25_no_supcon/stage1/ \
             --save_temp_every 1000 \
             --save_perm_every 5000 \
             --icl_soft_kmeans_temperature 0.5 \
-            --label_smoothing 0.1 \
+            --label_smoothing 0.0 \
             --graph_min_train_neighbors 4 \
             --graph_max_train_neighbors 4 \
             --graph_train_neighbors_per_test 2 \
             --graph_cross_label_fraction 0.25 \
-            --graph_num_graphs 6 \
+            --graph_num_graphs 1 \
             --recompute False \
 
 

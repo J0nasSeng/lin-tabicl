@@ -166,6 +166,93 @@ def test_graph_prior_graph_tasks_reuse_one_topology_across_gat_slots():
             assert torch.equal(reference, graph_set.graphs[graph_idx].edge_index[dataset_idx])
 
 
+def test_graph_prior_v1_graph_slots_are_reproducible_and_independent():
+    labels = _build_labels(batch_size=2, train_size=15, num_classes=3)
+    kwargs = dict(
+        graph_v1_prob=1.0,
+        graph_v2_prob=0.0,
+        graph_prob=0.0,
+        min_train_neighbors=1,
+        max_train_neighbors=3,
+        train_neighbors_per_test=2,
+        seed=11,
+    )
+    graph_set_a = GraphPrior(**kwargs)(labels, n_train=15, num_graphs=3)
+    graph_set_b = GraphPrior(**kwargs)(labels, n_train=15, num_graphs=3)
+
+    for graph_a, graph_b in zip(graph_set_a.graphs, graph_set_b.graphs):
+        for edges_a, edges_b in zip(graph_a.edge_index, graph_b.edge_index):
+            assert torch.equal(edges_a, edges_b)
+    assert any(
+        not torch.equal(graph_set_a.graphs[0].edge_index[dataset_idx], graph_set_a.graphs[graph_idx].edge_index[dataset_idx])
+        for dataset_idx in range(labels.shape[0])
+        for graph_idx in range(1, graph_set_a.num_graphs)
+    )
+
+
+def test_graph_prior_v2_graph_slots_are_reproducible_and_independent():
+    labels = _build_labels(batch_size=2, train_size=15, num_classes=3)
+    kwargs = dict(
+        graph_v1_prob=0.0,
+        graph_v2_prob=1.0,
+        graph_prob=0.0,
+        min_train_neighbors=1,
+        max_train_neighbors=3,
+        train_neighbors_per_test=2,
+        seed=11,
+    )
+    graph_set_a = GraphPrior(**kwargs)(labels, n_train=15, num_graphs=3)
+    graph_set_b = GraphPrior(**kwargs)(labels, n_train=15, num_graphs=3)
+
+    for graph_a, graph_b in zip(graph_set_a.graphs, graph_set_b.graphs):
+        for edges_a, edges_b in zip(graph_a.edge_index, graph_b.edge_index):
+            assert torch.equal(edges_a, edges_b)
+    assert any(
+        not torch.equal(graph_set_a.graphs[0].edge_index[dataset_idx], graph_set_a.graphs[graph_idx].edge_index[dataset_idx])
+        for dataset_idx in range(labels.shape[0])
+        for graph_idx in range(1, graph_set_a.num_graphs)
+    )
+
+
+def _graph_sets_equal(first, second):
+    return torch.equal(first.edge_index, second.edge_index) and torch.equal(
+        first.edge_offsets, second.edge_offsets
+    )
+
+
+def test_graph_prior_seed_advances_between_v1_calls_and_replays_sequence():
+    labels = _build_labels(batch_size=1, train_size=15, num_classes=3)
+    kwargs = dict(graph_v1_prob=1.0, graph_v2_prob=0.0, graph_prob=0.0, seed=11)
+    prior = GraphPrior(**kwargs)
+    first = prior(labels, n_train=15, num_graphs=2)
+    second = prior(labels, n_train=15, num_graphs=2)
+
+    replay = GraphPrior(**kwargs)
+    assert _graph_sets_equal(first, replay(labels, n_train=15, num_graphs=2))
+    assert _graph_sets_equal(second, replay(labels, n_train=15, num_graphs=2))
+    assert not _graph_sets_equal(first, second)
+
+
+def test_graph_prior_seed_advances_between_v2_calls():
+    labels = _build_labels(batch_size=1, train_size=15, num_classes=3)
+    prior = GraphPrior(graph_v1_prob=0.0, graph_v2_prob=1.0, graph_prob=0.0, seed=11)
+    first = prior(labels, n_train=15, num_graphs=2)
+    second = prior(labels, n_train=15, num_graphs=2)
+
+    assert not _graph_sets_equal(first, second)
+
+
+def test_graph_prior_graph_task_keeps_one_topology_per_call():
+    labels = _build_labels(batch_size=1, train_size=15, num_classes=3)
+    prior = GraphPrior(graph_v1_prob=0.0, graph_v2_prob=0.0, graph_prob=1.0, seed=11)
+    graph_set = prior(labels, n_train=15, num_graphs=3)
+
+    assert torch.equal(
+        graph_set.edge_index[:, int(graph_set.edge_offsets[0, 0]):int(graph_set.edge_offsets[0, 1])],
+        graph_set.edge_index[:, int(graph_set.edge_offsets[1, 0]):int(graph_set.edge_offsets[1, 1])],
+    )
+
+
 def test_induce_graph_set_preserves_topology_and_all_test_nodes():
     edge_index = torch.tensor(
         [[0, 1, 2, 3, 4, 5], [1, 0, 3, 2, 5, 4]], dtype=torch.long
@@ -483,7 +570,7 @@ def test_iclearning_soft_kmeans_decoder_forward_shape():
     model.train()
 
     out, pre = model(R, y_train, return_pre_decoder_repr=True)
-    assert out.shape == (batch_size, total_nodes - train_size, 5)
+    assert out.shape == (batch_size, total_nodes - train_size, 3)
     assert pre.shape == (batch_size, total_nodes - train_size, d_model)
     assert torch.isfinite(out).all()
     assert torch.isfinite(pre).all()
@@ -514,7 +601,7 @@ def test_iclearning_rbf_decoder_matches_reference_and_normalizes():
 
     log_probs = model._rbf_decoder(src, y_train, train_size)
     probs = log_probs.exp()
-    assert log_probs.shape == (batch_size, total_nodes, max_classes)
+    assert log_probs.shape == (batch_size, total_nodes, 3)
     assert torch.isfinite(log_probs).all()
     assert torch.all(probs >= 0)
     assert torch.allclose(probs.sum(dim=-1), torch.ones(batch_size, total_nodes), atol=1e-6)
@@ -527,9 +614,9 @@ def test_iclearning_rbf_decoder_matches_reference_and_normalizes():
         - 2 * torch.matmul(src_float, train.transpose(1, 2))
     ).clamp_min(0)
     assign = torch.softmax(-sq_dist / (2 * (temperature * src.shape[-1] ** 0.5) ** 2), dim=-1)
-    reference = torch.zeros(batch_size, total_nodes, max_classes)
+    reference = torch.zeros(batch_size, total_nodes, 3)
     for batch_index in range(batch_size):
-        for class_index in range(max_classes):
+        for class_index in range(3):
             class_rows = y_train[batch_index] == class_index
             reference[batch_index, :, class_index] = assign[batch_index, :, class_rows].sum(dim=-1)
     assert torch.allclose(probs, reference, atol=1e-6)
@@ -609,14 +696,14 @@ def test_iclearning_euclidean_decoder_matches_reference():
 
     log_probabilities = model._euclidean_decoder(src, y_train, train_size=4)
     probabilities = log_probabilities.exp()
-    src_normalized = torch.nn.functional.normalize(src.float(), p=2, dim=-1)
-    train_normalized = torch.nn.functional.normalize(src[:, :4].float(), p=2, dim=-1)
-    distances = torch.cdist(src_normalized, train_normalized, p=2).clamp_min(
-        torch.sqrt(torch.finfo(torch.float32).eps)
+    src_float = src.float()
+    train_float = src_float[:, :4]
+    distances = torch.cdist(src_float, train_float, p=2).clamp_min(
+        torch.sqrt(torch.tensor(torch.finfo(torch.float32).eps))
     )
     assignments = torch.softmax(-distances / model.soft_kmeans_temperature, dim=-1)
     reference = torch.zeros_like(probabilities)
-    for class_index in range(model.max_classes):
+    for class_index in range(3):
         reference[:, :, class_index] = assignments[:, :, y_train[0] == class_index].sum(dim=-1)
 
     assert torch.allclose(probabilities, reference, atol=1e-6)

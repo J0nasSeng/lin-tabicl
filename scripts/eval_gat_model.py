@@ -17,7 +17,7 @@ import numpy as np
 import torch
 from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import log_loss, recall_score
+from sklearn.metrics import log_loss, recall_score, silhouette_score
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import LabelEncoder
@@ -28,6 +28,7 @@ from xgboost import XGBClassifier
 from tabicl.eval._run import EvalSample, _build_model_from_checkpoint, _evaluate_one_dataset
 from tabicl._preprocessing.normalizer import RobustScaler, Standardizer, infer_feature_types
 from tabicl.prior._dataset import PriorDataset
+from tabicl.prior._prior_config import DEFAULT_FIXED_HP
 from tabicl import TabICLClassifier
 
 
@@ -45,9 +46,8 @@ GRAPH_EVALUATION_CONFIG = {
 	"graph_max_train_neighbors": 4,
 	"graph_train_neighbors_per_test": 2,
 	"graph_cross_label_fraction": 0.25,
-	"graph_num_graphs": 6,
-	"graph_v1_prob": 0.5,
-	"graph_v2_prob": 0.5,
+	"graph_v1_prob": 1.0,
+	"graph_v2_prob": 0.0,
 	"graph_prob": 0.0,
 }
 
@@ -245,16 +245,45 @@ def build_parser() -> argparse.ArgumentParser:
 		help="Estimator counts for --n-estimators-ablation.",
 	)
 	parser.add_argument(
-		"--refinement-ablation-num-datasets",
+		"--discrete-features-ablation",
+		action="store_true",
+		help="Compare graph TabICL performance across discrete-feature fractions.",
+	)
+	parser.add_argument(
+		"--discrete-features-ablation-values",
+		type=float,
+		nargs="+",
+		default=[0.0, 0.25, 0.5, 0.75, 1.0],
+		help="Discrete-feature fractions for --discrete-features-ablation.",
+	)
+	parser.add_argument(
+		"--gat-layers-ablation",
+		action="store_true",
+		help="Compare GAT-input and post-GAT representations with decoder, UMAP, and silhouette metrics.",
+	)
+	parser.add_argument(
+		"--gat-layers-ablation-num-datasets",
 		type=int,
 		default=100,
-		help="Number of datasets for the refinement ablation (default: 100).",
+		help="Number of datasets for the GAT-layer ablation (default: 100).",
+	)
+	parser.add_argument(
+		"--gat-layers-ablation-num-classes",
+		type=int,
+		default=2,
+		help="Number of classes for the GAT-layer ablation (default: 2).",
+	)
+	parser.add_argument(
+		"--refinement-ablation-num-datasets",
+		type=int,
+		default=50,
+		help="Number of datasets for the refinement ablation (default: 50).",
 	)
 	parser.add_argument(
 		"--refinement-ablation-num-classes",
 		type=int,
-		default=10,
-		help="Number of classes for the refinement ablation (default: 10).",
+		default=2,
+		help="Number of classes for the refinement ablation (default: 2).",
 	)
 	parser.add_argument(
 		"--rf-n-estimators",
@@ -266,7 +295,7 @@ def build_parser() -> argparse.ArgumentParser:
 		"--pretrained-tabicl-n-estimators",
 		type=int,
 		default=1,
-		help="Number of ensemble members for the pretrained TabICL baseline (default: 8)",
+		help="Number of ensemble members for the pretrained TabICL baseline (default: 1)",
 	)
 	parser.add_argument(
 		"--gat-tabicl-n-estimators",
@@ -918,12 +947,13 @@ def run_graph_ablation(
 		batch_size_per_gp=args.batch_size_per_gp,
 		min_features=args.min_features,
 		max_features=args.max_features,
-		max_classes=10,
+		max_classes=2,
 		min_seq_len=args.min_seq_len,
 		max_seq_len=args.max_seq_len,
 		min_train_size=args.min_train_size,
 		max_train_size=args.max_train_size,
 		prior_type=args.prior_type,
+		scm_fixed_hp=DEFAULT_FIXED_HP.copy(),
 		device=args.prior_device,
 		n_jobs=1,
 		normalization=("std" if args.normalize_features and args.normalization == "none" else args.normalization),
@@ -995,6 +1025,320 @@ def run_graph_ablation(
 	return rows
 
 
+def run_discrete_features_ablation(
+	checkpoint: Path, args: argparse.Namespace, device: str
+) -> list[dict]:
+	"""Evaluate graph TabICL while varying the prior categorical-feature rate."""
+	import matplotlib
+	matplotlib.use("Agg", force=True)
+	import matplotlib.pyplot as plt
+
+	values = tuple(args.discrete_features_ablation_values)
+	if not values or any(value < 0.0 or value > 1.0 for value in values):
+		raise ValueError("--discrete-features-ablation-values must be in [0, 1]")
+
+	rows: list[dict] = []
+	base = GRAPH_EVALUATION_CONFIG.copy()
+	for fraction in values:
+		fixed_hp = DEFAULT_FIXED_HP.copy()
+		fixed_hp["cat_prob"] = fraction
+		prior = PriorDataset(
+			batch_size=args.batch_size,
+			batch_size_per_gp=args.batch_size_per_gp,
+			min_features=args.min_features,
+			max_features=args.max_features,
+			max_classes=2,
+			min_seq_len=args.min_seq_len,
+			max_seq_len=args.max_seq_len,
+			min_train_size=args.min_train_size,
+			max_train_size=args.max_train_size,
+			prior_type=args.prior_type,
+			scm_fixed_hp=fixed_hp,
+			device=args.prior_device,
+			n_jobs=1,
+			normalization=("std" if args.normalize_features and args.normalization == "none" else args.normalization),
+		)
+		processed = 0
+		batch_index = 0
+		while processed < args.num_datasets:
+			batch = _as_regular_tensors(prior.get_batch())
+			current_batch_index = batch_index
+			batch_index += 1
+			for index in range(int(batch[0].shape[0])):
+				if processed >= args.num_datasets:
+					break
+				seq_len = int(batch[3][index].item())
+				train_size = int(batch[4][index].item())
+				y = batch[1][index, :seq_len].numpy().astype(int)
+				y_train, y_test = y[:train_size], y[train_size:]
+				if not _has_complete_label_support(y_train, y_test):
+					processed += 1
+					continue
+				x = batch[0][index, :seq_len, : int(batch[2][index].item())].numpy()
+				classifier = _build_gat_tabicl(
+					checkpoint, 1, device, args.seed + processed, 1, "last", graph_config=base
+				)
+				classifier.fit(x[:train_size], y_train)
+				probabilities = classifier.predict_proba(x[train_size:])
+				predictions = classifier.classes_[np.argmax(probabilities, axis=1)].astype(int)
+				rows.append({
+					"ablation": "discrete_features",
+					"variant": str(fraction),
+					"discrete_feature_fraction": fraction,
+					"dataset": processed,
+					"batch": current_batch_index,
+					"n_features": x.shape[1],
+					"score": "balanced_accuracy",
+					"value": _balanced_accuracy(y_test, predictions),
+				})
+				processed += 1
+
+	output_dir = args.output_dir
+	output_dir.mkdir(parents=True, exist_ok=True)
+	results_output = output_dir / "discrete_features_ablation.json"
+	results_output.write_text(json.dumps(rows, indent=2))
+	labels = [str(value) for value in values]
+	box_values = [[row["value"] for row in rows if row["variant"] == label] for label in labels]
+	fig, ax = plt.subplots(figsize=(max(7, len(labels) * 1.8), 5), dpi=150)
+	boxplot = ax.boxplot(box_values, labels=labels, patch_artist=True, showmeans=True)
+	for patch in boxplot["boxes"]:
+		patch.set_facecolor("#4472C4")
+		patch.set_alpha(0.75)
+	ax.set(
+		title=f"GAT TabICL discrete-feature fraction ablation (datasets={args.num_datasets})",
+		xlabel="Fraction of discrete features",
+		ylabel="Balanced accuracy",
+		ylim=(0.0, 1.0),
+	)
+	ax.grid(axis="y", alpha=0.25)
+	fig.tight_layout()
+	plot_output = output_dir / "discrete_features_ablation_balanced_accuracy.png"
+	fig.savefig(plot_output)
+	plt.close(fig)
+	print(f"Saved discrete-feature ablation results to {results_output}")
+	print(f"Saved discrete-feature ablation plot to {plot_output}")
+	return rows
+
+
+def _safe_silhouette(representation: np.ndarray, labels: np.ndarray) -> float:
+	"""Return a label silhouette score or NaN when it is undefined."""
+	representation = np.nan_to_num(representation, nan=0.0, posinf=0.0, neginf=0.0)
+	labels = np.asarray(labels)
+	if representation.shape[0] < 3 or np.unique(labels).size < 2:
+		return float("nan")
+	try:
+		return float(silhouette_score(representation, labels, metric="cosine"))
+	except ValueError:
+		return float("nan")
+
+
+def _plot_gat_layer_pair(
+	pre: np.ndarray,
+	post: np.ndarray,
+	labels: np.ndarray,
+	train_size: int,
+	output_path: Path,
+	seed: int,
+	n_neighbors: int,
+	n_epochs: int,
+) -> None:
+	"""Write a paired UMAP comparing the same dataset before and after GAT."""
+	import matplotlib
+	matplotlib.use("Agg", force=True)
+	import matplotlib.pyplot as plt
+	from umap import UMAP
+
+	if pre.shape[0] < 3 or post.shape[0] < 3:
+		return
+	coords = []
+	for representation in (pre, post):
+		nn = min(n_neighbors, representation.shape[0] - 1)
+		coords.append(UMAP(
+			n_components=2,
+			n_neighbors=nn,
+			min_dist=0.1,
+			metric="euclidean",
+			n_epochs=n_epochs,
+			n_jobs=1,
+			random_state=seed,
+		).fit_transform(np.nan_to_num(representation)))
+
+	fig, axes = plt.subplots(1, 2, figsize=(12, 5), dpi=150, constrained_layout=True)
+	label_min, label_max = labels.min(), labels.max()
+	if label_min == label_max:
+		label_min -= 0.5
+		label_max += 0.5
+	for ax, embedding, title in zip(axes, coords, ("GAT input / skip-GAT", "Post-GAT")):
+		ax.scatter(
+			embedding[:train_size, 0], embedding[:train_size, 1],
+			c=labels[:train_size], cmap="tab10", vmin=label_min, vmax=label_max,
+			s=16, alpha=0.75, label="train",
+		)
+		ax.scatter(
+			embedding[train_size:, 0], embedding[train_size:, 1],
+			c=labels[train_size:], cmap="tab10", vmin=label_min, vmax=label_max,
+			s=22, alpha=0.9, marker="x", label="test",
+		)
+		ax.set(title=title, xlabel="UMAP-1", ylabel="UMAP-2")
+		ax.grid(alpha=0.2)
+		ax.legend(loc="best")
+	fig.suptitle("GAT-layer representation comparison")
+	output_path.parent.mkdir(parents=True, exist_ok=True)
+	fig.savefig(output_path)
+	plt.close(fig)
+
+
+def run_gat_layers_ablation(checkpoint: Path, args: argparse.Namespace, device: str) -> list[dict]:
+	"""Compare the exact GAT input with the normal post-GAT representation."""
+	if args.gat_layers_ablation_num_datasets < 1:
+		raise ValueError("--gat-layers-ablation-num-datasets must be positive")
+	if args.gat_layers_ablation_num_classes < 2:
+		raise ValueError("--gat-layers-ablation-num-classes must be at least 2")
+
+	prior = PriorDataset(
+		batch_size=args.batch_size,
+		batch_size_per_gp=args.batch_size_per_gp,
+		min_features=args.min_features,
+		max_features=args.max_features,
+		max_classes=args.gat_layers_ablation_num_classes,
+		min_seq_len=args.min_seq_len,
+		max_seq_len=args.max_seq_len,
+		min_train_size=args.min_train_size,
+		max_train_size=args.max_train_size,
+		prior_type=args.prior_type,
+		device=args.prior_device,
+		graph_cross_label_fraction=0.0,
+		n_jobs=1,
+		normalization=("std" if args.normalize_features and args.normalization == "none" else args.normalization),
+	)
+	rows: list[dict] = []
+	processed = 0
+	batch_index = 0
+	output_dir = args.output_dir / "gat_layers_ablation"
+	while processed < args.gat_layers_ablation_num_datasets:
+		batch = _as_regular_tensors(prior.get_batch())
+		current_batch_index = batch_index
+		batch_index += 1
+		for index in range(int(batch[0].shape[0])):
+			if processed >= args.gat_layers_ablation_num_datasets:
+				break
+			seq_len = int(batch[3][index].item())
+			train_size = int(batch[4][index].item())
+			y = batch[1][index, :seq_len].numpy().astype(int)
+			y_train, y_test = y[:train_size], y[train_size:]
+			if not _has_complete_label_support(y_train, y_test):
+				processed += 1
+				continue
+			x = batch[0][index, :seq_len, : int(batch[2][index].item())].numpy()
+			common = GRAPH_EVALUATION_CONFIG.copy()
+			variants = {
+				"gat": None,
+				"skip_gat": True,
+			}
+			representations: dict[str, np.ndarray] = {}
+			for variant, skip in variants.items():
+				config = {**common}
+				if skip:
+					config["skip_gat"] = True
+				classifier = _build_gat_tabicl(
+					checkpoint,
+					args.gat_tabicl_n_estimators or args.pretrained_tabicl_n_estimators,
+					device,
+					args.seed + processed,
+					args.num_refinement_iter,
+					args.entry_layer,
+					graph_config=config,
+				)
+				classifier.fit(x[:train_size], y_train)
+				proba = classifier.predict_proba(x[train_size:])
+				predictions = classifier.classes_[np.argmax(proba, axis=1)].astype(int)
+				# predict_representation() returns the fitted training context followed
+				# by the rows supplied here; pass only test rows to avoid duplicating
+				# the training context.
+				full_repr = classifier.predict_representation(x[train_size:])
+				representations[variant] = full_repr
+				rows.append({
+					"ablation": "gat_layers",
+					"variant": variant,
+					"decoder": "native",
+					"dataset": processed,
+					"batch": current_batch_index,
+					"n_features": x.shape[1],
+					"representation_dim": int(full_repr.shape[1]),
+					"score": "balanced_accuracy",
+					"value": _balanced_accuracy(y_test, predictions),
+				})
+				for decoder_name, k in (("soft_knn", args.soft_knn or 10),):
+					knn_pred, _, _ = _soft_knn_predictions_from_representation(
+						full_repr, y_train, k, args.soft_knn_temperature
+					)
+					rows.append({
+						"ablation": "gat_layers",
+						"variant": variant,
+						"decoder": decoder_name,
+						"dataset": processed,
+						"batch": current_batch_index,
+						"n_features": x.shape[1],
+						"representation_dim": int(full_repr.shape[1]),
+						"score": "balanced_accuracy",
+						"value": _balanced_accuracy(y_test, knn_pred),
+					})
+			pre_test = representations["skip_gat"][train_size:]
+			post_test = representations["gat"][train_size:]
+			for variant, representation in (("skip_gat", pre_test), ("gat", post_test)):
+				rows.append({
+					"ablation": "gat_layers",
+					"variant": variant,
+					"decoder": "silhouette",
+					"dataset": processed,
+					"batch": current_batch_index,
+					"n_features": x.shape[1],
+					"representation_dim": int(representation.shape[1]),
+					"score": "silhouette_cosine_test",
+					"value": _safe_silhouette(representation, y_test),
+				})
+			_plot_gat_layer_pair(
+				representations["skip_gat"], representations["gat"], y, train_size,
+				output_dir / "umap" / f"dataset{processed:05d}.png",
+				args.seed + processed, args.umap_n_neighbors, args.umap_n_epochs,
+			)
+			processed += 1
+
+	output_dir.mkdir(parents=True, exist_ok=True)
+	results_output = output_dir / "gat_layers_ablation.json"
+	results_output.write_text(json.dumps(rows, indent=2, allow_nan=True))
+	import matplotlib
+	matplotlib.use("Agg", force=True)
+	import matplotlib.pyplot as plt
+	for score_name, filename, title, ylabel in (
+		("balanced_accuracy", "balanced_accuracy.png", "GAT-layer decoder comparison", "Balanced accuracy"),
+		("silhouette_cosine_test", "silhouette.png", "GAT-layer representation separation", "Silhouette score"),
+	):
+		plot_rows = [row for row in rows if row["score"] == score_name]
+		if not plot_rows:
+			continue
+		labels = sorted({
+			f'{row["variant"]} ({row["decoder"]})' for row in plot_rows
+		})
+		values = [[
+			row["value"] for row in plot_rows
+			if f'{row["variant"]} ({row["decoder"]})' == label and np.isfinite(row["value"])
+		] for label in labels]
+		if not all(values):
+			continue
+		fig, ax = plt.subplots(figsize=(max(7, len(labels) * 1.8), 5), dpi=150)
+		ax.boxplot(values, labels=labels, patch_artist=True, showmeans=True)
+		ax.set(title=title, ylabel=ylabel)
+		if score_name == "balanced_accuracy":
+			ax.set_ylim(0.0, 1.0)
+		ax.grid(axis="y", alpha=0.25)
+		fig.tight_layout()
+		fig.savefig(output_dir / filename)
+		plt.close(fig)
+	print(f"Saved GAT-layer ablation results to {results_output}")
+	return rows
+
+
 def run_requested_ablations(checkpoint: Path, args: argparse.Namespace, device: str) -> None:
 	"""Run each requested graph-only ablation independently."""
 	if args.graph_mixture_ablation:
@@ -1018,6 +1362,10 @@ def run_requested_ablations(checkpoint: Path, args: argparse.Namespace, device: 
 		run_graph_ablation(checkpoint, args, device, "n_estimators", [
 			(str(value), base, value) for value in args.n_estimators_ablation_values
 		])
+	if args.discrete_features_ablation:
+		run_discrete_features_ablation(checkpoint, args, device)
+	if args.gat_layers_ablation:
+		run_gat_layers_ablation(checkpoint, args, device)
 
 
 def _plot_umap(
@@ -1570,6 +1918,10 @@ def main() -> None:
 		raise ValueError("--soft-knn-ablation-num-datasets must be positive")
 	if args.soft_knn_ablation_num_classes < 2:
 		raise ValueError("--soft-knn-ablation-num-classes must be at least 2")
+	if args.gat_layers_ablation_num_datasets < 1:
+		raise ValueError("--gat-layers-ablation-num-datasets must be positive")
+	if args.gat_layers_ablation_num_classes < 2:
+		raise ValueError("--gat-layers-ablation-num-classes must be at least 2")
 	if args.max_seq_len < 2:
 		raise ValueError("--max-seq-len must be at least 2")
 	if args.plot_results_only:
@@ -1602,7 +1954,13 @@ def main() -> None:
 			"The supplied checkpoint must contain a TabICL model with a graph backend "
 			"(graph, graph-1d, or graph-2d)."
 		)
-	if args.graph_mixture_ablation or args.cross_label_fraction_ablation or args.n_estimators_ablation:
+	if (
+		args.graph_mixture_ablation
+		or args.cross_label_fraction_ablation
+		or args.n_estimators_ablation
+		or args.discrete_features_ablation
+		or args.gat_layers_ablation
+	):
 		run_requested_ablations(args.checkpoint, args, device)
 		return
 	if args.refinement_ablation:
@@ -1613,7 +1971,7 @@ def main() -> None:
 		return
 
 	rows = []
-	for num_classes in [10]:
+	for num_classes in [2, 5, 10]:
 		print(f"Evaluating {args.num_datasets} datasets for K={num_classes}...")
 		rows.extend(_evaluate_class_count(model, args.checkpoint, args, num_classes, device))
 	if args.skip_baselines:

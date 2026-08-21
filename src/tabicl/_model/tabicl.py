@@ -222,6 +222,7 @@ class TabICL(nn.Module):
         norm_first: bool = True,
         bias_free_ln: bool = False,
         recompute: bool = False,
+        skip_gat: bool = False,
     ):
         super().__init__()
         icl_dim = embed_dim * row_num_cls  # CLS tokens are concatenated for ICL
@@ -348,6 +349,7 @@ class TabICL(nn.Module):
             graph_prob=graph_prob,
             learnable_residual=learnable_residual,
             graph_max_chunk_size=graph_max_chunk_size,
+            skip_gat=skip_gat,
         )
 
         # KV cache for efficient inference
@@ -399,7 +401,8 @@ class TabICL(nn.Module):
             Predictions of shape (B, test_size, out_dim):
 
             - For regression (max_classes=0): out_dim = num_quantiles
-            - For classification (max_classes>0): out_dim = max_classes
+            - For MLP classification: out_dim = max_classes
+            - For kernel classification: out_dim = the active micro-batch class count K
         """
 
         B, T, H = X.shape
@@ -738,7 +741,8 @@ class TabICL(nn.Module):
                 Predictions of shape (B, test_size, out_dim):
 
                 - For regression (max_classes=0): out_dim = num_quantiles
-                - For classification (max_classes>0): out_dim = max_classes
+                - For MLP classification: out_dim = max_classes
+                - For kernel classification: out_dim = the active micro-batch class count K
 
             For inference mode:
                 For regression (max_classes=0):

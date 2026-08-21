@@ -8,6 +8,8 @@ from torch import Tensor
 
 
 _GRAPH_INDEX_DTYPE = torch.int32
+_GRAPH_SLOT_SEED_STRIDE = 1_000_003
+_GRAPH_CALL_SEED_STRIDE = _GRAPH_SLOT_SEED_STRIDE * 1_000_003
 
 
 @dataclass
@@ -337,6 +339,7 @@ class GraphPrior:
         self.cross_label_fraction = float(cross_label_fraction)
         self.train_neighbors_per_test = int(train_neighbors_per_test)
         self.seed = seed
+        self._call_count = 0
         self.share_graph_across_batch = bool(share_graph_across_batch)
 
     @staticmethod
@@ -594,14 +597,45 @@ class GraphPrior:
         )
         return [graph_edges] * num_graphs
 
+    def _make_graph_generator(
+        self,
+        device: torch.device,
+        seed: Optional[int],
+        batch_index: int,
+        graph_index: int,
+        fallback: torch.Generator,
+    ) -> torch.Generator:
+        """Create a reproducible RNG for one non-task graph slot.
+
+        The first slot keeps the per-dataset seed ``seed + batch``; later slots
+        receive a large deterministic offset so they cannot reuse the same
+        random stream. With no explicit seed, retain the caller's sequential
+        generator behavior.
+        """
+        if seed is None or graph_index == 0:
+            return fallback
+        generator = torch.Generator(device=device)
+        generator.manual_seed(
+            seed + batch_index + graph_index * _GRAPH_SLOT_SEED_STRIDE
+        )
+        return generator
+
     def __call__(self, y: Tensor, n_train: int, num_graphs: int = 1) -> CompactGraphSet:
         if y.ndim != 2 or not 0 < n_train <= y.shape[1]:
             raise ValueError("y must have shape (batch, total_nodes) and n_train must be valid")
         if num_graphs <= 0:
             raise ValueError("num_graphs must be positive")
+
+        call_index = self._call_count
+        self._call_count += 1
+        call_seed = (
+            None
+            if self.seed is None
+            else self.seed + call_index * _GRAPH_CALL_SEED_STRIDE
+        )
         mode_generator = torch.Generator(device=y.device)
-        if self.seed is not None:
-            mode_generator.manual_seed(self.seed)
+        if call_seed is not None:
+            mode_generator.manual_seed(call_seed)
         mode = self._weighted_choice(
             ["v1", "v2", "graph"],
             [self.graph_mode_probs[name] for name in ("v1", "v2", "graph")],
@@ -613,13 +647,13 @@ class GraphPrior:
                 y_train=y[:, :n_train].long(), total_nodes=y.shape[1], num_graphs=num_graphs,
                 min_train_neighbors=self.min_train_neighbors, max_train_neighbors=self.max_train_neighbors,
                 cross_label_fraction=self.cross_label_fraction, train_neighbors_per_test=self.train_neighbors_per_test,
-                seed=self.seed, share_graph_across_batch=self.share_graph_across_batch,
+                seed=call_seed, share_graph_across_batch=self.share_graph_across_batch,
             )
         per_dataset: list[list[Tensor]] = []
         for batch_index in range(y.shape[0]):
             generator = torch.Generator(device=y.device)
-            if self.seed is not None:
-                generator.manual_seed(self.seed + batch_index)
+            if call_seed is not None:
+                generator.manual_seed(call_seed + batch_index)
             tabular = mode == "v2"
             labels = y[batch_index].long()
             train_class_info = _class_index(labels[:n_train]) if tabular else None
@@ -629,12 +663,18 @@ class GraphPrior:
                     self._sample_v2_single(
                         labels,
                         n_train,
-                        generator,
+                        self._make_graph_generator(
+                            y.device,
+                            seed=call_seed,
+                            batch_index=batch_index,
+                            graph_index=graph_index,
+                            fallback=generator,
+                        ),
                         tabular=True,
                         train_class_info=train_class_info,
                         label_class_info=label_class_info,
                     )
-                    for _ in range(num_graphs)
+                    for graph_index in range(num_graphs)
                 ]
             else:
                 sampled = self._sample_graph_task_edges(
@@ -931,8 +971,8 @@ def build_class_conditioned_graphs(
 
     Each graph uses the same sampling rules as
     :func:`build_class_conditioned_graph`. When ``seed`` is supplied, graph
-    ``i`` uses ``seed + i`` so the complete graph set is reproducible while
-    individual graphs remain independently sampled.
+    ``i`` uses a distinct deterministic slot seed so the complete graph set is
+    reproducible while individual graphs remain independently sampled.
     """
 
     if num_graphs <= 0:
@@ -951,7 +991,7 @@ def build_class_conditioned_graphs(
                     max_train_neighbors=max_train_neighbors,
                     cross_label_fraction=cross_label_fraction,
                     train_neighbors_per_test=train_neighbors_per_test,
-                    seed=None if seed is None else seed + graph_idx,
+                    seed=None if seed is None else seed + graph_idx * _GRAPH_SLOT_SEED_STRIDE,
                     _class_infos=class_infos[:1],
                 )
                 for graph_idx in range(num_graphs)
@@ -975,7 +1015,7 @@ def build_class_conditioned_graphs(
             max_train_neighbors=max_train_neighbors,
             cross_label_fraction=cross_label_fraction,
             train_neighbors_per_test=train_neighbors_per_test,
-            seed=None if seed is None else seed + graph_idx,
+            seed=None if seed is None else seed + graph_idx * _GRAPH_SLOT_SEED_STRIDE,
             _class_infos=class_infos,
         )
         for graph_idx in range(num_graphs)

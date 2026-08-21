@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Literal, Optional, Union
 from collections import OrderedDict
 import math
+import warnings
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
@@ -127,6 +128,7 @@ class ICLearning(nn.Module):
         mode_prob: float | None = None,
         learnable_residual: bool = False,
         graph_max_chunk_size: int | None = None,
+        skip_gat: bool = False,
     ):
         super().__init__()
 
@@ -157,10 +159,19 @@ class ICLearning(nn.Module):
         self.graph_prob = float(graph_prob)
         self.learnable_residual = bool(learnable_residual)
         self.graph_max_chunk_size = graph_max_chunk_size
+        self.skip_gat = bool(skip_gat)
 
         valid_backends = (
             "encoder", "graph", "graph-pyg", "graph-2d", "graph-2d-pyg", "graph-1d", "graph-1d-pyg"
         )
+        if self.skip_gat and self.icl_backend not in ("encoder", *GRAPH_1D_BACKENDS):
+            raise ValueError("skip_gat is supported only for the encoder and graph-1d backends.")
+        if self.skip_gat:
+            warnings.warn(
+                "skip_gat is enabled; this bypasses the ICL backbone for diagnostic ablations only.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         if self.icl_backend not in valid_backends:
             raise ValueError(
                 f"Unknown icl_backend={self.icl_backend}. Expected one of {valid_backends}."
@@ -257,26 +268,56 @@ class ICLearning(nn.Module):
         enc_name = "tf_icl" if self.icl_backend == "encoder" else "gat_icl"
         self.inference_mgr = InferenceManager(enc_name=enc_name, out_dim=out_dim)
 
+    def _compact_class_labels(self, labels: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        """Map shuffled global labels to compact per-dataset class IDs."""
+        if labels.ndim != 2:
+            raise ValueError(f"Expected labels with shape (batch, rows), got {tuple(labels.shape)}")
+        labels = labels.long()
+        if labels.numel() == 0:
+            raise ValueError("Cannot compact an empty label tensor")
+        if labels.min() < 0 or labels.max() >= self.max_classes:
+            raise ValueError(f"Labels must be in [0, {self.max_classes})")
+
+        active = F.one_hot(labels, num_classes=self.max_classes).any(dim=1)
+        class_counts = active.sum(dim=1)
+        if not torch.all(class_counts == class_counts[0]):
+            raise ValueError(
+                "All datasets in a micro-batch must have the same number of classes; "
+                f"got {class_counts.tolist()}"
+            )
+        num_classes = int(class_counts[0].item())
+        global_ids = torch.arange(self.max_classes, device=labels.device).expand(labels.shape[0], -1)
+        active_ids = global_ids.masked_select(active).view(labels.shape[0], num_classes)
+        local_ids = torch.arange(num_classes, device=labels.device).expand(labels.shape[0], -1)
+        lookup = torch.full(
+            (labels.shape[0], self.max_classes), -1, dtype=torch.long, device=labels.device
+        )
+        lookup.scatter_(1, active_ids, local_ids)
+        compact = lookup.gather(1, labels)
+        return compact, active_ids, lookup
+
     def _aggregate_kernel_assignments(
         self,
         log_kernel: Tensor,
         y_train: Tensor,
     ) -> Tensor:
         """Aggregate train-row kernel assignments into log probabilities."""
-        class_masses = []
-        for class_index in range(self.max_classes):
-            class_mask = (y_train == class_index).unsqueeze(1)
-            class_masses.append(
-                torch.logsumexp(
-                    log_kernel.masked_fill(~class_mask, float("-inf")), dim=-1
-                )
-            )
-        log_class_mass = torch.stack(class_masses, dim=-1)
-        # A dataset may use fewer classes than max_classes. Give absent classes a
-        # finite machine-small mass so cross_entropy with label smoothing remains
-        # well-defined, then renormalize in log space.
-        log_floor = math.log(torch.finfo(log_class_mass.dtype).tiny)
-        return F.log_softmax(log_class_mass.clamp_min(log_floor), dim=-1)
+        if log_kernel.ndim != 3 or y_train.ndim != 2:
+            raise ValueError("Expected log_kernel=(B, Q, T) and y_train=(B, T)")
+        if log_kernel.shape[0] != y_train.shape[0] or log_kernel.shape[2] != y_train.shape[1]:
+            raise ValueError("Kernel and training-label dimensions do not match")
+        num_classes = int(y_train.max().item()) + 1
+        if y_train.min() < 0 or not torch.equal(
+            torch.unique(y_train), torch.arange(num_classes, device=y_train.device)
+        ):
+            raise ValueError("Compact training labels must contain every class ID from 0 to K-1")
+
+        # One batched matrix multiplication replaces the Python class loop.
+        class_membership = F.one_hot(y_train, num_classes=num_classes).to(log_kernel.dtype)
+        row_max = log_kernel.amax(dim=-1, keepdim=True)
+        scaled_mass = torch.bmm((log_kernel - row_max).exp(), class_membership)
+        log_class_mass = scaled_mass.clamp_min(torch.finfo(scaled_mass.dtype).tiny).log() + row_max
+        return torch.log_softmax(log_class_mass, dim=-1)
 
     def _soft_kmeans_decoder(
         self, src: Tensor, y_train: Tensor, train_size: int
@@ -288,6 +329,7 @@ class ICLearning(nn.Module):
         if train_size <= 0:
             raise ValueError("soft_kmeans decoder requires train_size > 0")
 
+        y_train, _, _ = self._compact_class_labels(y_train)
         train_repr_float = src[:, :train_size, :].float()
         outputs = []
         for start in range(0, src.shape[1], self.decoder_chunk_size):
@@ -311,6 +353,7 @@ class ICLearning(nn.Module):
 
         d = torch.tensor(src.shape[-1], dtype=src.dtype, device=src.device)
 
+        y_train, _, _ = self._compact_class_labels(y_train)
         train_repr_float = src[:, :train_size, :].float()
         train_sq = torch.sum(train_repr_float.square(), dim=-1, keepdim=True).transpose(1, 2)
         outputs = []
@@ -335,6 +378,7 @@ class ICLearning(nn.Module):
         if train_size <= 0:
             raise ValueError("euclidean decoder requires train_size > 0")
 
+        y_train, _, _ = self._compact_class_labels(y_train)
         train_repr_float = src[:, :train_size, :].float()
         train_sq = torch.sum(train_repr_float.square(), dim=-1, keepdim=True).transpose(1, 2)
         outputs = []
@@ -642,7 +686,8 @@ class ICLearning(nn.Module):
             Predictions of shape (B, T, out_dim):
 
             - For regression (max_classes=0): out_dim = num_quantiles
-            - For classification (max_classes>0): out_dim = max_classes
+            - For MLP classification: out_dim = max_classes
+            - For kernel classification: out_dim = the active micro-batch class count K
         """
 
         train_size = y_train.shape[1]
@@ -653,7 +698,7 @@ class ICLearning(nn.Module):
                 R[:, :train_size] = R[:, :train_size] + self.y_encoder(y_train.float())
             else:
                 R[:, :train_size] = R[:, :train_size] + self.y_encoder(y_train.unsqueeze(-1))
-            src = self.gat_icl(R, graph_set=graph_set)
+            src = R if self.skip_gat else self.gat_icl(R, graph_set=graph_set)
         elif self.icl_backend in GRAPH_2D_BACKENDS:
             if R.ndim != 4:
                 raise ValueError(
@@ -668,7 +713,7 @@ class ICLearning(nn.Module):
                 Ry_train = self.y_encoder(y_train.unsqueeze(-1))
 
             R[:, :train_size] = R[:, :train_size] + Ry_train
-            src = self._apply_icl_backbone(R, train_size=train_size, y_train=y_train)
+            src = R if self.skip_gat else self._apply_icl_backbone(R, train_size=train_size, y_train=y_train)
         if self.norm_first:
             src = self.ln(src)
         if self.decoder_type == "mlp":
@@ -700,9 +745,11 @@ class ICLearning(nn.Module):
     ) -> Tensor:
         """Decode one hierarchy node into probabilities over local labels."""
         train_size = y_train.shape[1]
-        num_classes = int(torch.unique(y_train).numel())
         out = self._decode_representations(src, y_train=y_train, train_size=train_size)
-        out = out[:, train_size:, :num_classes]
+        if self.decoder_type == "mlp":
+            out = out[:, train_size:, : int(torch.unique(y_train).numel())]
+        else:
+            out = out[:, train_size:]
         if self.decoder_type in ("soft_kmeans", "rbf", "euclidean"):
             return out.exp()
         return torch.softmax(out / softmax_temperature, dim=-1)

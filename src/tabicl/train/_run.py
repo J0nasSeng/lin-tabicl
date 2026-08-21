@@ -1168,6 +1168,10 @@ class Trainer:
         #self.fit_ensemble(micro_batch)
 
         micro_X, _micro_y, micro_d, y_train, y_test, graph_sets = self._prepare_micro_batch_tensors(micro_batch)
+        _, active_class_ids, label_lookup = self.raw_model.icl_predictor._compact_class_labels(y_train)
+        compact_y_test = label_lookup.gather(1, y_test.long())
+        if (compact_y_test < 0).any():
+            raise ValueError("Test labels must use the same active classes as the training labels")
         graph_set = graph_sets if graph_sets is not None else None
 
         # Set DDP gradient sync for last micro batch only
@@ -1202,14 +1206,20 @@ class Trainer:
                 pred_3d = model_out
 
             pred = pred_3d.flatten(end_dim=-2)
-            true = y_test.long().flatten()
+            true = compact_y_test.flatten()
+            expected_num_classes = active_class_ids.shape[-1]
+            if pred.shape[-1] != expected_num_classes:
+                raise RuntimeError(
+                    f"Decoder returned {pred.shape[-1]} classes, expected "
+                    f"{expected_num_classes} for this micro-batch"
+                )
             # All datasets have the same sequence length within a micro-batch,
             # so flattening preserves the previous mean-over-datasets reduction
             # while avoiding one cross-entropy kernel and Python loop per dataset.
             ce_loss = F.cross_entropy(
                 pred,
                 true,
-                label_smoothing=float(getattr(self.config, "label_smoothing", 0.1)),
+                label_smoothing=float(getattr(self.config, "label_smoothing", 0.0)),
                 reduction="mean",
             )
 

@@ -15,6 +15,7 @@ from .graph import (
 	build_class_conditioned_graphs,
 	GraphPrior,
 	stack_graph_sets,
+	_compact_from_graph_batches,
 )
 from .inference_config import InferenceConfig
 from .tabicl import TabICL
@@ -100,9 +101,33 @@ class GATInferenceEngine(nn.Module):
 		if graph_config is not None:
 			predictor = self.model.icl_predictor
 			for parameter, value in graph_config.items():
+				if parameter == "skip_gat":
+					if bool(value) and self.model.icl_backend not in {"graph-1d", "graph-1d-pyg"}:
+						raise ValueError(
+							"skip_gat is supported only for graph-1d backends in GATInferenceEngine."
+						)
+					predictor.skip_gat = bool(value)
+					continue
+				if parameter == "graph_num_graphs":
+					value = int(value)
+					gat = predictor.gat_icl
+					if value <= 0 or len(gat.graph_blocks) % value != 0:
+						raise ValueError(
+							"graph_num_graphs must be positive and divide the number of GAT blocks"
+						)
+					predictor.graph_num_graphs = value
+					gat.num_graphs = value
+					gat.layers_per_graph = len(gat.graph_blocks) // value
+					continue
+				if parameter == "graph_ablation":
+					if value not in {"empty", "fully_connected", "cross_label_70", "cross_label_10"}:
+						raise ValueError(f"Unknown graph ablation: {value}")
+					predictor.graph_ablation = value
+					continue
 				if not hasattr(predictor, parameter):
 					raise ValueError(f"Unknown graph configuration parameter: {parameter}")
 				setattr(predictor, parameter, value)
+		self.reinit_graph_prior()
 		if decoder_chunk_size is not None:
 			self.model.decoder_chunk_size = int(decoder_chunk_size)
 			self.model.icl_predictor.decoder_chunk_size = int(decoder_chunk_size)
@@ -119,6 +144,14 @@ class GATInferenceEngine(nn.Module):
 		self.model_path_ = checkpoint_path
 		self.inference_config_ = InferenceConfig()
 		self.max_features = self.model.max_features
+		self.skip_gat = bool(self.model.icl_predictor.skip_gat)
+		if self.skip_gat:
+			import warnings
+			warnings.warn(
+				"skip_gat is enabled; GAT refinement is bypassed for diagnostic evaluation only.",
+				RuntimeWarning,
+				stacklevel=2,
+			)
 
 		gat = self.model.icl_predictor.gat_icl
 		self.num_layers = len(gat.graph_blocks)
@@ -132,9 +165,10 @@ class GATInferenceEngine(nn.Module):
 		"""Expose the wrapped model's class limit for sklearn adapters."""
 		return self.model.max_classes
 
-	def _make_graph_set(self, y_train: Tensor, total_nodes: int) -> SparseGraphSet:
+	def reinit_graph_prior(self) -> None:
+		"""Recreate the graph prior from the current model graph settings."""
 		predictor = self.model.icl_predictor
-		prior = GraphPrior(
+		self.graph_prior = GraphPrior(
 			graph_v1_prob=getattr(predictor, "graph_v1_prob", 1.0),
 			graph_v2_prob=getattr(predictor, "graph_v2_prob", 0.0),
 			graph_prob=getattr(predictor, "graph_prob", 0.0),
@@ -145,9 +179,57 @@ class GATInferenceEngine(nn.Module):
 			seed=predictor.graph_seed,
 			share_graph_across_batch=predictor.graph_share_across_batch,
 		)
+
+	def _make_graph_set(self, y_train: Tensor, total_nodes: int) -> SparseGraphSet:
+		predictor = self.model.icl_predictor
+		ablation = getattr(predictor, "graph_ablation", None)
+		if ablation is not None:
+			return self._make_ablation_graph_set(
+				y_train, total_nodes, ablation, predictor.graph_num_graphs
+			)
 		full_labels = torch.zeros((y_train.shape[0], total_nodes), dtype=y_train.dtype, device=y_train.device)
 		full_labels[:, : y_train.shape[1]] = y_train
-		return prior(full_labels.long(), y_train.shape[1], num_graphs=predictor.graph_num_graphs)
+		return self.graph_prior(
+			full_labels.long(), y_train.shape[1], num_graphs=predictor.graph_num_graphs
+		)
+
+	def _make_ablation_graph_set(
+		self, y_train: Tensor, total_nodes: int, ablation: str, num_graphs: int
+	) -> SparseGraphSet:
+		"""Build controlled graph topologies for inference-only ablations."""
+		batch_size, train_size = y_train.shape
+		device = y_train.device
+		graphs: list[SparseGraphBatch] = []
+		for _ in range(num_graphs):
+			edges: list[Tensor] = []
+			for batch_index in range(batch_size):
+				if ablation == "empty":
+					edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
+				elif ablation == "fully_connected":
+					nodes = torch.arange(total_nodes, device=device)
+					sources = nodes[:, None].expand(total_nodes, total_nodes).reshape(-1)
+					destinations = nodes[None, :].expand(total_nodes, total_nodes).reshape(-1)
+					edge_index = torch.stack((sources, destinations))
+				else:
+					# Use the class-conditioned graph sampler so the ablation changes
+					# only the train-train cross-label budget.
+					prior = GraphPrior(
+						graph_v1_prob=1.0,
+						min_train_neighbors=4,
+						max_train_neighbors=4,
+						cross_label_fraction=0.7 if ablation == "cross_label_70" else 0.1,
+						train_neighbors_per_test=2,
+						seed=17 + batch_index,
+					)
+					labels = torch.zeros((1, total_nodes), dtype=y_train.dtype, device=device)
+					labels[:, :train_size] = y_train[batch_index]
+					graph_set = prior(labels, train_size, num_graphs=1)
+					edge_index = graph_set.edge_index[:, int(graph_set.edge_offsets[0, 0]):int(graph_set.edge_offsets[0, 1])]
+				edges.append(edge_index)
+				continue
+				edges.append(edge_index)
+			graphs.append(SparseGraphBatch(edge_index=edges, num_nodes=total_nodes))
+		return _compact_from_graph_batches(graphs, total_nodes)
 
 	def _graph_input(
 		self,
@@ -336,6 +418,14 @@ class GATInferenceEngine(nn.Module):
 			graph_set = self._compact_graph_set(graph_set, X.shape[0])
 			self._validate_graph_set(graph_set, X.shape[1], X.shape[0])
 
+		# DEBUG: check if all graphs are the same
+		graphs = graph_set.graphs
+		graphs_are_all_same = all(
+			all(torch.equal(graphs[0].edge_index[i], graph.edge_index[i]) for i in range(len(graph.edge_index)))
+			for graph in graphs[1:]
+		) if graphs else True
+		print(f"Generated graphs are all the same: {graphs_are_all_same}")
+
 		if self.model.max_classes > 0 and int(torch.unique(y_train[0]).numel()) > self.model.max_classes:
 			if return_repr:
 				raise ValueError("return_repr is not supported for hierarchical graph inference")
@@ -355,7 +445,13 @@ class GATInferenceEngine(nn.Module):
 		if self.mode == "ensemble" or (self.num_iterations == 1 and self.entry_layer is None):
 			if return_repr:
 				graph_input = self._graph_input(X, y_train, inference_config, feature_shuffles)
-				representation = self._run_refinement(graph_input, graph_set)
+				if self.skip_gat:
+					representation = graph_input.clone()
+					representation[:, : y_train.shape[1]] += self.model.icl_predictor.y_encoder(
+						y_train.float()
+					)
+				else:
+					representation = self._run_refinement(graph_input, graph_set)
 				out = self._decode(representation, y_train)[:, y_train.shape[1] :]
 				if self.model.max_classes > 0:
 					num_classes = int(torch.unique(y_train[0]).numel())

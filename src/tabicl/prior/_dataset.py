@@ -678,6 +678,10 @@ class SCMPrior(Prior):
             if actual_gp_size <= 0:
                 break
 
+            # Each group is consumed as one training micro-batch. Sample its
+            # class cardinality once so the decoder has one output width.
+            sampled_num_classes = np.random.randint(2, self.max_classes + 1)
+
             group_sampled_hp = self.hp_sampling()
             # If per-group, sample seq_len and train_size for this group. Otherwise, use global ones
             if self.seq_len_per_gp:
@@ -712,13 +716,6 @@ class SCMPrior(Prior):
 
                 # Generate parameters for each dataset in this subgroup
                 for ds_idx in range(actual_subgp_size):
-                    # Each dataset has its own number of classes
-                    ds_num_classes = np.random.randint(2, self.max_classes + 1)
-                    #if np.random.random() > 0.5:
-                    #    ds_num_classes = np.random.randint(2, self.max_classes + 1)
-                    #else:
-                    #    ds_num_classes = 2
-
                     # Create parameters dictionary for this dataset
                     params = {
                         **self.fixed_hp,  # Fixed HPs
@@ -731,7 +728,7 @@ class SCMPrior(Prior):
                         **subgp_sampled_hp,  # sampled HPs for this group
                         "prior_type": subgp_prior_type,
                         "num_features": group_num_features,
-                        "num_classes": ds_num_classes,
+                        "num_classes": sampled_num_classes,
                         "device": self.device,
                         "graph_backend": self.graph_backend,
                         "graph_num_graphs": self.graph_num_graphs,
@@ -752,7 +749,6 @@ class SCMPrior(Prior):
         # However, 'threading' does not respect `inner_max_num_threads`.
         # Therefore, we stick with the 'loky' backend for parallelism, but this requires generating
         # the prior datasets separately from the training process and loading them from disk,
-        # rather than generating them on-the-fly.
         if self.n_jobs > 1 and self.device == "cpu":
             with joblib.parallel_config(
                 n_jobs=self.n_jobs, backend="loky", inner_max_num_threads=self.num_threads_per_generate

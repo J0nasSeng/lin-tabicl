@@ -41,6 +41,9 @@ class GraphMultiheadAttention(nn.Module):
         self.nhead = nhead
         self.head_dim = d_model // nhead
         self.scale = self.head_dim**-0.5
+        # Inference/training attention temperature. Values below 1 sharpen
+        # the destination-wise softmax; change this constant for ablations.
+        self.temperature = 1.0
 
         self.q_proj = nn.Linear(d_model, d_model)
         self.k_proj = nn.Linear(d_model, d_model)
@@ -55,6 +58,9 @@ class GraphMultiheadAttention(nn.Module):
         # compatibility. The explicit name makes the runtime memory limit
         # clearer for new callers.
         self.max_chunk_size = None if max_chunk_size is None else int(max_chunk_size)
+        self.last_attention_weights: Tensor | None = None
+        self.last_attention_edge_src: Tensor | None = None
+        self.last_attention_edge_dst: Tensor | None = None
 
         nn.init.xavier_uniform_(self.out_proj.weight)
         nn.init.zeros_(self.out_proj.bias)
@@ -129,6 +135,9 @@ class GraphMultiheadAttention(nn.Module):
 
         # No incoming edges anywhere: keep only the residual connection.
         if not all_edge_src:
+            self.last_attention_weights = None
+            self.last_attention_edge_src = None
+            self.last_attention_edge_dst = None
             if alpha is None:
                 return residual_src
             return (1.0 - alpha) * residual_src
@@ -188,7 +197,7 @@ class GraphMultiheadAttention(nn.Module):
             src_index = global_edge_src[start:end]
             q_dst = q[dst]
             k_src = k[src_index]
-            logits = (q_dst * k_src).sum(dim=-1) * self.scale
+            logits = (q_dst * k_src).sum(dim=-1) * (self.scale / self.temperature)
             if include_values:
                 return dst, logits, v[src_index]
             return dst, logits
@@ -214,6 +223,7 @@ class GraphMultiheadAttention(nn.Module):
             sum_per_group = sum_per_group.index_add(0, group_index, exp_logits)
 
         # Pass 3: normalize and accumulate messages directly into destinations.
+        cached_weights: list[Tensor] = []
         for start, end in chunks:
             dst, logits, values = chunk_logits(start, end, include_values=True)
             group_index = chunk_group_index(dst)
@@ -221,8 +231,13 @@ class GraphMultiheadAttention(nn.Module):
             edge_weight = (edge_weight / sum_per_group[group_index].clamp_min(1e-12)).view(
                 end - start, C, self.nhead
             )
+            cached_weights.append(edge_weight.detach())
             edge_weight = self.dropout(edge_weight)
             agg = agg.index_add(0, dst, values * edge_weight.unsqueeze(-1))
+
+        self.last_attention_weights = torch.cat(cached_weights, dim=0).detach()
+        self.last_attention_edge_src = global_edge_src.detach().clone()
+        self.last_attention_edge_dst = global_edge_dst.detach().clone()
 
         attn_out = self.out_proj(agg.view(B, T, C, self.d_model))
         if alpha is None:
@@ -553,6 +568,7 @@ class Graph1DAttentionTransformer(nn.Module):
         out = src.unsqueeze(2)
         for block_idx, block in enumerate(self.graph_blocks):
             edges = edge_index_batch[block_idx // self.layers_per_graph]
+            out_ = out.clone()
             if self.recompute:
                 out = checkpoint(
                     partial(block, edge_index_batch=edges, edge_index_is_global=edge_index_is_global),
