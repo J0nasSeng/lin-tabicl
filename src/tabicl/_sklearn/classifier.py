@@ -458,7 +458,11 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
                 graph_config=self.graph_config,
             )
         else:
-            self.model_ = TabICL(**checkpoint["config"], icl_backend="encoder")
+            encoder_config = {
+                key: value for key, value in checkpoint["config"].items() if key != "model_type"
+            }
+            encoder_config["icl_backend"] = "encoder"
+            self.model_ = TabICL(**encoder_config)
         self.model_config_ = checkpoint["config"]
         if not isinstance(self.model_, GATInferenceEngine):
             self.model_.load_state_dict(checkpoint["state_dict"])

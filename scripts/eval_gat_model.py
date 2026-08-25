@@ -150,6 +150,18 @@ def _mean_entropy(y_proba: np.ndarray) -> float:
 def build_parser() -> argparse.ArgumentParser:
 	parser = argparse.ArgumentParser(description=__doc__)
 	parser.add_argument("checkpoint", type=Path, nargs="?", help="TabICL checkpoint (.ckpt) to evaluate")
+	parser.add_argument(
+		"--encoder-checkpoint",
+		type=Path,
+		default=None,
+		help="Optional custom encoder-backend TabICL checkpoint to evaluate as a baseline.",
+	)
+	parser.add_argument(
+		"--encoder-n-estimators",
+		type=int,
+		default=1,
+		help="Number of ensemble estimators for the custom encoder baseline.",
+	)
 	parser.add_argument("--num-datasets", type=int, default=1000, help="Datasets per class count")
 	parser.add_argument("--batch-size", type=int, default=1, help="Prior datasets generated per batch")
 	parser.add_argument(
@@ -896,6 +908,21 @@ def _build_pretrained_tabicl(n_estimators: int, device: str, seed: int):
 		n_jobs=1,
 		verbose=False,
 		norm_methods="none"
+	)
+
+
+def _build_encoder_tabicl(
+	checkpoint: Path, n_estimators: int, device: str, seed: int
+):
+	"""Build a custom encoder-backend TabICL baseline."""
+	return TabICLClassifier(
+		model_path=checkpoint,
+		n_estimators=n_estimators,
+		device=device,
+		random_state=seed,
+		n_jobs=1,
+		verbose=False,
+		norm_methods="none",
 	)
 
 
@@ -1653,6 +1680,27 @@ def _evaluate_class_count(
 				print(f"Warning: pretrained TabICL failed for K={num_classes}, dataset={processed}: {exc}")
 				continue
 
+			if args.encoder_checkpoint is not None:
+				encoder_tabicl = _build_encoder_tabicl(
+					args.encoder_checkpoint,
+					args.encoder_n_estimators,
+					device,
+					args.seed + processed,
+				)
+				try:
+					encoder_tabicl.fit(x_train, y_train)
+					encoder_proba = encoder_tabicl.predict_proba(x_test)
+					predictions["encoder_tabicl"] = (
+						encoder_tabicl.classes_[np.argmax(encoder_proba, axis=1)].astype(int),
+						encoder_proba,
+						encoder_tabicl.classes_,
+					)
+				except Exception as exc:
+					print(
+						f"Warning: encoder TabICL failed for K={num_classes}, "
+						f"dataset={processed}: {exc}"
+					)
+
 			for model_name, (prediction, probabilities, class_labels) in predictions.items():
 				for score_name, score_fn in SCORES.items():
 					rows.append({
@@ -1893,6 +1941,8 @@ def main() -> None:
 		raise ValueError("--rf-n-estimators must be positive")
 	if args.pretrained_tabicl_n_estimators < 1:
 		raise ValueError("--pretrained-tabicl-n-estimators must be positive")
+	if args.encoder_n_estimators < 1:
+		raise ValueError("--encoder-n-estimators must be positive")
 	if args.gat_tabicl_n_estimators is not None and args.gat_tabicl_n_estimators < 1:
 		raise ValueError("--gat-tabicl-n-estimators must be positive")
 	if args.num_refinement_iter < 1:

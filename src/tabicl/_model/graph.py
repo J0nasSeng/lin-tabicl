@@ -340,6 +340,8 @@ class GraphPrior:
         self.train_neighbors_per_test = int(train_neighbors_per_test)
         self.seed = seed
         self._call_count = 0
+        self._call_seed_generator = torch.Generator(device="cpu")
+        self._call_seed_generator.seed()
         self.share_graph_across_batch = bool(share_graph_across_batch)
 
     @staticmethod
@@ -628,14 +630,19 @@ class GraphPrior:
 
         call_index = self._call_count
         self._call_count += 1
-        call_seed = (
-            None
-            if self.seed is None
-            else self.seed + call_index * _GRAPH_CALL_SEED_STRIDE
-        )
+        if self.seed is None:
+            call_seed = int(
+                torch.randint(
+                    0,
+                    2**63 - 1,
+                    (1,),
+                    generator=self._call_seed_generator,
+                ).item()
+            )
+        else:
+            call_seed = self.seed + call_index * _GRAPH_CALL_SEED_STRIDE
         mode_generator = torch.Generator(device=y.device)
-        if call_seed is not None:
-            mode_generator.manual_seed(call_seed)
+        mode_generator.manual_seed(call_seed)
         mode = self._weighted_choice(
             ["v1", "v2", "graph"],
             [self.graph_mode_probs[name] for name in ("v1", "v2", "graph")],

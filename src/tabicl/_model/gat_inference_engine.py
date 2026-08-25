@@ -418,14 +418,6 @@ class GATInferenceEngine(nn.Module):
 			graph_set = self._compact_graph_set(graph_set, X.shape[0])
 			self._validate_graph_set(graph_set, X.shape[1], X.shape[0])
 
-		# DEBUG: check if all graphs are the same
-		graphs = graph_set.graphs
-		graphs_are_all_same = all(
-			all(torch.equal(graphs[0].edge_index[i], graph.edge_index[i]) for i in range(len(graph.edge_index)))
-			for graph in graphs[1:]
-		) if graphs else True
-		print(f"Generated graphs are all the same: {graphs_are_all_same}")
-
 		if self.model.max_classes > 0 and int(torch.unique(y_train[0]).numel()) > self.model.max_classes:
 			if return_repr:
 				raise ValueError("return_repr is not supported for hierarchical graph inference")

@@ -22,6 +22,10 @@ from tabicl.prior._dataset import PriorDataset
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", type=Path)
+    parser.add_argument(
+        "--encoder-checkpoint", type=Path, default=None,
+        help="Optional custom encoder-backend TabICL checkpoint to evaluate on the same datasets.",
+    )
     parser.add_argument("--num-datasets", type=int, default=1)
     parser.add_argument("--num-classes", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=1)
@@ -105,6 +109,83 @@ def _build_classifier(
         gat_entry_layer=None,
         graph_config=config or None,
     )
+
+def _build_encoder_classifier(
+    checkpoint: Path, device: str, seed: int, n_estimators: int
+) -> TabICLClassifier:
+    """Build the optional custom encoder-backend comparison model."""
+    return TabICLClassifier(
+        model_path=checkpoint,
+        n_estimators=n_estimators,
+        batch_size=1,
+        device=device,
+        random_state=seed,
+        n_jobs=1,
+        norm_methods="none",
+    )
+
+
+def _encoder_layer_representations(
+    classifier: TabICLClassifier, X: np.ndarray
+) -> dict[str, np.ndarray]:
+    """Return test-row representations after each encoder ICL block."""
+    model = classifier.model_
+    blocks = model.icl_predictor.tf_icl.blocks
+    captured: list[list[torch.Tensor]] = [[] for _ in blocks]
+
+    hooks = []
+    for index, block in enumerate(blocks):
+        hooks.append(
+            block.register_forward_hook(
+                lambda _module, _inputs, output, index=index: captured[index].append(
+                    output.detach() if isinstance(output, torch.Tensor) else output[0].detach()
+                )
+            )
+        )
+    try:
+        X = classifier.X_encoder_.transform(X)
+        if classifier.feature_reducer_ is not None:
+            X = classifier.feature_reducer_.transform(X)
+        for subset, generator in zip(classifier.feature_subsets_, classifier.ensemble_generators_):
+            data = generator.transform(X[:, subset], mode="both")
+            for norm_method, (Xs, ys) in data.items():
+                feature_shuffles = generator.feature_shuffles_[norm_method]
+                batch_size = classifier.batch_size or Xs.shape[0]
+                n_batches = int(np.ceil(Xs.shape[0] / batch_size))
+                X_batches = np.array_split(Xs, n_batches)
+                y_batches = np.array_split(ys, n_batches)
+                shuffle_batches = (
+                    np.array_split(feature_shuffles, n_batches)
+                    if feature_shuffles is not None
+                    else [None] * n_batches
+                )
+                for X_batch, y_batch, shuffle_batch in zip(
+                    X_batches, y_batches, shuffle_batches,
+                ):
+                    X_batch = torch.from_numpy(X_batch).float().to(classifier.device_)
+                    y_batch = torch.from_numpy(y_batch).float().to(classifier.device_)
+                    if shuffle_batch is not None:
+                        shuffle_batch = shuffle_batch.tolist()
+                    with torch.no_grad():
+                        model(
+                            X=X_batch,
+                            y_train=y_batch,
+                            feature_shuffles=shuffle_batch,
+                            return_logits=True,
+                            inference_config=classifier.inference_config_,
+                            return_pre_decoder_repr=True,
+                        )
+    finally:
+        for hook in hooks:
+            hook.remove()
+
+    return {
+        f"encoder_{index + 1}": np.mean(
+            np.concatenate([value.float().cpu().numpy() for value in values], axis=0), axis=0
+        )
+        for index, values in enumerate(captured)
+        if values
+    }
 
 
 def _prefixes(classifier: TabICLClassifier, requested: list[int] | None) -> list[int]:
@@ -351,6 +432,15 @@ def _plot_metrics(rows: list[dict], output_dir: Path) -> None:
                 [0], [np.nanmean(skip_values)], yerr=[np.nanstd(skip_values)],
                 marker="o", capsize=4, linewidth=2, color="black", label="skip-GAT",
             )
+        encoder_values = np.asarray(
+            [row[metric] for row in rows if row["variant"] == "encoder"], dtype=float
+        )
+        if encoder_values.size:
+            axis.errorbar(
+                [-1], [np.nanmean(encoder_values)], yerr=[np.nanstd(encoder_values)],
+                marker="o", capsize=4, linewidth=2, color="#70AD47",
+                label="custom encoder",
+            )
         for temperature in temperatures:
             means = []
             stds = []
@@ -373,7 +463,12 @@ def _plot_metrics(rows: list[dict], output_dir: Path) -> None:
                     plotted_blocks, means, yerr=stds, marker="o", capsize=4,
                     linewidth=2, label=f"temperature={temperature:g}",
                 )
-        axis.set_xticks(block_values, ["skip-GAT" if block == 0 else str(block) for block in block_values])
+        axis.set_xticks(
+            [-1, *block_values],
+            ["custom encoder", *[
+                "skip-GAT" if block == 0 else str(block) for block in block_values
+            ]],
+        )
         axis.set_xlabel("Number of applied GAT blocks")
         axis.set_ylabel(ylabel)
         axis.set_title(title)
@@ -624,6 +719,8 @@ def main() -> None:
     args = _parser().parse_args()
     if args.num_datasets < 1 or args.num_classes < 2:
         raise ValueError("num-datasets must be positive and num-classes must be at least 2")
+    if args.n_estimators < 1:
+        raise ValueError("n-estimators must be positive")
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     temperatures = sorted(set(args.temperatures))
@@ -689,6 +786,27 @@ def main() -> None:
                 "balanced_accuracy": _balanced_accuracy(y_test, skip_pred),
             })
 
+            encoder_representations: dict[str, np.ndarray] = {}
+            if args.encoder_checkpoint is not None:
+                encoder = _build_encoder_classifier(
+                    args.encoder_checkpoint,
+                    device,
+                    args.seed + processed + 100000,
+                    args.n_estimators,
+                )
+                encoder.fit(x[:train_size], y_train)
+                encoder_proba = encoder.predict_proba(x[train_size:])
+                encoder_representations = _encoder_layer_representations(encoder, x)
+                encoder_pred = encoder.classes_[np.argmax(encoder_proba, axis=1)]
+                rows.append({
+                    "dataset": processed, "variant": "encoder", "blocks": -1,
+                    "temperature": None,
+                    "cross_entropy": float(log_loss(
+                        y_test, encoder_proba, labels=encoder.classes_
+                    )),
+                    "balanced_accuracy": _balanced_accuracy(y_test, encoder_pred),
+                })
+
             if args.graph_ablation:
                 ablation_names = ("empty", "fully_connected", "cross_label_70", "cross_label_10")
                 for ablation_index, ablation in enumerate(ablation_names):
@@ -744,6 +862,7 @@ def main() -> None:
                 _set_temperature(classifier, temperature)
                 prefixes = _prefixes(classifier, args.blocks)
                 full_repr: dict[str, np.ndarray] = {"skip_gat": skip_repr}
+                full_repr.update(encoder_representations)
                 for prefix in prefixes:
                     if prefix == 0:
                         continue

@@ -4,11 +4,11 @@
 ICL_BACKEND=${ICL_BACKEND:-graph-1d}
 # Enable wandb logging by setting WAND_LOG=True (and optionally WAND_MODE=online)
 WAND_LOG=${WAND_LOG:-True}
-WAND_MODE=${WAND_MODE:-offline}
+WAND_MODE=${WAND_MODE:-online}
 # GPU selection controls
 DEVICE=${DEVICE:-cuda}
-NUM_GPUS=${NUM_GPUS:-3}
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,2,3}
+NUM_GPUS=${NUM_GPUS:-2}
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1,2}
 # Confusion matrix logging interval
 LOG_CONF_MAT_EVERY=${LOG_CONF_MAT_EVERY:-200000} # effectively disables confusion matrix logging if set to a large number
 
@@ -63,7 +63,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --icl_backend ${ICL_BACKEND} \
             --ff_factor 2 \
             --norm_first True \
-            --checkpoint_dir /workspace/checkpoints_dyngraph_intraclass=0.25_no_supcon/stage1/ \
+            --checkpoint_dir /workspace/checkpoints_encoder/stage1/ \
             --save_temp_every 1000 \
             --save_perm_every 5000 \
             --icl_soft_kmeans_temperature 0.5 \
@@ -72,7 +72,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --graph_max_train_neighbors 4 \
             --graph_train_neighbors_per_test 2 \
             --graph_cross_label_fraction 0.25 \
-            --graph_num_graphs 1 \
+            --graph_num_graphs 4 \
             --recompute False \
 
 
