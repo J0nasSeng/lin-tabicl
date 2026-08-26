@@ -44,6 +44,7 @@ from ._graph_scm import GraphSCM
 from ._hp_sampling import HpSamplerList
 from ._reg2cls import Reg2Cls
 from ._prior_config import DEFAULT_FIXED_HP, DEFAULT_SAMPLED_HP
+from tabicl._model.graph import GraphTopologyPrior, stack_graph_sets
 
 warnings.filterwarnings(
     "ignore", message=".*The PyTorch API of nested tensors is in prototype stage.*", category=UserWarning
@@ -1357,6 +1358,18 @@ class PriorDataset(IterableDataset):
             n_jobs: int = -1,
             num_threads_per_generate: int = 1,
             device: str = "cpu",
+            normalization: str = "none",
+            graph_backend: Optional[bool] = None,
+            graph_num_graphs: int = 1,
+            graph_min_train_neighbors: int = 8,
+            graph_max_train_neighbors: int = 15,
+            graph_cross_label_fraction: float = 0.1,
+            graph_train_neighbors_per_test: int = 3,
+            graph_seed: Optional[int] = None,
+            graph_share_across_batch: bool = False,
+            graph_v1_prob: float = 1.0,
+            graph_v2_prob: float = 0.0,
+            graph_prob: float = 0.0,
     ):
         super().__init__()
         if prior_type == "dummy":
@@ -1440,6 +1453,18 @@ class PriorDataset(IterableDataset):
         self.max_train_size = max_train_size
         self.device = device
         self.prior_type = prior_type
+        self.graph_num_graphs = int(graph_num_graphs)
+        self.normalization = normalization
+        self.graph_backend = self.graph_num_graphs > 1 if graph_backend is None else bool(graph_backend)
+        self.graph_min_train_neighbors = int(graph_min_train_neighbors)
+        self.graph_max_train_neighbors = int(graph_max_train_neighbors)
+        self.graph_cross_label_fraction = float(graph_cross_label_fraction)
+        self.graph_train_neighbors_per_test = int(graph_train_neighbors_per_test)
+        self.graph_seed = graph_seed
+        self.graph_share_across_batch = bool(graph_share_across_batch)
+        self.graph_v1_prob = float(graph_v1_prob)
+        self.graph_v2_prob = float(graph_v2_prob)
+        self.graph_prob = float(graph_prob)
 
     def get_batch(self, batch_size: Optional[int] = None) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """
@@ -1475,7 +1500,33 @@ class PriorDataset(IterableDataset):
         train_sizes : Tensor
             Position for train/test split for each dataset of shape (batch_size,).
         """
-        return self.prior.get_batch(batch_size or self.batch_size)
+        batch = self.prior.get_batch(batch_size or self.batch_size)
+        if not self.graph_backend:
+            return batch
+
+        X, y, d, seq_lens, train_sizes = batch
+        if getattr(y, "is_nested", False):
+            raise ValueError("graph_backend does not support nested batches")
+        graph_prior = GraphTopologyPrior(
+            graph_v1_prob=self.graph_v1_prob,
+            graph_v2_prob=self.graph_v2_prob,
+            graph_prob=self.graph_prob,
+            min_train_neighbors=self.graph_min_train_neighbors,
+            max_train_neighbors=self.graph_max_train_neighbors,
+            cross_label_fraction=self.graph_cross_label_fraction,
+            train_neighbors_per_test=self.graph_train_neighbors_per_test,
+            seed=self.graph_seed,
+            share_graph_across_batch=self.graph_share_across_batch,
+        )
+        graph_sets = [
+            graph_prior(
+                y[index : index + 1].long(),
+                int(train_sizes[index]),
+                num_graphs=self.graph_num_graphs,
+            )
+            for index in range(y.shape[0])
+        ]
+        return X, y, d, seq_lens, train_sizes, stack_graph_sets(graph_sets)
 
     def __iter__(self) -> "PriorDataset":
         """

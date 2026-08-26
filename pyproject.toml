@@ -38,7 +38,13 @@ dependencies = [
     "transformers",
     "wandb",
     "rtpt",
-    "umap-learn"
+    "umap-learn",
+    "matplotlib",
+    "kagglehub>=1.0.2",
+    "pandas>=2.3.3",
+    "torchdata>=0.11.0",
+    "torch-geometric>=2.8.0.post1",
+    "tabulate>=0.10.0",
 ]
 
 [project.optional-dependencies]

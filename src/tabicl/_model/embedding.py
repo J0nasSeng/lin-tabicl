@@ -135,7 +135,9 @@ class ColEmbedding(nn.Module):
         feature_group_size: int = 3,
         target_aware: bool = False,
         max_classes: int = 10,
+        max_features: int = 100,
         reserve_cls_tokens: int = 4,
+        enable_column_identity_rotation: bool = False,
         ssmax: Union[bool, str] = False,
         zero_init: bool = True,
         mixed_radix_ensemble: bool = True,
@@ -148,9 +150,18 @@ class ColEmbedding(nn.Module):
         self.feature_group_size = feature_group_size
         self.target_aware = target_aware
         self.max_classes = max_classes
+        self.max_features = max_features
+        self.enable_column_identity_rotation = enable_column_identity_rotation
         self.affine = affine
         self.mixed_radix_ensemble = mixed_radix_ensemble
         self.in_linear = SkippableLinear(feature_group_size if feature_group else 1, embed_dim, bias=True)
+
+        if self.max_features <= 0:
+            raise ValueError("max_features must be > 0")
+        if self.enable_column_identity_rotation and self.embed_dim % 2 != 0:
+            raise ValueError("column identity rotation requires an even embed_dim")
+        if self.enable_column_identity_rotation:
+            self.column_identity_rotations = nn.Parameter(torch.empty(self.max_features, self.embed_dim // 2))
 
         self.tf_col = SetTransformer(
             num_blocks=num_blocks,
@@ -183,9 +194,79 @@ class ColEmbedding(nn.Module):
         self.inference_mgr = InferenceManager(enc_name="tf_col", out_dim=embed_dim)
 
         nn.init.xavier_uniform_(self.in_linear.weight)
-        nn.init.xavier_uniform_(self.y_encoder.weight)
         nn.init.zeros_(self.in_linear.bias)
-        nn.init.zeros_(self.y_encoder.bias)
+        if target_aware:
+            nn.init.xavier_uniform_(self.y_encoder.weight)
+            nn.init.zeros_(self.y_encoder.bias)
+        if self.enable_column_identity_rotation:
+            self._reset_column_identity_rotations()
+
+    def _reset_column_identity_rotations(self) -> None:
+        """Initialize column identity embeddings with orthogonal vectors."""
+
+        with torch.no_grad():
+            table = self.column_identity_rotations
+            rot_dim = table.shape[1]
+            start = 0
+            while start < self.max_features:
+                block = torch.empty(rot_dim, rot_dim, device=table.device, dtype=table.dtype)
+                nn.init.orthogonal_(block)
+                rows = min(rot_dim, self.max_features - start)
+                table[start : start + rows].copy_(block[:rows])
+                start += rows
+
+    def _apply_column_identity_rotation(self, src: Tensor, valid_feature_mask: Optional[Tensor] = None) -> Tensor:
+        """Rotate feature columns using learnable per-column identity angles.
+
+        Parameters
+        ----------
+        src : Tensor
+            Projected tensor of shape (B, C, T, E) where C includes reserved CLS slots.
+
+        valid_feature_mask : Optional[Tensor], default=None
+            Optional boolean mask of shape (B, C - reserve_cls_tokens) indicating
+            where rotation should be applied.
+        """
+
+        if not self.enable_column_identity_rotation:
+            return src
+
+        cls_cols = self.reserve_cls_tokens
+        total_cols = src.shape[1]
+        num_feature_cols = total_cols - cls_cols
+
+        if num_feature_cols <= 0:
+            return src
+        if num_feature_cols > self.max_features:
+            raise ValueError(
+                f"Received {num_feature_cols} feature columns but max_features={self.max_features}. "
+                "Increase max_features to cover all projected columns."
+            )
+
+        feature_src = src[:, cls_cols:, :, :]
+        col_ids = torch.arange(num_feature_cols, device=src.device)
+        angles = self.column_identity_rotations[col_ids]  # (C_feat, E/2)
+        cos_theta = torch.cos(angles).view(1, num_feature_cols, 1, -1)
+        sin_theta = torch.sin(angles).view(1, num_feature_cols, 1, -1)
+
+        even = feature_src[..., 0::2]
+        odd = feature_src[..., 1::2]
+        rot_even = even * cos_theta - odd * sin_theta
+        rot_odd = even * sin_theta + odd * cos_theta
+
+        rotated = torch.empty_like(feature_src)
+        rotated[..., 0::2] = rot_even
+        rotated[..., 1::2] = rot_odd
+
+        if valid_feature_mask is not None:
+            mask = valid_feature_mask.unsqueeze(-1).unsqueeze(-1)
+            feature_src = torch.where(mask, rotated, feature_src)
+        else:
+            feature_src = rotated
+
+        out = src.clone()
+        out[:, cls_cols:, :, :] = feature_src
+        return out
 
     @staticmethod
     def map_feature_shuffle(reference_pattern: List[int], other_pattern: List[int]) -> List[int]:
@@ -392,7 +473,6 @@ class ColEmbedding(nn.Module):
                 else:
                     y_emb = self.y_encoder(y_train.unsqueeze(-1))
                 src[..., :train_size, :] = src[..., :train_size, :] + y_emb
-                # TODO: Check why the attention result dominates in terms of magnitude
                 src = self.tf_col(src, train_size=None if embed_with_test else train_size)
             else:
                 # Mixed-radix ensembling for many-class classification
@@ -425,6 +505,65 @@ class ColEmbedding(nn.Module):
             embeddings = src
 
         return embeddings
+
+    def project_input(self, X: Tensor, d: Optional[Tensor] = None) -> Tensor:
+        """Project raw input features with ``in_linear`` only.
+
+        This method mirrors the column layout logic used in training forward but
+        skips set-transformer processing and affine heads. It is intended for
+        graph-backend residual fusion where a pre-column embedding signal is
+        added to column embeddings.
+
+        Parameters
+        ----------
+        X : Tensor
+            Input tensor of shape (B, T, H).
+
+        d : Optional[Tensor], default=None
+            Number of valid features per table, shape (B,). Only used when
+            feature grouping is disabled.
+
+        Returns
+        -------
+        Tensor
+            Projected tensor of shape (B, T, H+C, E) where C is reserved cls
+            token count and E is embedding dimension.
+        """
+
+        if self.feature_group:
+            assert d is None, "d is not supported when feature grouping is enabled."
+            Xg = self.feature_grouping(X)
+            if self.reserve_cls_tokens > 0:
+                Xg = F.pad(Xg, (0, 0, self.reserve_cls_tokens, 0), value=-100.0)
+            features = Xg.transpose(1, 2)  # (B, G+C, T, group_size)
+            src = self.in_linear(features)
+            src = self._apply_column_identity_rotation(src)
+            return src.transpose(1, 2)  # (B, T, G+C, E)
+
+        if self.reserve_cls_tokens > 0:
+            X = F.pad(X, (self.reserve_cls_tokens, 0), value=-100.0)
+
+        if d is None:
+            features = X.transpose(1, 2).unsqueeze(-1)  # (B, H+C, T, 1)
+            src = self.in_linear(features)
+            src = self._apply_column_identity_rotation(src)
+            return src.transpose(1, 2)  # (B, T, H+C, E)
+
+        if self.reserve_cls_tokens > 0:
+            d = d + self.reserve_cls_tokens
+
+        B, T, HC = X.shape
+        Xt = X.transpose(1, 2)  # (B, H+C, T)
+        indices = torch.arange(HC, device=X.device).unsqueeze(0).expand(B, HC)
+        mask = indices < d.unsqueeze(1)
+        features = Xt[mask].unsqueeze(-1)  # (N, T, 1)
+        effective_src = self.in_linear(features)
+
+        src = torch.zeros(B, HC, T, self.embed_dim, device=X.device, dtype=effective_src.dtype)
+        src[mask] = effective_src
+        valid_feature_mask = mask[:, self.reserve_cls_tokens :] if self.reserve_cls_tokens > 0 else mask
+        src = self._apply_column_identity_rotation(src, valid_feature_mask=valid_feature_mask)
+        return src.transpose(1, 2)  # (B, T, H+C, E)
 
     def _train_forward(
         self, X: Tensor, y_train: Tensor, d: Optional[Tensor] = None, embed_with_test: bool = False

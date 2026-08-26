@@ -4,7 +4,7 @@ import warnings
 from pathlib import Path
 import multiprocessing as mp
 from collections import OrderedDict
-from typing import Optional, List, Dict
+from typing import Any, Optional, List, Dict
 
 import numpy as np
 import torch
@@ -18,12 +18,14 @@ from huggingface_hub import hf_hub_download
 from huggingface_hub.utils import LocalEntryNotFoundError
 
 from .base import TabICLBaseEstimator
-from .preprocessing import TransformToNumerical, EnsembleGenerator
+from .preprocessing import TransformToNumerical, EnsembleGenerator, FeatureReducer
 from .sklearn_utils import validate_data, _num_samples
 
 from tabicl import InferenceConfig
 from tabicl._model.tabicl import TabICL
 from tabicl._model.kv_cache import TabICLCache
+from tabicl._model.gat_inference_engine import GATInferenceEngine
+from tabicl._model.graph import CompactGraphSet, SparseGraphSet, stack_graph_sets
 
 
 class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
@@ -226,6 +228,18 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
               from the class initialization are ignored
             - All settings must be explicitly defined in the provided InferenceConfig object
 
+    feature_reduction : {None, 'ensemble', 'pca', 'umap'}, default=None
+        Strategy for inputs wider than the model's ``max_features`` limit.
+        ``None`` preserves the normal behavior for supported inputs and
+        automatically uses deterministic feature-subset ensembling for wider
+        inputs. ``'ensemble'`` always partitions features into contiguous
+        subsets. ``'pca'`` and ``'umap'`` fit a reducer on the training data
+        before inference and require ``n_components``.
+
+    n_components : int or None, default=None
+        Number of features produced by PCA or UMAP. It must not exceed the
+        model's ``max_features`` limit.
+
     Attributes
     ----------
     classes_ : ndarray of shape (n_classes,)
@@ -303,6 +317,14 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
         n_jobs: Optional[int] = None,
         verbose: bool = False,
         inference_config: Optional[InferenceConfig | Dict] = None,
+        gat_mode: str = "ensemble",
+        gat_num_iterations: int = 1,
+        gat_entry_layer: int | str | None = None,
+        feature_reduction: str | None = None,
+        n_components: int | None = None,
+        max_chunk_size: int | None = None,
+        decoder_chunk_size: int = 5000,
+        graph_config: Optional[Dict[str, Any]] = None,
     ):
         self.n_estimators = n_estimators
         self.norm_methods = norm_methods
@@ -326,6 +348,16 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
         self.random_state = random_state
         self.verbose = verbose
         self.inference_config = inference_config
+        self.gat_mode = gat_mode
+        self.gat_num_iterations = gat_num_iterations
+        self.gat_entry_layer = gat_entry_layer
+        self.max_chunk_size = max_chunk_size
+        self.graph_config = graph_config
+        if decoder_chunk_size <= 0:
+            raise ValueError("decoder_chunk_size must be positive")
+        self.decoder_chunk_size = int(decoder_chunk_size)
+        self.feature_reduction = feature_reduction
+        self.n_components = n_components
 
     def _load_model(self) -> None:
         """Load a model from a given path or download it if not available.
@@ -415,10 +447,32 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
         assert "state_dict" in checkpoint, "The checkpoint doesn't contain the model state."
 
         self.model_path_ = model_path_
-        self.model_ = TabICL(**checkpoint["config"])
+        if checkpoint["config"].get("icl_backend", "encoder") in {
+            "graph", "graph-pyg", "graph-2d", "graph-2d-pyg",
+            "graph-1d", "graph-1d-pyg",
+        }:
+            if self.kv_cache:
+                raise ValueError("KV caching is not currently supported for graph-backend inference.")
+            self.model_ = GATInferenceEngine(
+                model_path_,
+                device=self.device_,
+                mode=self.gat_mode,
+                num_iterations=self.gat_num_iterations,
+                entry_layer=self.gat_entry_layer,
+                max_chunk_size=self.max_chunk_size,
+                decoder_chunk_size=self.decoder_chunk_size,
+                graph_config=self.graph_config,
+            )
+        else:
+            encoder_config = {
+                key: value for key, value in checkpoint["config"].items() if key != "model_type"
+            }
+            encoder_config["icl_backend"] = "encoder"
+            self.model_ = TabICL(**encoder_config)
         self.model_config_ = checkpoint["config"]
-        self.model_.load_state_dict(checkpoint["state_dict"])
-        self.model_.eval()
+        if not isinstance(self.model_, GATInferenceEngine):
+            self.model_.load_state_dict(checkpoint["state_dict"])
+            self.model_.eval()
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> TabICLClassifier:
         """Fit the classifier to training data.
@@ -499,21 +553,61 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
                     f"ensembling during column-wise embedding and hierarchical classification during in-context learning."
                 )
 
-        #  Transform input features
+        # Transform input features. Keep the original width for sklearn's
+        # feature validation and track the width consumed by the model
+        # separately.
         self.X_encoder_ = TransformToNumerical(verbose=self.verbose)
         X = self.X_encoder_.fit_transform(X)
 
-        # Fit ensemble generator to create multiple dataset views
-        self.ensemble_generator_ = EnsembleGenerator(
-            classification=True,
-            n_estimators=self.n_estimators,
-            norm_methods=self.norm_methods or ["none", "power"],
-            feat_shuffle_method=self.feat_shuffle_method,
-            class_shuffle_method=self.class_shuffle_method,
-            outlier_threshold=self.outlier_threshold,
-            random_state=self.random_state,
-        )
-        self.ensemble_generator_.fit(X, y)
+        if self.feature_reduction not in {None, "ensemble", "pca", "umap"}:
+            raise ValueError("feature_reduction must be one of None, 'ensemble', 'pca', or 'umap'.")
+
+        max_features = self.model_.max_features
+        strategy = self.feature_reduction
+        if strategy is None and X.shape[1] > max_features:
+            strategy = "ensemble"
+        self.feature_reducer_ = None
+        if strategy in {"pca", "umap"}:
+            if self.kv_cache:
+                raise ValueError("KV caching is not supported with dimensionality reduction.")
+            if self.n_components is None:
+                raise ValueError("n_components must be specified when feature_reduction is 'pca' or 'umap'.")
+            if not isinstance(self.n_components, (int, np.integer)) or self.n_components <= 0:
+                raise ValueError("n_components must be a positive integer.")
+            if self.n_components > max_features:
+                raise ValueError(
+                    f"n_components={self.n_components} exceeds the model limit of {max_features} features."
+                )
+            self.feature_reducer_ = FeatureReducer(strategy, self.n_components, self.random_state)
+            X = self.feature_reducer_.fit_transform(X)
+        elif strategy is None and X.shape[1] > max_features:
+            raise ValueError(f"The input has {X.shape[1]} features, but the model supports at most {max_features}.")
+
+        self.feature_reduction_ = strategy
+        self.n_features_model_ = X.shape[1] if strategy != "ensemble" else min(X.shape[1], max_features)
+        if strategy == "ensemble":
+            self.feature_subsets_ = [
+                np.arange(start, min(start + max_features, X.shape[1]))
+                for start in range(0, X.shape[1], max_features)
+            ]
+        else:
+            self.feature_subsets_ = [np.arange(X.shape[1])]
+
+        self.ensemble_generators_ = []
+        for subset in self.feature_subsets_:
+            generator = EnsembleGenerator(
+                classification=True,
+                n_estimators=self.n_estimators,
+                norm_methods=self.norm_methods or ["none", "power"],
+                feat_shuffle_method=self.feat_shuffle_method,
+                class_shuffle_method=self.class_shuffle_method,
+                outlier_threshold=self.outlier_threshold,
+                random_state=self.random_state,
+            )
+            generator.fit(X[:, subset], y)
+            self.ensemble_generators_.append(generator)
+        # Preserve the established public/internal attribute for ordinary use.
+        self.ensemble_generator_ = self.ensemble_generators_[0]
 
         self.model_kv_cache_ = None
         if self.kv_cache:
@@ -533,36 +627,39 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
         # X=None is required in transform() even though it is the default value
         # because sklearn's _SetOutputMixin wraps transform() with a signature
         # that enforces X as a positional argument.
-        train_data = self.ensemble_generator_.transform(X=None, mode="train")
-        self.model_kv_cache_ = OrderedDict()
+        self.model_kv_cache_ = []
+        for generator in self.ensemble_generators_:
+            train_data = generator.transform(X=None, mode="train")
+            subset_cache = OrderedDict()
+            for norm_method, (Xs, ys) in train_data.items():
+                batch_size = self.batch_size or Xs.shape[0]
+                n_batches = int(np.ceil(Xs.shape[0] / batch_size))
+                Xs_split = np.array_split(Xs, n_batches)
+                ys_split = np.array_split(ys, n_batches)
 
-        for norm_method, (Xs, ys) in train_data.items():
-            batch_size = self.batch_size or Xs.shape[0]
-            n_batches = int(np.ceil(Xs.shape[0] / batch_size))
-            Xs_split = np.array_split(Xs, n_batches)
-            ys_split = np.array_split(ys, n_batches)
+                caches = []
+                for X_batch, y_batch in zip(Xs_split, ys_split):
+                    X_batch = torch.from_numpy(X_batch).float().to(self.device_)
+                    y_batch = torch.from_numpy(y_batch).float().to(self.device_)
+                    with torch.no_grad():
+                        self.model_.forward_with_cache(
+                            X_train=X_batch,
+                            y_train=y_batch,
+                            use_cache=False,
+                            store_cache=True,
+                            cache_mode=self.cache_mode_,
+                            inference_config=self.inference_config_,
+                        )
+                    caches.append(self.model_._cache)
+                    self.model_.clear_cache()
 
-            caches = []
-            for X_batch, y_batch in zip(Xs_split, ys_split):
-                X_batch = torch.from_numpy(X_batch).float().to(self.device_)
-                y_batch = torch.from_numpy(y_batch).float().to(self.device_)
-                with torch.no_grad():
-                    self.model_.forward_with_cache(
-                        X_train=X_batch,
-                        y_train=y_batch,
-                        use_cache=False,
-                        store_cache=True,
-                        cache_mode=self.cache_mode_,
-                        inference_config=self.inference_config_,
-                    )
-                caches.append(self.model_._cache)
-                self.model_.clear_cache()
-
-            # Merge all batch caches into a single cache
-            self.model_kv_cache_[norm_method] = TabICLCache.concat(caches)
+                # Merge all batch caches into a single cache
+                subset_cache[norm_method] = TabICLCache.concat(caches)
+            self.model_kv_cache_.append(subset_cache)
 
     def _batch_forward(
-        self, Xs: np.ndarray, ys: np.ndarray, feature_shuffles: Optional[np.ndarray] = None
+        self, Xs: np.ndarray, ys: np.ndarray, feature_shuffles: Optional[np.ndarray] = None,
+        graph_set: SparseGraphSet | CompactGraphSet | None = None,
     ) -> np.ndarray:
         """Process model forward passes in batches to manage memory efficiently.
 
@@ -592,6 +689,13 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
         """
 
         batch_size = self.batch_size or Xs.shape[0]
+        # Hierarchical graph inference allocates a fresh column/GAT pass for
+        # every tree node. Force one ensemble view per model call so a batch of
+        # views cannot multiply those node-local GPU allocations.
+        model = getattr(self.model_, "model", self.model_)
+        max_classes = getattr(model, "max_classes", None)
+        if max_classes is not None and ys.size and np.unique(ys[0]).size > max_classes:
+            batch_size = 1
         n_batches = np.ceil(Xs.shape[0] / batch_size)
         Xs = np.array_split(Xs, n_batches)
         ys = np.array_split(ys, n_batches)
@@ -606,6 +710,7 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
             y_batch = torch.from_numpy(y_batch).float().to(self.device_)
             if shuffle_batch is not None:
                 shuffle_batch = shuffle_batch.tolist()
+            batch_graph_set = None if graph_set is None else stack_graph_sets([graph_set] * len(X_batch))
 
             with torch.no_grad():
                 out = self.model_(
@@ -615,11 +720,68 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
                     return_logits=True if self.average_logits else False,
                     softmax_temperature=self.softmax_temperature,
                     inference_config=self.inference_config_,
+                    graph_set=batch_graph_set,
                 )
             outputs.append(out.float().cpu().numpy())
 
         return np.concatenate(outputs, axis=0)
 
+    def _batch_forward_with_repr(
+        self, Xs: np.ndarray, ys: np.ndarray, feature_shuffles: Optional[np.ndarray] = None
+    ) -> np.ndarray:
+        """Return graph-backend representations for a batch of ensemble views."""
+        if not isinstance(self.model_, GATInferenceEngine):
+            raise ValueError("Representations are only exposed for graph-backend TabICL models.")
+
+        batch_size = self.batch_size or Xs.shape[0]
+        n_batches = int(np.ceil(Xs.shape[0] / batch_size))
+        Xs_split = np.array_split(Xs, n_batches)
+        ys_split = np.array_split(ys, n_batches)
+        if feature_shuffles is None:
+            feature_shuffles = [None] * n_batches
+        else:
+            feature_shuffles = np.array_split(feature_shuffles, n_batches)
+
+        representations = []
+        for X_batch, y_batch, shuffle_batch in zip(Xs_split, ys_split, feature_shuffles):
+            X_batch = torch.from_numpy(X_batch).float().to(self.device_)
+            y_batch = torch.from_numpy(y_batch).float().to(self.device_)
+            if shuffle_batch is not None:
+                shuffle_batch = shuffle_batch.tolist()
+            with torch.no_grad():
+                _, representation = self.model_(
+                    X=X_batch,
+                    y_train=y_batch,
+                    feature_shuffles=shuffle_batch,
+                    return_logits=True,
+                    inference_config=self.inference_config_,
+                    return_repr=True,
+                )
+            representations.append(representation.float().cpu().numpy())
+        return np.concatenate(representations, axis=0)
+
+    def predict_representation(self, X: np.ndarray) -> np.ndarray:
+        """Return the fitted graph TabICL representation for train and test rows.
+
+        The returned representation is produced by the same sklearn ensemble
+        views and GAT inference engine used by :meth:`predict_proba`.
+        """
+        check_is_fitted(self)
+        if not isinstance(self.model_, GATInferenceEngine):
+            raise ValueError("Representations are only exposed for graph-backend TabICL models.")
+
+        X = validate_data(self, X, reset=False, dtype=None, skip_check_array=True)
+        X = self.X_encoder_.transform(X)
+        outputs = []
+        if self.feature_reducer_ is not None:
+            X = self.feature_reducer_.transform(X)
+        for subset, generator in zip(self.feature_subsets_, self.ensemble_generators_):
+            data = generator.transform(X[:, subset], mode="both")
+            for norm_method, (Xs, ys) in data.items():
+                feature_shuffles = generator.feature_shuffles_[norm_method]
+                outputs.append(self._batch_forward_with_repr(Xs, ys, feature_shuffles))
+        return np.mean(np.concatenate(outputs, axis=0), axis=0)
+    
     def _batch_forward_with_cache(self, Xs: np.ndarray, kv_cache: TabICLCache) -> np.ndarray:
         """Process model forward passes using a pre-computed KV cache.
 
@@ -663,7 +825,9 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
             outputs.append(out.float().cpu().numpy())
         return np.concatenate(outputs, axis=0)
 
-    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+    def predict_proba(
+        self, X: np.ndarray, graph_set: SparseGraphSet | CompactGraphSet | None = None
+    ) -> np.ndarray:
         """Predict class probabilities for test samples.
 
         Applies the ensemble of TabICL models to make predictions, with each ensemble
@@ -696,7 +860,8 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
         # Check if prediction is possible
         has_kv_cache = hasattr(self, "model_kv_cache_") and self.model_kv_cache_ is not None
         has_training_data = (
-            hasattr(self, "ensemble_generator_") and getattr(self.ensemble_generator_, "X_", None) is not None
+            hasattr(self, "ensemble_generators_")
+            and any(getattr(generator, "X_", None) is not None for generator in self.ensemble_generators_)
         )
         if not has_kv_cache and not has_training_data:
             raise RuntimeError(
@@ -749,35 +914,35 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
 
         X = self.X_encoder_.transform(X)
 
+        if feature_mask is not None and self.feature_reducer_ is not None:
+            raise ValueError("All-NaN feature masking is not supported with PCA or UMAP reduction.")
+        if self.feature_reducer_ is not None:
+            X = self.feature_reducer_.transform(X)
+
         # Skip KV cache when features are masked
         has_kv_cache = hasattr(self, "model_kv_cache_") and self.model_kv_cache_ is not None
         use_cache = has_kv_cache and feature_mask is None
 
-        if use_cache:
-            # Cache exists: forward only test data and use the pre-computed cache for training data
-            test_data = self.ensemble_generator_.transform(X, mode="test")
-            outputs = []
-            for norm_method, (Xs_test,) in test_data.items():
-                kv_cache = self.model_kv_cache_[norm_method]
-                outputs.append(self._batch_forward_with_cache(Xs_test, kv_cache))
-            outputs = np.concatenate(outputs, axis=0)
-        else:
-            # No cache or masked features: forward both training and test data
-            data = self.ensemble_generator_.transform(X, mode="both", feature_mask=feature_mask)
-            outputs = []
-            for norm_method, (Xs, ys) in data.items():
-                if feature_mask is None:
-                    feature_shuffles = self.ensemble_generator_.feature_shuffles_[norm_method]
-                else:
-                    feature_shuffles = self.ensemble_generator_.masked_feature_shuffles_[norm_method]
-
-                outputs.append(self._batch_forward(Xs, ys, feature_shuffles))
-            outputs = np.concatenate(outputs, axis=0)
-
-        # Extract class shuffle patterns from ensemble generator
+        outputs = []
         class_shuffles = []
-        for shuffles in self.ensemble_generator_.class_shuffles_.values():
-            class_shuffles.extend(shuffles)
+        for subset_idx, (subset, generator) in enumerate(zip(self.feature_subsets_, self.ensemble_generators_)):
+            subset_mask = None if feature_mask is None else feature_mask[subset]
+            X_subset = X[:, subset]
+            if use_cache:
+                test_data = generator.transform(X_subset, mode="test")
+                for norm_method, (Xs_test,) in test_data.items():
+                    outputs.append(self._batch_forward_with_cache(Xs_test, self.model_kv_cache_[subset_idx][norm_method]))
+            else:
+                data = generator.transform(X_subset, mode="both", feature_mask=subset_mask)
+                for norm_method, (Xs, ys) in data.items():
+                    if subset_mask is None:
+                        feature_shuffles = generator.feature_shuffles_[norm_method]
+                    else:
+                        feature_shuffles = generator.masked_feature_shuffles_[norm_method]
+                    outputs.append(self._batch_forward(Xs, ys, feature_shuffles, graph_set=graph_set))
+            for shuffles in generator.class_shuffles_.values():
+                class_shuffles.extend(shuffles)
+        outputs = np.concatenate(outputs, axis=0)
 
         # Determine actual number of ensemble members
         # May be fewer than requested if dataset has quite limited features and classes
@@ -802,7 +967,9 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
         # Normalize probabilities
         return avg / avg.sum(axis=1, keepdims=True)
 
-    def predict(self, X: np.ndarray) -> np.ndarray:
+    def predict(
+        self, X: np.ndarray, graph_set: SparseGraphSet | CompactGraphSet | None = None
+    ) -> np.ndarray:
         """Predict class labels for test samples.
 
         Uses predict_proba to get class probabilities and returns the class with
@@ -821,7 +988,7 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
         array-like of shape (n_samples,)
             Predicted class labels for each test sample.
         """
-        proba = self.predict_proba(X)
+        proba = self.predict_proba(X, graph_set=graph_set)
         y = np.argmax(proba, axis=1)
 
         return self.y_encoder_.inverse_transform(y)

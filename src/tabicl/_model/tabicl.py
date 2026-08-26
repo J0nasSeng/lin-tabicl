@@ -7,6 +7,19 @@ from torch import nn, Tensor
 from .embedding import ColEmbedding
 from .interaction import RowInteraction
 from .learning import ICLearning
+
+
+GRAPH_2D_BACKENDS = ("graph", "graph-pyg", "graph-2d", "graph-2d-pyg")
+GRAPH_1D_BACKENDS = ("graph-1d", "graph-1d-pyg")
+GRAPH_BACKENDS = GRAPH_2D_BACKENDS + GRAPH_1D_BACKENDS
+from .graph import (
+    CompactGraphSet,
+    SparseGraphBatch,
+    SparseGraphSet,
+    build_class_conditioned_graphs,
+    induce_graph_set,
+    stack_graph_sets,
+)
 from .quantile_dist import QuantileToDistribution
 from .kv_cache import TabICLCache
 from .inference_config import InferenceConfig
@@ -153,6 +166,7 @@ class TabICL(nn.Module):
     def __init__(
         self,
         max_classes: int = 10,
+        max_features: int = 100,
         num_quantiles: int = 999,
         embed_dim: int = 128,
         col_num_blocks: int = 3,
@@ -180,17 +194,26 @@ class TabICL(nn.Module):
         row_rope_interleaved: bool = True,
         icl_num_blocks: int = 12,
         icl_nhead: int = 8,
-        icl_backend: Literal["encoder", "graph"] = "graph",
-        icl_decoder_type: Literal["mlp", "soft_kmeans"] = "mlp",
+        icl_backend: Literal[
+            "encoder", "graph", "graph-pyg", "graph-2d", "graph-2d-pyg", "graph-1d", "graph-1d-pyg"
+        ] = "graph",
+        icl_decoder_type: Literal["mlp", "soft_kmeans", "rbf", "euclidean"] = "mlp",
         icl_soft_kmeans_temperature: float = 0.1,
+        decoder_chunk_size: int = 5000,
         graph_min_train_neighbors: int = 8,
         graph_max_train_neighbors: int = 15,
-        graph_same_label_ratio: float = 0.9,
-        graph_cross_label_ratio: float = 0.1,
-        graph_test_k_per_class: int = 8,
+        graph_cross_label_fraction: float = 0.1,
+        graph_train_neighbors_per_test: int = 8,
         graph_seed: Optional[int] = None,
         graph_share_across_batch: bool = False,
-        graph_share_require_identical_labels: bool = True,
+        graph_num_graphs: int = 1,
+        graph_v1_prob: float = 1.0,
+        graph_v2_prob: float = 0.0,
+        graph_prob: float = 0.0,
+        tab_graphs: str | None = None,
+        mode_prob: float | None = None,
+        learnable_residual: bool = False,
+        graph_max_chunk_size: int | None = None,
         icl_ssmax: Union[
             bool,
             Literal[
@@ -209,6 +232,7 @@ class TabICL(nn.Module):
         bias_free_ln: bool = False,
         zero_init: bool = True,
         recompute: bool = False,
+        skip_gat: bool = False,
     ):
         super().__init__()
         icl_dim = embed_dim * row_num_cls  # CLS tokens are concatenated for ICL
@@ -223,6 +247,7 @@ class TabICL(nn.Module):
             out_dim = max_classes
 
         self.max_classes = max_classes
+        self.max_features = max_features
         self.num_quantiles = num_quantiles
         self.embed_dim = embed_dim
         self.col_num_blocks = col_num_blocks
@@ -243,14 +268,23 @@ class TabICL(nn.Module):
         self.icl_backend = icl_backend
         self.icl_decoder_type = icl_decoder_type
         self.icl_soft_kmeans_temperature = icl_soft_kmeans_temperature
+        self.decoder_chunk_size = decoder_chunk_size
         self.graph_min_train_neighbors = graph_min_train_neighbors
         self.graph_max_train_neighbors = graph_max_train_neighbors
-        self.graph_same_label_ratio = graph_same_label_ratio
-        self.graph_cross_label_ratio = graph_cross_label_ratio
-        self.graph_test_k_per_class = graph_test_k_per_class
+        self.graph_cross_label_fraction = graph_cross_label_fraction
+        self.graph_train_neighbors_per_test = graph_train_neighbors_per_test
         self.graph_seed = graph_seed
+        self.graph_num_graphs = graph_num_graphs
         self.graph_share_across_batch = graph_share_across_batch
-        self.graph_share_require_identical_labels = graph_share_require_identical_labels
+        if tab_graphs is not None:
+            graph_v1_prob, graph_v2_prob, graph_prob = (
+                (1.0, 0.0, 0.0) if tab_graphs == "v1" else
+                (0.0, float(mode_prob if mode_prob is not None else 1.0),
+                 float(1.0 - (mode_prob if mode_prob is not None else 1.0)))
+            )
+        self.graph_v1_prob = float(graph_v1_prob)
+        self.graph_v2_prob = float(graph_v2_prob)
+        self.graph_prob = float(graph_prob)
         self.icl_ssmax = icl_ssmax
         self.ff_factor = ff_factor
         self.dropout = dropout
@@ -274,7 +308,9 @@ class TabICL(nn.Module):
             feature_group_size=col_feature_group_size,
             target_aware=col_target_aware,
             max_classes=max_classes,
+            max_features=max_features,
             reserve_cls_tokens=row_num_cls,
+            enable_column_identity_rotation=icl_backend in GRAPH_2D_BACKENDS,
             ssmax=col_ssmax,
             zero_init=zero_init,
             recompute=recompute,
@@ -313,14 +349,21 @@ class TabICL(nn.Module):
             icl_backend=icl_backend,
             decoder_type=icl_decoder_type,
             soft_kmeans_temperature=icl_soft_kmeans_temperature,
+            decoder_chunk_size=decoder_chunk_size,
             graph_min_train_neighbors=graph_min_train_neighbors,
             graph_max_train_neighbors=graph_max_train_neighbors,
-            graph_same_label_ratio=graph_same_label_ratio,
-            graph_cross_label_ratio=graph_cross_label_ratio,
-            graph_test_k_per_class=graph_test_k_per_class,
+            graph_cross_label_fraction=graph_cross_label_fraction,
+            graph_train_neighbors_per_test=graph_train_neighbors_per_test,
             graph_seed=graph_seed,
             graph_share_across_batch=graph_share_across_batch,
-            graph_share_require_identical_labels=graph_share_require_identical_labels,
+            graph_num_cls=row_num_cls,
+            graph_num_graphs=graph_num_graphs,
+            graph_v1_prob=graph_v1_prob,
+            graph_v2_prob=graph_v2_prob,
+            graph_prob=graph_prob,
+            learnable_residual=learnable_residual,
+            graph_max_chunk_size=graph_max_chunk_size,
+            skip_gat=skip_gat,
         )
 
         # KV cache for efficient inference
@@ -342,6 +385,7 @@ class TabICL(nn.Module):
         d: Optional[Tensor] = None,
         embed_with_test: bool = False,
         return_pre_decoder_repr: bool = False,
+        graph_set: Optional[SparseGraphSet] = None,
     ) -> Tensor | tuple[Tensor, Tensor]:
         """Column-wise embedding -> row-wise interaction -> dataset-wise in-context learning for training.
 
@@ -371,7 +415,8 @@ class TabICL(nn.Module):
             Predictions of shape (B, test_size, out_dim):
 
             - For regression (max_classes=0): out_dim = num_quantiles
-            - For classification (max_classes>0): out_dim = max_classes
+            - For MLP classification: out_dim = max_classes
+            - For kernel classification: out_dim = the active micro-batch class count K
         """
 
         B, T, H = X.shape
@@ -387,22 +432,35 @@ class TabICL(nn.Module):
         if self.col_embedder.feature_group:
             d = None
 
-        # Column-wise embedding -> Row-wise interaction
-        representations = self.row_interactor(
-            self.col_embedder(
-                X,
-                y_train=y_train,
-                d=d,
-                embed_with_test=embed_with_test,
-            ),
+        col_embeddings = self.col_embedder(
+            X,
+            y_train=y_train,
             d=d,
+            embed_with_test=embed_with_test,
         )
+
+        # Column-wise embedding -> Row-wise interaction (encoder backend)
+        if self.icl_backend not in GRAPH_2D_BACKENDS:
+            representations = self.row_interactor(col_embeddings, d=d)
+            icl_input = representations
+        else:
+            pre_col_embeddings = self.col_embedder.project_input(X, d=d)
+            encode_labels = len(torch.unique(y_train[0])) <= self.max_classes
+            icl_input = self.icl_predictor.prepare_graph_input(
+                col_embeddings=col_embeddings,
+                y_train=y_train,
+                pre_col_embeddings=pre_col_embeddings,
+                encode_labels=encode_labels,
+            )
 
         # Dataset-wise in-context learning
         return self.icl_predictor(
-            representations,
+            icl_input,
             y_train=y_train,
             return_pre_decoder_repr=return_pre_decoder_repr,
+            pre_col_embeddings=pre_col_embeddings if self.icl_backend in GRAPH_2D_BACKENDS else None,
+            base_col_embeddings=col_embeddings if self.icl_backend in GRAPH_2D_BACKENDS else None,
+            graph_set=graph_set,
         )
 
     def _inference_forward(
@@ -414,6 +472,7 @@ class TabICL(nn.Module):
         return_logits: bool = True,
         softmax_temperature: float = 0.9,
         inference_config: Optional[InferenceConfig] = None,
+        graph_set: Optional[SparseGraphSet] = None,
     ) -> Tensor:
         """Column-wise embedding -> row-wise interaction -> dataset-wise in-context learning.
 
@@ -465,28 +524,180 @@ class TabICL(nn.Module):
         if inference_config is None:
             inference_config = InferenceConfig()
 
-        # Column-wise embedding -> Row-wise interaction
-        representations = self.row_interactor(
-            self.col_embedder(
-                X,
+        if self.icl_backend in GRAPH_2D_BACKENDS and len(torch.unique(y_train[0])) > self.max_classes:
+            probabilities = self._graph_hierarchical_inference(
+                X=X,
                 y_train=y_train,
-                embed_with_test=embed_with_test,
                 feature_shuffles=feature_shuffles,
-                mgr_config=inference_config.COL_CONFIG,
-            ),
-            mgr_config=inference_config.ROW_CONFIG,
+                inference_config=inference_config,
+                graph_set=graph_set,
+                softmax_temperature=softmax_temperature,
+            )
+            if return_logits:
+                return softmax_temperature * torch.log(probabilities.clamp_min(1e-6))
+            return probabilities
+
+        col_embeddings = self.col_embedder(
+            X,
+            y_train=y_train,
+            embed_with_test=embed_with_test,
+            feature_shuffles=feature_shuffles,
+            mgr_config=inference_config.COL_CONFIG,
         )
+
+        if self.icl_backend not in GRAPH_2D_BACKENDS:
+            icl_input = self.row_interactor(col_embeddings, mgr_config=inference_config.ROW_CONFIG)
+        else:
+            pre_col_embeddings = self.col_embedder.project_input(X)
+            encode_labels = len(torch.unique(y_train[0])) <= self.max_classes
+            icl_input = self.icl_predictor.prepare_graph_input(
+                col_embeddings=col_embeddings,
+                y_train=y_train,
+                pre_col_embeddings=pre_col_embeddings,
+                encode_labels=encode_labels,
+            )
 
         # Dataset-wise in-context learning
         out = self.icl_predictor(
-            representations,
+            icl_input,
             y_train=y_train,
             return_logits=return_logits,
             softmax_temperature=softmax_temperature,
             mgr_config=inference_config.ICL_CONFIG,
+            pre_col_embeddings=pre_col_embeddings if self.icl_backend in GRAPH_2D_BACKENDS else None,
+            base_col_embeddings=col_embeddings if self.icl_backend in GRAPH_2D_BACKENDS else None,
+            graph_set=graph_set,
         )
 
         return out
+
+    @torch.inference_mode()
+    def _graph_hierarchical_inference(
+        self,
+        X: Tensor,
+        y_train: Tensor,
+        feature_shuffles: Optional[List[List[int]]],
+        inference_config: InferenceConfig,
+        graph_set: Optional[SparseGraphSet | CompactGraphSet],
+        softmax_temperature: float,
+    ) -> Tensor:
+        """Run graph hierarchy inference with fresh local target encodings."""
+        predictor = self.icl_predictor
+        train_size = y_train.shape[1]
+        # Keep the hierarchy accumulator on CPU. A recursive GPU accumulator
+        # keeps every completed child result live while the remaining subtree
+        # is evaluated, which makes peak memory grow with the tree size.
+        outputs = []
+
+        for batch_idx, global_y in enumerate(y_train.long()):
+            # Build only the runtime tree metadata. Representations are
+            # intentionally not reused because every node needs local labels.
+            predictor._fit_hierarchical(
+                torch.zeros(train_size, self.embed_dim * self.row_num_cls, device=X.device), global_y
+            )
+            root = predictor.root
+            num_classes = int(root.classes_.numel())
+            base_graph = None
+            if graph_set is not None:
+                base_graph = graph_set.slice(batch_idx) if isinstance(graph_set, CompactGraphSet) else SparseGraphSet(
+                    graphs=[
+                        SparseGraphBatch(edge_index=[graph.edge_index[batch_idx]], num_nodes=graph.num_nodes)
+                        for graph in graph_set.graphs
+                    ]
+                )
+            test_X = X[batch_idx, train_size:]
+
+            def process_node(node):
+                node_classes = node.classes_.to(X.device, dtype=global_y.dtype)
+                node_mask = torch.isin(global_y, node_classes)
+                node_y = (
+                    predictor._label_encoding(node.y.to(X.device).long())
+                    if node.is_leaf
+                    else node.group_indices.to(X.device).long()
+                )
+                if node_y.numel() == 0 or int(node_y.max()) >= self.max_classes:
+                    raise ValueError("Hierarchy node labels must be within max_classes")
+
+                node_X = torch.cat([X[batch_idx, :train_size][node_mask], test_X], dim=0).unsqueeze(0)
+                node_features = self.col_embedder(
+                    node_X,
+                    y_train=node_y.unsqueeze(0),
+                    embed_with_test=False,
+                    feature_shuffles=(
+                        [feature_shuffles[batch_idx]] if feature_shuffles is not None else None
+                    ),
+                    mgr_config=inference_config.COL_CONFIG,
+                )
+                # Column inference may offload its result to CPU. The graph
+                # pipeline and projected input must be assembled on the model
+                # device before adding them together.
+                node_features = node_features.to(device=X.device)
+                if self.icl_backend in GRAPH_2D_BACKENDS:
+                    node_pre = self.col_embedder.project_input(node_X)
+                    node_input = predictor.prepare_graph_input(
+                        node_features,
+                        node_y.unsqueeze(0),
+                        pre_col_embeddings=node_pre,
+                    )
+                else:
+                    node_pre = None
+                    node_input = self.row_interactor(
+                        node_features, mgr_config=inference_config.ROW_CONFIG
+                    )
+
+                if base_graph is None:
+                    node_graph = build_class_conditioned_graphs(
+                        y_train=node_y.unsqueeze(0),
+                        total_nodes=node_X.shape[1],
+                        num_graphs=predictor.graph_num_graphs,
+                        min_train_neighbors=predictor.graph_min_train_neighbors,
+                        max_train_neighbors=predictor.graph_max_train_neighbors,
+                        cross_label_fraction=predictor.graph_cross_label_fraction,
+                        train_neighbors_per_test=predictor.graph_train_neighbors_per_test,
+                        seed=predictor.graph_seed,
+                        share_graph_across_batch=predictor.graph_share_across_batch,
+                    )
+                else:
+                    node_graph = induce_graph_set(base_graph, node_mask, train_size)
+                compact_node_graph = stack_graph_sets([node_graph])
+                if self.icl_backend in GRAPH_2D_BACKENDS:
+                    node_src = predictor._run_graph_column_pipeline(
+                        node_input, y_train=node_y.unsqueeze(0), graph_set=compact_node_graph
+                    )
+                else:
+                    node_input = node_input.clone()
+                    node_input[:, : node_y.numel()] += predictor.y_encoder(node_y.unsqueeze(0).float())
+                    node_src = predictor.gat_icl(
+                        node_input, graph_set=compact_node_graph
+                    )
+                if predictor.norm_first:
+                    node_src = predictor.ln(node_src)
+                local_probs = predictor._decode_node_probabilities(
+                    node_src, node_y.unsqueeze(0), softmax_temperature=softmax_temperature
+                ).squeeze(0).detach().to(device="cpu", dtype=torch.float32)
+
+                # Release node-local GPU temporaries before descending into
+                # the next node. Probabilities remain on CPU for composition.
+                del node_X, node_features, node_pre, node_input, node_src, node_graph, compact_node_graph
+
+                if node.is_leaf:
+                    mapped = torch.zeros(
+                        (test_X.shape[0], num_classes), device="cpu", dtype=local_probs.dtype
+                    )
+                    for local_idx, global_idx in enumerate(node.classes_.tolist()):
+                        mapped[:, global_idx] = local_probs[:, local_idx]
+                    return mapped
+
+                mapped = torch.zeros(
+                    (test_X.shape[0], num_classes), device="cpu", dtype=local_probs.dtype
+                )
+                for group_idx, child in enumerate(node.child_nodes):
+                    mapped += process_node(child) * local_probs[:, group_idx : group_idx + 1]
+                return mapped
+
+            outputs.append(process_node(root))
+
+        return torch.stack(outputs, dim=0)
 
     def forward(
         self,
@@ -499,6 +710,7 @@ class TabICL(nn.Module):
         softmax_temperature: float = 0.9,
         inference_config: Optional[InferenceConfig] = None,
         return_pre_decoder_repr: bool = False,
+        graph_set: Optional[SparseGraphSet] = None,
     ) -> Tensor | tuple[Tensor, Tensor]:
         """Column-wise embedding -> row-wise interaction -> dataset-wise in-context learning.
 
@@ -543,7 +755,8 @@ class TabICL(nn.Module):
                 Predictions of shape (B, test_size, out_dim):
 
                 - For regression (max_classes=0): out_dim = num_quantiles
-                - For classification (max_classes>0): out_dim = max_classes
+                - For MLP classification: out_dim = max_classes
+                - For kernel classification: out_dim = the active micro-batch class count K
 
             For inference mode:
                 For regression (max_classes=0):
@@ -561,6 +774,7 @@ class TabICL(nn.Module):
                 d=d,
                 embed_with_test=embed_with_test,
                 return_pre_decoder_repr=return_pre_decoder_repr,
+                graph_set=graph_set,
             )
         else:
             out = self._inference_forward(
@@ -571,6 +785,7 @@ class TabICL(nn.Module):
                 return_logits=return_logits,
                 softmax_temperature=softmax_temperature,
                 inference_config=inference_config,
+                graph_set=graph_set,
             )
 
         return out
@@ -795,18 +1010,26 @@ class TabICL(nn.Module):
             X = X_test
             y_train = None
 
-        # Column-wise embedding with cache support -> Row-wise interaction
-        representations = self.row_interactor(
-            self.col_embedder.forward_with_cache(
-                X,
-                col_cache=self._cache.col_cache,
-                y_train=y_train,
-                use_cache=use_cache,
-                store_cache=store_cache,
-                mgr_config=inference_config.COL_CONFIG,
-            ),
-            mgr_config=inference_config.ROW_CONFIG,
+        col_embeddings = self.col_embedder.forward_with_cache(
+            X,
+            col_cache=self._cache.col_cache,
+            y_train=y_train,
+            use_cache=use_cache,
+            store_cache=store_cache,
+            mgr_config=inference_config.COL_CONFIG,
         )
+
+        if self.icl_backend == "encoder":
+            representations = self.row_interactor(col_embeddings, mgr_config=inference_config.ROW_CONFIG)
+            use_col_embeddings = False
+            pre_col_embeddings = None
+        else:
+            representations = col_embeddings
+            use_col_embeddings = True
+            if use_cache:
+                pre_col_embeddings = self.col_embedder.project_input(X)
+            else:
+                pre_col_embeddings = self.col_embedder.project_input(X, d=None)
 
         # Dataset-wise in-context learning
         if cache_mode == "repr":
@@ -843,6 +1066,8 @@ class TabICL(nn.Module):
                 use_cache=use_cache,
                 store_cache=store_cache,
                 mgr_config=inference_config.ICL_CONFIG,
+                use_col_embeddings=use_col_embeddings,
+                pre_col_embeddings=pre_col_embeddings,
             )
 
             if X_test is None:
