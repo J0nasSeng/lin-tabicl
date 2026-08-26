@@ -8,6 +8,7 @@ from contextlib import nullcontext
 
 import math
 import numpy as np
+import psutil
 
 import torch
 from torch import nn
@@ -30,10 +31,12 @@ except ImportError:
     confusion_matrix = None
 
 from tabicl._model.tabicl import TabICL
+from tabicl._model.attention import set_flash_attn3_enabled
 from tabicl.prior._dataset import PriorDataset
-from tabicl.prior._genload import LoadPriorDataset
+from tabicl.prior._genload import LoadPriorDataset, seed_worker
+from tabicl.prior.graph_lib._config import PriorConfig
 from tabicl.train._optim import get_scheduler
-from tabicl.train._losses import entropy_regularizer, supervised_contrastive_loss
+from tabicl.train._muon import Muon
 from tabicl.train._train_config import build_parser
 from tabicl.train._umap_logging import build_test_umap_wandb_images
 from rtpt import RTPT
@@ -140,8 +143,7 @@ class Trainer:
         self.configure_optimizer()
         self.configure_amp()
         self.load_checkpoint()
-        self.rtpt = RTPT(name_initials="JS", experiment_name="TabICL_Stage1", max_iterations=self.config.max_steps)
-        self.rtpt.start()
+        self.seed()
 
     def configure_ddp(self):
         """Set up distributed training and system configuration.
@@ -239,33 +241,58 @@ class Trainer:
     def build_model(self):
         """Build and initialize the TabICL model."""
 
+        # Determine the task type. regression_method=None trains for classification;
+        # "quantile" trains for quantile regression (max_classes=0) with a pinball loss.
+        self.regression = self.config.regression_method is not None
+        if self.regression and self.config.regression_method != "quantile":
+            raise NotImplementedError(
+                f"regression_method='{self.config.regression_method}' is not supported. "
+                "Only None (classification) and 'quantile' (pinball regression) are available."
+            )
+        if self.regression and self.config.num_quantiles <= 0:
+            raise ValueError("For quantile regression, num_quantiles must be greater than 0.")
+
+        # Map the private-style --norm_type to the public model's bias_free_ln flag.
+        if self.config.norm_type == "default":
+            bias_free_ln = False
+        elif self.config.norm_type == "layernorm_nobias":
+            bias_free_ln = True
+        else:
+            raise NotImplementedError(
+                f"norm_type='{self.config.norm_type}' is not supported. "
+                "Use 'default' or 'layernorm_nobias'."
+            )
+
+        # FlashAttention-3 runs attention in fp16; the v2 recipe enables it only for stages 2 & 3.
+        set_flash_attn3_enabled(self.config.use_flash_attn3)
+
         self.model_config = {
-            "max_classes": self.config.max_classes,
+            "max_classes": 0 if self.regression else self.config.max_classes,
+            "num_quantiles": self.config.num_quantiles,
             "embed_dim": self.config.embed_dim,
             "col_num_blocks": self.config.col_num_blocks,
             "col_nhead": self.config.col_nhead,
             "col_num_inds": self.config.col_num_inds,
+            "col_affine": self.config.col_affine,
+            "col_feature_group": self.config.col_feature_group,
+            "col_feature_group_size": self.config.col_feature_group_size,
+            "col_target_aware": self.config.col_target_aware,
+            "col_ssmax": self.config.ssmax_type if self.config.col_ssmax else False,
             "row_num_blocks": self.config.row_num_blocks,
             "row_nhead": self.config.row_nhead,
             "row_num_cls": self.config.row_num_cls,
             "row_rope_base": self.config.row_rope_base,
+            "row_rope_interleaved": self.config.row_rope_interleaved,
             "icl_num_blocks": self.config.icl_num_blocks,
             "icl_nhead": self.config.icl_nhead,
-            "icl_backend": self.config.icl_backend,
-            "icl_decoder_type": self.config.icl_decoder_type,
-            "icl_soft_kmeans_temperature": self.config.icl_soft_kmeans_temperature,
-            "graph_min_train_neighbors": self.config.graph_min_train_neighbors,
-            "graph_max_train_neighbors": self.config.graph_max_train_neighbors,
-            "graph_same_label_ratio": self.config.graph_same_label_ratio,
-            "graph_cross_label_ratio": self.config.graph_cross_label_ratio,
-            "graph_test_k_per_class": self.config.graph_test_k_per_class,
-            "graph_seed": self.config.graph_seed,
-            "graph_share_across_batch": self.config.graph_share_across_batch,
-            "graph_share_require_identical_labels": self.config.graph_share_require_identical_labels,
+            "icl_ssmax": self.config.ssmax_type if self.config.icl_ssmax else False,
             "ff_factor": self.config.ff_factor,
             "dropout": self.config.dropout,
             "activation": self.config.activation,
             "norm_first": self.config.norm_first,
+            "bias_free_ln": bias_free_ln,
+            "zero_init": self.config.zero_init,
+            "recompute": self.config.recompute,
         }
 
         model = TabICL(**self.model_config)
@@ -311,6 +338,7 @@ class Trainer:
         if self.config.prior_dir is None:
             # Generate prior data on the fly
             dataset = PriorDataset(
+                regression=self.regression,
                 batch_size=self.config.batch_size,
                 batch_size_per_gp=self.config.batch_size_per_gp,
                 min_features=self.config.min_features,
@@ -319,13 +347,15 @@ class Trainer:
                 min_seq_len=self.config.min_seq_len,
                 max_seq_len=self.config.max_seq_len,
                 log_seq_len=self.config.log_seq_len,
+                log_n_features=self.config.log_n_features,
                 seq_len_per_gp=self.config.seq_len_per_gp,
                 min_train_size=self.config.min_train_size,
                 max_train_size=self.config.max_train_size,
                 replay_small=self.config.replay_small,
                 prior_type=self.config.prior_type,
+                config=PriorConfig.from_args(self.config),  # graph_scm prior options
                 device=self.config.prior_device,
-                n_jobs=1,  # Set to 1 to avoid nested parallelism during DDP
+                n_jobs=1,  # Set to 1 to avoid nested parallelism; the DataLoader parallelizes across batches
             )
         else:
             # Load pre-generated prior data from disk
@@ -342,23 +372,56 @@ class Trainer:
         if self.master_process:
             print(dataset)
 
+        # For on-the-fly generation, parallelize dataset creation across dataloader workers.
+        # For pre-generated data loaded from disk, a single worker is enough.
+        if self.config.prior_dir is None:
+            # psutil.cpu_count(logical=False) can return None on some platforms; fall back safely.
+            num_workers = self.config.n_jobs
+            if num_workers <= 0:
+                num_workers = psutil.cpu_count(logical=False) or os.cpu_count() or 1
+            prefetch_factor = 2
+        else:
+            num_workers = 1
+            prefetch_factor = 4
+
         # Create dataloader for efficient loading and prefetching
         self.dataloader = DataLoader(
             dataset,
             batch_size=None,  # No additional batching since PriorDataset handles batching internally
             shuffle=False,
-            num_workers=1,
-            prefetch_factor=4,
+            num_workers=num_workers,
+            prefetch_factor=prefetch_factor,
             pin_memory=True if self.config.prior_device == "cpu" else False,
             pin_memory_device=self.config.device if self.config.prior_device == "cpu" else "",
+            worker_init_fn=seed_worker,
+            persistent_workers=True,
         )
 
     def configure_optimizer(self):
         """Configure optimizer and scheduler."""
 
-        self.optimizer = optim.AdamW(
-            params=self.raw_model.parameters(), lr=self.config.lr, weight_decay=self.config.weight_decay
-        )
+        if self.config.muon:
+            if self.master_process:
+                print("Using Muon optimizer.")
+            self.optimizer = Muon(
+                param_groups=[dict(params=list(self.raw_model.parameters()), use_muon=True)],
+                lr=self.config.lr,
+                weight_decay=self.config.weight_decay,
+                matched_adamw_rms=0.2,
+                momentum=self.config.beta1,
+                nesterov=True,
+                ns_steps=5,
+                adamw_betas=(self.config.beta1, self.config.beta2),
+                adamw_eps=1e-8,
+                use_cautious_wd=self.config.use_cautious_wd,
+            )
+        else:
+            self.optimizer = optim.AdamW(
+                params=self.raw_model.parameters(),
+                lr=self.config.lr,
+                betas=(self.config.beta1, self.config.beta2),
+                weight_decay=self.config.weight_decay,
+            )
         self.scheduler = get_scheduler(config=self.config, optimizer=self.optimizer)
 
     def configure_amp(self):
@@ -484,6 +547,16 @@ class Trainer:
                     os.remove(ckpt_path)
                 except Exception as e:
                     print(f"Error removing checkpoint {ckpt_path}: {e}")
+
+    def seed(self):
+        """Reset global seeds with the current step. This avoids regenerating
+        identical datasets when resuming pretraining with on-the-fly data
+        generation.
+        """
+        # Set random seeds
+        seed_offset = self.ddp_rank if self.ddp else 0
+        np.random.seed(self.config.np_seed + seed_offset + self.curr_step)
+        torch.manual_seed(self.config.torch_seed + seed_offset + self.curr_step)
 
     @ddp_cleanup
     def train(self):
@@ -679,58 +752,26 @@ class Trainer:
         if self.ddp:
             self.model.require_backward_grad_sync = micro_batch_idx == num_micro_batches - 1
 
+        # By default (v2), ignore the per-dataset feature count so the model treats all (padded)
+        # columns uniformly. This is required for the model's feature grouping and supports
+        # variable-feature priors (e.g. graph_scm).
+        model_d = None if self.config.ignore_d else micro_d
+
         with self.amp_ctx:
-            supcon_weight = float(getattr(self.config, "supcon_weight", 0.0))
-            entropy_weight = float(getattr(self.config, "entropy_weight", 0.0))
-            capture_pre_decoder_repr = (dataset_results_to_log > 0) or (supcon_weight > 0)
-            model_out = self.model(
-                micro_X,
-                y_train,
-                micro_d,
-                return_pre_decoder_repr=capture_pre_decoder_repr,
-            )
-            if capture_pre_decoder_repr:
-                pred_3d, pre_decoder_repr_test = model_out
+            if self.regression:
+                # (B, test_size, num_quantiles) predicted quantiles at levels
+                # linspace(0, 1, num_quantiles + 2)[1:-1] (matches inference / QuantileDistribution)
+                pred = self.model(micro_X, y_train, model_d)
+                alphas = torch.linspace(
+                    0.0, 1.0, self.config.num_quantiles + 2, device=pred.device, dtype=pred.dtype
+                )[1:-1].view(1, 1, -1)
+                errors = y_test.unsqueeze(-1) - pred
+                loss = torch.maximum(alphas * errors, (alphas - 1) * errors).mean()
             else:
-                pred_3d = model_out
-
-            pred = pred_3d.flatten(end_dim=-2)
-            true = y_test.long().flatten()
-            # Compute class-reweighted CE per dataset to handle dataset-level imbalance.
-            # Each dataset gets its own class weights based on its y_test distribution.
-            num_classes = pred_3d.shape[-1]
-            ce_losses = []
-            for ds_idx in range(pred_3d.shape[0]):
-                ds_logits = pred_3d[ds_idx]
-                ds_targets = y_test[ds_idx].long()
-
-                class_counts = torch.bincount(ds_targets, minlength=num_classes).to(ds_logits.dtype)
-                present_mask = class_counts > 0
-
-                class_weights = torch.zeros(num_classes, device=ds_logits.device, dtype=ds_logits.dtype)
-                if present_mask.any():
-                    present_classes = present_mask.sum().to(ds_logits.dtype)
-                    inv_freq = 1 / torch.sqrt(class_counts[present_mask])
-                    inv_freq = inv_freq / inv_freq.mean()
-                    class_weights[present_mask] = inv_freq.to(device=class_weights.device, dtype=class_weights.dtype)
-                    class_weights = class_weights / class_weights.sum()  # Normalize to num present classes
-
-                ce_losses.append(F.cross_entropy(ds_logits, ds_targets, weight=class_weights, reduction="mean"))
-
-            ce_loss = torch.stack(ce_losses).mean()
-
-            supcon_raw_loss = pred.new_zeros(())
-            if supcon_weight > 0:
-                repr_flat = pre_decoder_repr_test.reshape(-1, pre_decoder_repr_test.shape[-1])
-                labels_flat = y_test.long().reshape(-1)
-                supcon_raw_loss = supervised_contrastive_loss(repr_flat, labels_flat)
-
-            entropy_raw_loss = pred.new_zeros(())
-            if entropy_weight > 0:
-                entropy_raw_loss = entropy_regularizer(pred_3d)
-
-            # Keep CE as primary objective; maximize predictive entropy via a negative entropy term.
-            loss = ce_loss + supcon_weight * supcon_raw_loss - entropy_weight * entropy_raw_loss
+                pred = self.model(micro_X, y_train, model_d)  # (B, test_size, max_classes)
+                pred = pred.flatten(end_dim=-2)
+                true = y_test.long().flatten()
+                loss = F.cross_entropy(pred, true)
 
         # Scale loss for gradient accumulation and backpropagate
         scaled_loss = loss / num_micro_batches
@@ -738,67 +779,12 @@ class Trainer:
 
         with torch.no_grad():
             micro_results = {}
-            micro_results["ce"] = (ce_loss / num_micro_batches).item()
-            micro_results["loss"] = loss.item() / num_micro_batches
-            accuracy = (pred.argmax(dim=1) == true).sum() / len(true)
-            micro_results["accuracy"] = accuracy.item() / num_micro_batches
-            if supcon_weight > 0:
-                micro_results["supcon"] = (supcon_weight * supcon_raw_loss / num_micro_batches).item()
-                micro_results["supcon_raw"] = (supcon_raw_loss / num_micro_batches).item()
-            if entropy_weight > 0:
-                micro_results["entropy"] = (-entropy_weight * entropy_raw_loss / num_micro_batches).item()
-                micro_results["entropy_raw"] = (entropy_raw_loss / num_micro_batches).item()
-
-            if should_log_conf_mat and confusion_matrix is not None and true.numel() > 0:
-                y_true_all = true.detach().cpu().tolist()
-                y_pred_all = pred.argmax(dim=1).detach().cpu().tolist()
-                micro_results["confusion_matrix_sample_y_true"] = y_true_all
-                micro_results["confusion_matrix_sample_y_pred"] = y_pred_all
-
-                if (
-                    dataset_results_to_log > 0
-                    and self.master_process
-                    and self.wandb_run is not None
-                    and wandb is not None
-                ):
-                    class_names = [str(i) for i in range(self.config.max_classes)]
-                    confusion_images = {}
-                    n_ds = min(dataset_results_to_log, y_test.shape[0], pred_3d.shape[0])
-                    y_pred_per_ds = pred_3d.argmax(dim=-1)
-                    labels = np.arange(self.config.max_classes)
-
-                    for local_idx in range(n_ds):
-                        y_true_ds = y_test[local_idx].long().detach().cpu().numpy()
-                        y_pred_ds = y_pred_per_ds[local_idx].long().detach().cpu().numpy()
-                        cm_ds = confusion_matrix(y_true_ds, y_pred_ds, labels=labels)
-                        cm_image = build_confusion_matrix_plot_image(
-                            cm=cm_ds.tolist(),
-                            class_names=class_names,
-                            wandb_module=wandb,
-                        )
-                        if cm_image is not None:
-                            key = f"confusion_matrix_ds_{dataset_results_start_index + local_idx}"
-                            confusion_images[key] = cm_image
-
-                    if confusion_images:
-                        micro_results["confusion_images"] = confusion_images
-
-            if (
-                should_log_conf_mat
-                and dataset_results_to_log > 0
-                and self.master_process
-                and self.wandb_run is not None
-            ):
-                umap_images = build_test_umap_wandb_images(
-                    repr_test=pre_decoder_repr_test,
-                    y_test=y_test,
-                    wandb_module=wandb,
-                    max_datasets=dataset_results_to_log,
-                    start_index=dataset_results_start_index,
-                    seed=self.config.np_seed + self.curr_step,
-                )
-                if umap_images:
-                    micro_results["umap_images"] = umap_images
+            if self.regression:
+                micro_results["pinball"] = scaled_loss.item()
+            else:
+                micro_results["ce"] = scaled_loss.item()
+                accuracy = (pred.argmax(dim=1) == true).sum() / len(true)
+                micro_results["accuracy"] = accuracy.item() / num_micro_batches
 
         return micro_results
 
@@ -837,7 +823,7 @@ class Trainer:
         micro_batches = [torch.split(t, self.config.micro_batch_size, dim=0) for t in batch]
         micro_batches = list(zip(*micro_batches))
 
-        results = {"ce": 0.0, "accuracy": 0.0}
+        results = {"pinball": 0.0} if self.regression else {"ce": 0.0, "accuracy": 0.0}
         failed_batches = 0
         should_log_conf_mat = self._should_log_conf_mat_now()
         confusion_y_true_payload: list[int] = []

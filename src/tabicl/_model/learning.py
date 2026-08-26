@@ -86,6 +86,7 @@ class ICLearning(nn.Module):
         norm_first: bool = True,
         bias_free_ln: bool = False,
         ssmax: Union[bool, str] = False,
+        zero_init: bool = True,
         recompute: bool = False,
         icl_backend: Literal["encoder", "graph"] = "graph",
         graph_min_train_neighbors: int = 8,
@@ -115,43 +116,19 @@ class ICLearning(nn.Module):
         self.graph_share_across_batch = graph_share_across_batch
         self.graph_share_require_identical_labels = graph_share_require_identical_labels
 
-        if self.icl_backend not in ("encoder", "graph"):
-            raise ValueError(f"Unknown icl_backend={self.icl_backend}. Expected 'encoder' or 'graph'.")
-
-        if self.decoder_type not in ("mlp", "soft_kmeans"):
-            raise ValueError(f"Unknown decoder_type={self.decoder_type}. Expected 'mlp' or 'soft_kmeans'.")
-
-        if self.soft_kmeans_temperature <= 0:
-            raise ValueError("soft_kmeans_temperature must be > 0")
-
-        if self.icl_backend == "graph" and max_classes <= 0:
-            raise ValueError("Graph ICL backend is currently supported for classification only (max_classes > 0).")
-
-        if self.icl_backend == "encoder":
-            self.tf_icl = Encoder(
-                num_blocks=num_blocks,
-                d_model=d_model,
-                nhead=nhead,
-                dim_feedforward=dim_feedforward,
-                dropout=dropout,
-                activation=activation,
-                norm_first=norm_first,
-                bias_free_ln=bias_free_ln,
-                ssmax=ssmax,
-                recompute=recompute,
-            )
-        else:
-            self.gat_icl = GraphAttentionTransformer(
-                num_blocks=num_blocks,
-                d_model=d_model,
-                nhead=nhead,
-                dim_feedforward=dim_feedforward,
-                dropout=dropout,
-                activation=activation,
-                norm_first=norm_first,
-                bias_free_ln=bias_free_ln,
-                recompute=recompute,
-            )
+        self.tf_icl = Encoder(
+            num_blocks=num_blocks,
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation=activation,
+            norm_first=norm_first,
+            bias_free_ln=bias_free_ln,
+            ssmax=ssmax,
+            zero_init=zero_init,
+            recompute=recompute,
+        )
         if self.norm_first:
             self.ln = nn.LayerNorm(d_model, bias=not bias_free_ln)
 

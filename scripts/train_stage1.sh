@@ -126,6 +126,11 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/r
             --icl_backend ${ICL_BACKEND} \
             --ff_factor 2 \
             --norm_first True \
+<<<<<<< HEAD
             --checkpoint_dir /workspace/checkpoints/stage1/ \
+=======
+            --ignore_d False \
+            --checkpoint_dir /my/stage1/checkpoint/dir \
+>>>>>>> 8f1aa2098c894ab91dba15209cf2002ba4be6c6c
             --save_temp_every 50 \
             --save_perm_every 5000
