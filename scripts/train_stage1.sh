@@ -7,8 +7,8 @@ WAND_LOG=${WAND_LOG:-True}
 WAND_MODE=${WAND_MODE:-online}
 # GPU selection controls
 DEVICE=${DEVICE:-cuda}
-NUM_GPUS=${NUM_GPUS:-2}
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1,2}
+NUM_GPUS=${NUM_GPUS:-4}
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,5}
 # Confusion matrix logging interval
 LOG_CONF_MAT_EVERY=${LOG_CONF_MAT_EVERY:-200000} # effectively disables confusion matrix logging if set to a large number
 
@@ -28,9 +28,10 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --dtype bfloat16 \
             --np_seed 42 \
             --torch_seed 42 \
-            --max_steps 10000 \
-            --batch_size 60 \
-            --micro_batch_size 5 \
+            --max_steps 500000 \
+            --batch_size 64 \
+            --batch_size_per_gp 8 \
+            --micro_batch_size 8 \
             --log_conf_mat_every ${LOG_CONF_MAT_EVERY} \
             --lr 8e-4 \
             --weight_decay 1e-4 \
@@ -43,12 +44,11 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --prior_type nanotabicl \
             --prior_device cpu \
             --normalization std \
-            --batch_size_per_gp 5 \
             --min_features 2 \
             --max_features 256 \
             --max_classes 10 \
             --max_seq_len 2048 \
-            --min_train_size 0.1 \
+            --min_train_size 0.3 \
             --max_train_size 0.9 \
             --embed_dim 128 \
             --col_num_blocks 3 \
@@ -63,7 +63,7 @@ torchrun --standalone --nproc_per_node=${NUM_GPUS} /workspace/src/tabicl/train/_
             --icl_backend ${ICL_BACKEND} \
             --ff_factor 2 \
             --norm_first True \
-            --checkpoint_dir /workspace/checkpoints_encoder/stage1/ \
+            --checkpoint_dir /workspace/checkpoints_graph-1d-500k/stage1/ \
             --save_temp_every 1000 \
             --save_perm_every 5000 \
             --icl_soft_kmeans_temperature 0.5 \

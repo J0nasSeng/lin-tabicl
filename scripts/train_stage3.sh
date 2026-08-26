@@ -1,21 +1,21 @@
 # This script is used to train TabICL for the third stage of the curriculum learning
 
 # Choose ICL backbone: graph or encoder
-ICL_BACKEND=${ICL_BACKEND:-graph-1d}
+ICL_BACKEND=${ICL_BACKEND:-encoder}
 # Enable wandb logging by setting WAND_LOG=True (and optionally WAND_MODE=online)
 WAND_LOG=${WAND_LOG:-True}
 WAND_MODE=${WAND_MODE:-online}
 # GPU selection controls
 DEVICE=${DEVICE:-cuda}
-NUM_GPUS=${NUM_GPUS:-4}
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1,2,3,4}
+NUM_GPUS=${NUM_GPUS:-3}
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,7}
 # Confusion matrix logging interval
 LOG_CONF_MAT_EVERY=${LOG_CONF_MAT_EVERY:-100}
 
 # Stage 3 starts from the latest Stage 1 or 2 checkpoint and writes to a separate
 # directory. Override these variables to use a different run layout.
-STAGE2_CHECKPOINT_DIR=${STAGE2_CHECKPOINT_DIR:-/workspace/checkpoints_dyngraph_intraclass=0.25_no_supcon_4_graphs/stage1}
-STAGE3_CHECKPOINT_DIR=${STAGE3_CHECKPOINT_DIR:-/workspace/checkpoints_dyngraph_intraclass=0.25_no_supcon_4_graphs/stage3}
+STAGE2_CHECKPOINT_DIR=${STAGE2_CHECKPOINT_DIR:-/workspace/checkpoints_encoder/stage1}
+STAGE3_CHECKPOINT_DIR=${STAGE3_CHECKPOINT_DIR:-/workspace/checkpoints_encoder/stage3}
 STAGE2_CHECKPOINT=${STAGE2_CHECKPOINT:-$(find "${STAGE2_CHECKPOINT_DIR}" -maxdepth 1 -type f -name 'step-*.ckpt' -printf '%f\n' | sort -V | tail -n 1)}
 
 if [[ -z "${STAGE2_CHECKPOINT}" || ! -f "${STAGE2_CHECKPOINT_DIR}/${STAGE2_CHECKPOINT}" && ! -f "${STAGE2_CHECKPOINT}" ]]; then
