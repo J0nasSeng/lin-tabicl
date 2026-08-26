@@ -348,7 +348,11 @@ class TabICLRegressor(RegressorMixin, TabICLBaseEstimator):
 
         self.model_path_ = model_path_
 
-        config = checkpoint["config"]
+        config = checkpoint["config"].copy()
+        # Graph ICL currently supports classification only. Regression
+        # checkpoints must therefore be instantiated through the encoder path.
+        if config.get("max_classes", 0) == 0 and config.get("icl_backend") != "encoder":
+            config["icl_backend"] = "encoder"
         self.model_ = TabICL(**config)
         self.model_config_ = config
         self.model_.load_state_dict(checkpoint["state_dict"])

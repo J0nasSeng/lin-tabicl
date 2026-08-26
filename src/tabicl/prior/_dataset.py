@@ -15,124 +15,100 @@ an infinite stream of synthetic datasets with diverse characteristics.
 
 from __future__ import annotations
 
-import functools
 import os
-
 import sys
 import math
 import warnings
-from typing import Dict, Tuple, Union, Optional, Any, List, Callable
+from typing import Dict, Tuple, Union, Optional, Any
 
 import numpy as np
-import psutil
-import threadpoolctl
 from scipy.stats import loguniform
-import multiprocessing as mp
+import joblib
 
 import torch
 import torch.nn.functional as F
-from sklearn.ensemble import ExtraTreesRegressor
 from torch import Tensor
 from torch.nested import nested_tensor
 from torch.utils.data import IterableDataset
 
-from .graph_lib._config import PriorConfig
 from ._mlp_scm import MLPSCM
 from ._tree_scm import TreeSCM
-from ._graph_scm import GraphSCM
+from ._nanotabicl_prior import NanoTabICLPrior
 
 from ._hp_sampling import HpSamplerList
 from ._reg2cls import Reg2Cls
 from ._prior_config import DEFAULT_FIXED_HP, DEFAULT_SAMPLED_HP
+from tabicl._preprocessing.normalizer import normalize_batch
+from tabicl._model.graph import CompactGraphSet, GraphPrior, build_class_conditioned_graphs, stack_graph_sets
+
 
 warnings.filterwarnings(
     "ignore", message=".*The PyTorch API of nested tensors is in prototype stage.*", category=UserWarning
 )
 
 
-def run_parallel(func: Callable, args: List[Any], n_jobs: int = -1) -> List[Any]:
-    """
-    Uses a multiprocessing.Pool to evaluate func on all values in args, with n_jobs processes running in parallel.
-
-    :param func: Function to be called.
-    :param args: List of arguments to call the function with.
-    :param n_jobs: Number of jobs (if -1, set to the number of physical cores).
-    :return: Returns the list of values returned by the function evaluated on different values from args.
-    """
-    ctx = mp.get_context(method='fork')  # not sure if this is necessary
-    with ctx.Pool(processes=n_jobs if n_jobs >= 1 else psutil.cpu_count(logical=False),
-                 initializer=functools.partial(torch.set_num_threads, 1)) as pool:
-        return pool.map(func, args)
-
-
 class Prior:
-    """
-    Abstract base class for dataset prior generators.
+    """Abstract base class for dataset prior generators.
 
     Defines the interface and common functionality for different types of
     synthetic dataset generators.
 
     Parameters
     ----------
-    regression : bool, default=False
-        If True, generates regression datasets. Otherwise, generates classification datasets.
-
     batch_size : int, default=256
-        Total number of datasets to generate per batch
+        Total number of datasets to generate per batch.
 
     min_features : int, default=2
-        Minimum number of features per dataset
+        Minimum number of features per dataset.
 
     max_features : int, default=100
-        Maximum number of features per dataset
+        Maximum number of features per dataset.
 
     max_classes : int, default=10
-        Maximum number of target classes
+        Maximum number of target classes.
 
-    min_seq_len : int, default=None
-        Minimum samples per dataset. If None, uses max_seq_len
+    min_seq_len : int, optional
+        Minimum samples per dataset. If None, uses max_seq_len.
 
     max_seq_len : int, default=1024
-        Maximum samples per dataset
+        Maximum samples per dataset.
 
     log_seq_len : bool, default=False
-        If True, sample sequence length from a log-uniform distribution
+        If True, sample sequence length from a log-uniform distribution.
 
-    min_train_size : int|float, default=0.1
+    min_train_size : int or float, default=0.1
         Position or ratio for train/test split start. If int, absolute position.
         If float between 0 and 1, specifies a fraction of sequence length.
 
-    max_train_size : int|float, default=0.9
+    max_train_size : int or float, default=0.9
         Position or ratio for train/test split end. If int, absolute position.
         If float between 0 and 1, specifies a fraction of sequence length.
 
     replay_small : bool, default=False
         If True, occasionally sample smaller sequence lengths with
-        specific distributions to ensure model robustness on smaller datasets
+        specific distributions to ensure model robustness on smaller datasets.
     """
 
     def __init__(
-            self,
-            regression: bool = False,
-            batch_size: int = 256,
-            min_features: int = 2,
-            max_features: int = 100,
-            max_classes: int = 10,
-            min_seq_len: Optional[int] = None,
-            max_seq_len: int = 1024,
-            log_seq_len: bool = False,
-            min_train_size: Union[int, float] = 0.1,
-            max_train_size: Union[int, float] = 0.9,
-            replay_small: bool = False,
+        self,
+        batch_size: int = 256,
+        min_features: int = 2,
+        max_features: int = 100,
+        max_classes: int = 10,
+        min_seq_len: Optional[int] = None,
+        max_seq_len: int = 1024,
+        log_seq_len: bool = False,
+        min_train_size: Union[int, float] = 0.1,
+        max_train_size: Union[int, float] = 0.9,
+        replay_small: bool = False,
     ):
-        self.regression = regression
         self.batch_size = batch_size
 
         assert min_features <= max_features, "Invalid feature range"
         self.min_features = min_features
         self.max_features = max_features
 
-        self.max_classes = 0 if regression else max_classes
+        self.max_classes = max_classes
         self.min_seq_len = min_seq_len
         self.max_seq_len = max_seq_len
         self.log_seq_len = log_seq_len
@@ -144,23 +120,23 @@ class Prior:
 
     @staticmethod
     def validate_train_size_range(min_train_size: Union[int, float], max_train_size: Union[int, float]) -> None:
-        """
-        Checks if the training size range is valid.
+        """Check if the training size range is valid.
 
         Parameters
         ----------
-        min_train_size : int|float
-            Minimum training size (position or ratio)
+        min_train_size : int or float
+            Minimum training size (position or ratio).
 
-        max_train_size : int|float
-            Maximum training size (position or ratio)
+        max_train_size : int or float
+            Maximum training size (position or ratio).
 
         Raises
         ------
         AssertionError
-            If training size range is invalid
+            If training size range is invalid.
+
         ValueError
-            If training size types are mismatched or invalid
+            If training size types are mismatched or invalid.
         """
         # Check for numeric types only
         if not isinstance(min_train_size, (int, float)) or not isinstance(max_train_size, (int, float)):
@@ -170,18 +146,15 @@ class Prior:
         if isinstance(min_train_size, int) and isinstance(max_train_size, int):
             assert 0 < min_train_size < max_train_size, "0 < min_train_size < max_train_size"
         elif isinstance(min_train_size, float) and isinstance(max_train_size, float):
-            # Allow min == max to express a fixed train fraction (e.g. the 80% used in
-            # TabICLv2 pretraining stages 2 & 3); the float sampler uses np.random.uniform.
-            assert 0 < min_train_size <= max_train_size < 1, "0 < min_train_size <= max_train_size < 1"
+            assert 0 < min_train_size < max_train_size < 1, "0 < min_train_size < max_train_size < 1"
         else:
             raise ValueError("Both training sizes must be of the same type (int or float)")
 
     @staticmethod
     def sample_seq_len(
-            min_seq_len: Optional[int], max_seq_len: int, log: bool = False, replay_small: bool = False
+        min_seq_len: Optional[int], max_seq_len: int, log: bool = False, replay_small: bool = False
     ) -> int:
-        """
-        Selects a random sequence length within the specified range.
+        """Select a random sequence length within the specified range.
 
         This method provides flexible sampling strategies for dataset sizes, including
         occasional re-sampling of smaller sequence lengths for better training diversity.
@@ -192,20 +165,20 @@ class Prior:
             Minimum sequence length. If None, returns max_seq_len directly.
 
         max_seq_len : int
-            Maximum sequence length
+            Maximum sequence length.
 
         log : bool, default=False
             If True, sample from a log-uniform distribution to better
-            cover the range of possible sizes
+            cover the range of possible sizes.
 
         replay_small : bool, default=False
             If True, occasionally sample smaller sequence lengths with
-            specific distributions to ensure model robustness on smaller datasets
+            specific distributions to ensure model robustness on smaller datasets.
 
         Returns
         -------
         int
-            The sampled sequence length
+            The sampled sequence length.
         """
         if min_seq_len is None:
             return max_seq_len
@@ -228,34 +201,33 @@ class Prior:
 
     @staticmethod
     def sample_train_size(min_train_size: Union[int, float], max_train_size: Union[int, float], seq_len: int) -> int:
-        """
-        Selects a random training size within the specified range.
+        """Select a random training size within the specified range.
 
         This method handles both absolute position and fractional ratio approaches
         for determining the training/test split point.
 
         Parameters
         ----------
-        min_train_size : int|float
+        min_train_size : int or float
             Minimum training size. If int, used as absolute position.
             If float between 0 and 1, used as ratio of sequence length.
 
-        max_train_size : int|float
+        max_train_size : int or float
             Maximum training size. If int, used as absolute position.
             If float between 0 and 1, used as ratio of sequence length.
 
         seq_len : int
-            Total sequence length
+            Total sequence length.
 
         Returns
         -------
         int
-            The sampled training size position
+            The sampled training size position.
 
         Raises
         ------
         ValueError
-            If training size range has incompatible types
+            If training size range has incompatible types.
         """
         if isinstance(min_train_size, int) and isinstance(max_train_size, int):
             train_size = np.random.randint(min_train_size, max_train_size)
@@ -268,8 +240,7 @@ class Prior:
 
     @staticmethod
     def adjust_max_features(seq_len: int, max_features: int) -> int:
-        """
-        Adjusts the maximum number of features based on the sequence length.
+        """Adjust the maximum number of features based on the sequence length.
 
         This method implements an adaptive feature limit that scales inversely
         with sequence length. Longer sequences are restricted to fewer features
@@ -279,18 +250,18 @@ class Prior:
         Parameters
         ----------
         seq_len : int
-            Sequence length (number of samples)
+            Sequence length (number of samples).
 
         max_features : int
-            Original maximum number of features
+            Original maximum number of features.
 
         Returns
         -------
         int
-            Adjusted maximum number of features, ensuring computational feasibility
+            Adjusted maximum number of features, ensuring computational feasibility.
         """
         if seq_len <= 10240:
-            return max_features
+            return min(100, max_features)
         elif 10240 < seq_len <= 20000:
             return min(80, max_features)
         elif 20000 < seq_len <= 30000:
@@ -306,10 +277,10 @@ class Prior:
         else:
             return 10
 
+
     @staticmethod
     def delete_unique_features(X: Tensor, d: Tensor) -> Tuple[Tensor, Tensor]:
-        """
-        Removes features that have only one unique value across all samples.
+        """Remove features that have only one unique value across all samples.
 
         Single-value features provide no useful information for learning since they
         have zero variance. This method identifies and removes such constant features
@@ -319,21 +290,20 @@ class Prior:
         Parameters
         ----------
         X : Tensor
-            Input features tensor of shape (B, T, H) where:
-            - B is batch size
-            - T is sequence length
-            - H is feature dimensionality
+            Input features tensor of shape ``(B, T, H)`` where B is batch size,
+            T is sequence length, and H is feature dimensionality.
 
         d : Tensor
-            Number of features per dataset of shape (B,), indicating how many
-            features are actually used in each dataset (rest is padding)
+            Number of features per dataset of shape ``(B,)``, indicating how many
+            features are actually used in each dataset (rest is padding).
 
         Returns
         -------
-        tuple
-            (X_new, d_new) where:
-            - X_new is the filtered tensor with non-informative features removed
-            - d_new is the updated feature count per dataset
+        X_new : Tensor
+            The filtered tensor with non-informative features removed.
+
+        d_new : Tensor
+            The updated feature count per dataset.
         """
 
         def filter_unique_features(xi: Tensor, di: int) -> Tuple[Tensor, Tensor]:
@@ -355,9 +325,8 @@ class Prior:
         return X_new, d_new
 
     @staticmethod
-    def cls_sanity_check(X: Tensor, y: Tensor, train_size: int, n_attempts: int = 10, min_classes: int = 2) -> bool:
-        """
-        Verifies that both train and test sets contain all classes for classification datasets.
+    def sanity_check(X: Tensor, y: Tensor, train_size: int, n_attempts: int = 10, min_classes: int = 2) -> bool:
+        """Verify that both train and test sets contain all classes.
 
         For in-context learning to work properly, we need both the train and test
         sets to contain examples from all classes. This method checks this condition
@@ -366,24 +335,24 @@ class Prior:
         Parameters
         ----------
         X : Tensor
-            Input features tensor of shape (B, T, H)
+            Input features tensor of shape ``(B, T, H)``.
 
         y : Tensor
-            Target Targets tensor of shape (B, T)
+            Target labels tensor of shape ``(B, T)``.
 
         train_size : int
-            Position to split the data into train and test sets
+            Position to split the data into train and test sets.
 
         n_attempts : int, default=10
-            Number of random permutations to try for fixing invalid splits
+            Number of random permutations to try for fixing invalid splits.
 
         min_classes : int, default=2
-            Minimum number of classes required in both train and test sets
+            Minimum number of classes required in both train and test sets.
 
         Returns
         -------
         bool
-            True if all datasets have valid splits, False otherwise
+            True if all datasets have valid splits, False otherwise.
         """
 
         def is_valid_split(yi: Tensor) -> bool:
@@ -422,109 +391,137 @@ class Prior:
         return True
 
 
+def _build_prior_graph(params: Dict[str, Any], y: Tensor) -> CompactGraphSet:
+    """Build graph metadata for one valid dataset inside prior generation."""
+    train_size = int(params["train_size"])
+    return GraphPrior(
+        graph_v1_prob=float(params.get("graph_v1_prob", 1.0)),
+        graph_v2_prob=float(params.get("graph_v2_prob", 0.0)),
+        graph_prob=float(params.get("graph_prob", 0.0)),
+        min_train_neighbors=int(params["graph_min_train_neighbors"]),
+        max_train_neighbors=int(params["graph_max_train_neighbors"]),
+        cross_label_fraction=float(params["graph_cross_label_fraction"]),
+        train_neighbors_per_test=int(params["graph_train_neighbors_per_test"]),
+        seed=params.get("graph_seed"),
+        homophily_prob=float(params.get("graph_homophily_prob", 0.7)),
+        transition_scope_prob=float(params.get("graph_transition_scope_prob", 0.5)),
+        remain_prob_range=tuple(params.get("graph_remain_prob_range", (0.7, 0.99))),
+        heterophily_structure_probs=params.get("graph_heterophily_structure_probs"),
+        group_count_range=tuple(params.get("graph_group_count_range", (2, 4))),
+        share_graph_across_batch=bool(params.get("graph_share_across_batch", False)),
+    )(y.long().unsqueeze(0), train_size, num_graphs=int(params["graph_num_graphs"]))
+
+
 class SCMPrior(Prior):
-    """
-    Generates synthetic datasets using Structural Causal Models (SCM).
+    """Generate synthetic datasets using Structural Causal Models (SCM).
 
     The data generation process follows a hierarchical structure:
+
     1. Generate a list of parameters for each dataset, respecting group/subgroup sharing.
-    2. Process the parameter list to generate datasets, applying necessary transformations and checks.
+    2. Process the parameter list to generate datasets, applying necessary
+       transformations and checks.
 
     Parameters
     ----------
-    regression : bool, default=False
-        If True, generates regression datasets. Otherwise, generates classification datasets.
-
     batch_size : int, default=256
-        Total number of datasets to generate per batch
+        Total number of datasets to generate per batch.
 
     batch_size_per_gp : int, default=4
-        Number of datasets per group, sharing similar characteristics
+        Number of datasets per group, sharing similar characteristics.
 
-    batch_size_per_subgp : int, default=None
-        Number of datasets per subgroup, with more similar causal structures
-        If None, defaults to batch_size_per_gp
+    batch_size_per_subgp : int, optional
+        Number of datasets per subgroup, with more similar causal structures.
+        If None, defaults to batch_size_per_gp.
 
     min_features : int, default=2
-        Minimum number of features per dataset
+        Minimum number of features per dataset.
 
     max_features : int, default=100
-        Maximum number of features per dataset
+        Maximum number of features per dataset.
 
     max_classes : int, default=10
-        Maximum number of target classes
+        Maximum number of target classes.
 
-    min_seq_len : int, default=None
+    min_seq_len : int, optional
         Minimum samples per dataset. If None, uses max_seq_len directly.
 
     max_seq_len : int, default=1024
-        Maximum samples per dataset
+        Maximum samples per dataset.
 
     log_seq_len : bool, default=False
-        If True, sample sequence length from a log-uniform distribution
+        If True, sample sequence length from a log-uniform distribution.
 
-    seq_len_per_gp : bool = False
-        If True, sample sequence length per group, allowing variable-sized datasets
+    seq_len_per_gp : bool, default=False
+        If True, sample sequence length per group, allowing variable-sized datasets.
 
-    min_train_size : int|float, default=0.1
+    min_train_size : int or float, default=0.1
         Position or ratio for train/test split start. If int, absolute position.
         If float between 0 and 1, specifies a fraction of sequence length.
 
-    max_train_size : int|float, default=0.9
+    max_train_size : int or float, default=0.9
         Position or ratio for train/test split end. If int, absolute position.
         If float between 0 and 1, specifies a fraction of sequence length.
 
     replay_small : bool, default=False
         If True, occasionally sample smaller sequence lengths with
-        specific distributions to ensure model robustness on smaller datasets
+        specific distributions to ensure model robustness on smaller datasets.
 
     prior_type : str, default="mlp_scm"
-        Type of prior: 'mlp_scm' (default), 'tree_scm', or 'mix_scm'
-        'mix_scm' randomly selects between 'mlp_scm' and 'tree_scm' based on probabilities.
+        Type of prior: 'mlp_scm' (default), 'tree_scm', or 'mix_scm'.
+        'mix_scm' randomly selects between 'mlp_scm' and 'tree_scm' based on
+        probabilities.
 
     fixed_hp : dict, default=DEFAULT_FIXED_HP
-        Fixed structural configuration parameters
+        Fixed structural configuration parameters.
 
     sampled_hp : dict, default=DEFAULT_SAMPLED_HP
-        Parameters sampled during generation
+        Parameters sampled during generation.
 
     n_jobs : int, default=-1
         Number of parallel jobs to run (-1 means using all processors).
 
     num_threads_per_generate : int, default=1
-        Number of threads per job for dataset generation
+        Number of threads per job for dataset generation.
 
     device : str, default="cpu"
-        Computation device ('cpu' or 'cuda')
+        Computation device ('cpu' or 'cuda').
     """
 
     def __init__(
-            self,
-            regression: bool = False,
-            batch_size: int = 256,
-            batch_size_per_gp: int = 4,
-            batch_size_per_subgp: Optional[int] = None,
-            min_features: int = 2,
-            max_features: int = 100,
-            max_classes: int = 10,
-            min_seq_len: Optional[int] = None,
-            max_seq_len: int = 1024,
-            log_seq_len: bool = False,
-            log_n_features: bool = False,
-            seq_len_per_gp: bool = False,
-            min_train_size: Union[int, float] = 0.1,
-            max_train_size: Union[int, float] = 0.9,
-            replay_small: bool = False,
-            prior_type: str = "mlp_scm",
-            fixed_hp: Dict[str, Any] = DEFAULT_FIXED_HP,
-            sampled_hp: Dict[str, Any] = DEFAULT_SAMPLED_HP,
-            n_jobs: int = -1,
-            num_threads_per_generate: int = 1,
-            device: str = "cpu",
-            config: Optional[PriorConfig] = None,
+        self,
+        batch_size: int = 256,
+        batch_size_per_gp: int = 4,
+        batch_size_per_subgp: Optional[int] = None,
+        min_features: int = 2,
+        max_features: int = 100,
+        max_classes: int = 10,
+        min_seq_len: Optional[int] = None,
+        max_seq_len: int = 1024,
+        log_seq_len: bool = False,
+        seq_len_per_gp: bool = False,
+        min_train_size: Union[int, float] = 0.1,
+        max_train_size: Union[int, float] = 0.9,
+        replay_small: bool = False,
+        prior_type: str = "mlp_scm",
+        fixed_hp: Dict[str, Any] = DEFAULT_FIXED_HP,
+        sampled_hp: Dict[str, Any] = DEFAULT_SAMPLED_HP,
+        n_jobs: int = -1,
+        num_threads_per_generate: int = 1,
+        device: str = "cpu",
+        normalization: str = "none",
+        graph_backend: bool = False,
+        graph_num_graphs: int = 1,
+        graph_min_train_neighbors: int = 8,
+        graph_max_train_neighbors: int = 15,
+        graph_cross_label_fraction: float = 0.1,
+        graph_train_neighbors_per_test: int = 8,
+        graph_seed: Optional[int] = None,
+        graph_share_across_batch: bool = False,
+        graph_v1_prob: float = 1.0,
+        graph_v2_prob: float = 0.0,
+        graph_prob: float = 0.0,
     ):
         super().__init__(
-            regression=regression,
             batch_size=batch_size,
             min_features=min_features,
             max_features=max_features,
@@ -539,6 +536,10 @@ class SCMPrior(Prior):
 
         self.batch_size_per_gp = batch_size_per_gp
         self.batch_size_per_subgp = batch_size_per_subgp or batch_size_per_gp
+        if self.batch_size_per_gp <= 0:
+            raise ValueError("batch_size_per_gp must be positive")
+        if self.batch_size <= 0 or self.batch_size % self.batch_size_per_gp != 0:
+            raise ValueError("batch_size must be a positive multiple of batch_size_per_gp")
         self.seq_len_per_gp = seq_len_per_gp
         self.prior_type = prior_type
         self.fixed_hp = fixed_hp
@@ -546,25 +547,32 @@ class SCMPrior(Prior):
         self.n_jobs = n_jobs
         self.num_threads_per_generate = num_threads_per_generate
         self.device = device
-        self.log_n_features = log_n_features
-        self.config = config or PriorConfig()
+        self.graph_backend = graph_backend
+        self.graph_num_graphs = int(graph_num_graphs)
+        self.graph_min_train_neighbors = graph_min_train_neighbors
+        self.graph_max_train_neighbors = graph_max_train_neighbors
+        self.graph_cross_label_fraction = graph_cross_label_fraction
+        self.graph_train_neighbors_per_test = graph_train_neighbors_per_test
+        self.graph_seed = graph_seed
+        self.graph_share_across_batch = graph_share_across_batch
+        self.graph_v1_prob = float(graph_v1_prob)
+        self.graph_v2_prob = float(graph_v2_prob)
+        self.graph_prob = float(graph_prob)
 
     def hp_sampling(self) -> Dict[str, Any]:
-        """
-        Sample hyperparameters for dataset generation.
+        """Sample hyperparameters for dataset generation.
 
         Returns
         -------
         dict
-            Dictionary with sampled hyperparameters merged with fixed ones
+            Dictionary with sampled hyperparameters merged with fixed ones.
         """
         hp_sampler = HpSamplerList(self.sampled_hp, device=self.device)
         return hp_sampler.sample()
 
     @torch.no_grad()
-    def generate_dataset(self, params: Dict[str, Any]) -> Tuple[Tensor, Tensor, Tensor]:
-        """
-        Generates a single valid dataset based on the provided parameters.
+    def generate_dataset(self, params: Dict[str, Any]) -> tuple:
+        """Generate a single valid dataset based on the provided parameters.
 
         Parameters
         ----------
@@ -574,77 +582,74 @@ class SCMPrior(Prior):
 
         Returns
         -------
-        tuple
-            (X, y, d) where:
-            - X: Features tensor of shape (seq_len, max_features)
-            - y: Targets tensor of shape (seq_len,)
-            - d: Number of active features after filtering (scalar Tensor)
-        """
+        X : Tensor
+            Features tensor of shape ``(seq_len, max_features)``.
 
-        # print(f'{params["prior_type"]=}')
+        y : Tensor
+            Labels tensor of shape ``(seq_len,)``.
+
+        d : Tensor
+            Nominal sampled feature width for the group (scalar Tensor).
+        """
         if params["prior_type"] == "mlp_scm":
             prior_cls = MLPSCM
         elif params["prior_type"] == "tree_scm":
             prior_cls = TreeSCM
+        elif params["prior_type"] == "nanotabicl":
+            prior_cls = NanoTabICLPrior
         else:
             raise ValueError(f"Unknown prior type {params['prior_type']}")
 
-        for idx in range(100):
+        while True:
             X, y = prior_cls(**params)()
-            X, y = Reg2Cls(params)(X, y)
+            if params["prior_type"] != "nanotabicl":
+                X, y = Reg2Cls(params)(X, y)
 
             # Add batch dim for single dataset to be compatible with delete_unique_features and sanity_check
             X, y = X.unsqueeze(0), y.unsqueeze(0)
-            d = torch.tensor([params["num_features"]], device=self.device, dtype=torch.long)
+            nominal_features = int(params["num_features"])
+            d = torch.tensor([nominal_features], device=self.device, dtype=torch.long)
 
             # Only keep valid datasets with sufficient features and balanced classes
-            X, d = self.delete_unique_features(X, d)
-            if not (d > 0).all():
-                continue
-
-            if not (self.regression or self.cls_sanity_check(X, y, params["train_size"])):
-                continue
-
-            #
-            # if idx <= 5 and self.config.filter_unpredictable_datasets \
-            #         and compute_predictability_pvalue(X[0], y[0], is_classif=not self.regression) >= 0.05:
-            if idx <= 5 and should_filter(X[0], y[0], self.config, is_classif=not self.regression):
-                # print(f'filter', flush=True)
-                continue
-
-            # print(f'no filter', flush=True)
-            break
-
-        return X.squeeze(0), y.squeeze(0), d.squeeze(0)
+            X, filtered_d = self.delete_unique_features(X, d)
+            if (filtered_d > 0).all() and self.sanity_check(X, y, params["train_size"]):
+                # Keep the nominal group width in metadata. The tensor is
+                # already padded to that width by delete_unique_features;
+                # filtering only changes which columns contain information.
+                X, y = X.squeeze(0), y.squeeze(0)
+                d = torch.tensor(nominal_features, device=self.device, dtype=torch.long)
+                if params.get("graph_backend", False):
+                    return X, y, d, _build_prior_graph(params, y)
+                return X, y, d
 
     @torch.no_grad()
     def get_batch(self, batch_size: Optional[int] = None) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        """
-        Generates a batch of datasets by first creating a parameter list and then processing it.
+        """Generate a batch of datasets by first creating a parameter list and then processing it.
 
         Parameters
         ----------
         batch_size : int, optional
-            Batch size override. If None, uses self.batch_size
+            Batch size override. If None, uses self.batch_size.
 
         Returns
         -------
         X : Tensor or NestedTensor
-            Features tensor. If seq_len_per_gp=False, shape is (batch_size, seq_len, max_features).
+            Features tensor. If seq_len_per_gp=False, shape is
+            ``(batch_size, seq_len, max_features)``.
             If seq_len_per_gp=True, returns a NestedTensor.
 
         y : Tensor or NestedTensor
-            Targets tensor. If seq_len_per_gp=False, shape is (batch_size, seq_len).
+            Labels tensor. If seq_len_per_gp=False, shape is ``(batch_size, seq_len)``.
             If seq_len_per_gp=True, returns a NestedTensor.
 
         d : Tensor
-            Number of active features per dataset after filtering, shape (batch_size,)
+            Nominal sampled feature width per dataset, shape ``(batch_size,)``.
 
         seq_lens : Tensor
-            Sequence length for each dataset, shape (batch_size,)
+            Sequence length for each dataset, shape ``(batch_size,)``.
 
         train_sizes : Tensor
-            Position for train/test split for each dataset, shape (batch_size,)
+            Position for train/test split for each dataset, shape ``(batch_size,)``.
         """
         batch_size = batch_size or self.batch_size
 
@@ -672,6 +677,10 @@ class SCMPrior(Prior):
             actual_gp_size = min(size_per_gp, batch_size - gp_idx * size_per_gp)
             if actual_gp_size <= 0:
                 break
+
+            # Each group is consumed as one training micro-batch. Sample its
+            # class cardinality once so the decoder has one output width.
+            sampled_num_classes = np.random.randint(2, self.max_classes + 1)
 
             group_sampled_hp = self.hp_sampling()
             # If per-group, sample seq_len and train_size for this group. Otherwise, use global ones
@@ -687,10 +696,9 @@ class SCMPrior(Prior):
                 gp_train_size = global_train_size
                 gp_max_features = self.max_features
 
-            if self.config.seq_lens_multiple_of > 1:
-                k = self.config.seq_lens_multiple_of
-                gp_seq_len = k * round(gp_seq_len / k)
-                gp_train_size = k * round(gp_train_size / k)
+            # Sample feature width once for the complete group. Subgroups may
+            # still vary prior hyperparameters, but not tensor width.
+            group_num_features = round(np.random.uniform(self.min_features, gp_max_features))
 
             # Calculate number of subgroups for this group
             num_subgps_in_gp = math.ceil(actual_gp_size / size_per_subgp)
@@ -704,49 +712,35 @@ class SCMPrior(Prior):
 
                 # Subgroups share prior type, number of features, and sampled HPs
                 subgp_prior_type = self.get_prior()
-                if self.log_n_features:
-                    subgp_num_features = int(loguniform.rvs(self.min_features, gp_max_features))
-                else:
-                    subgp_num_features = round(np.random.uniform(self.min_features, gp_max_features))
                 subgp_sampled_hp = {k: v() if callable(v) else v for k, v in group_sampled_hp.items()}
 
                 # Generate parameters for each dataset in this subgroup
                 for ds_idx in range(actual_subgp_size):
-                    if self.regression:
-                        ds_num_classes = None
-                    else:
-                        # Each dataset has its own number of classes
-                        if np.random.random() > 0.5:
-                            ds_num_classes = np.random.randint(2, self.max_classes + 1)
-                        else:
-                            ds_num_classes = 2
-
                     # Create parameters dictionary for this dataset
                     params = {
-                        # -----------------
-                        # Global parameters
-                        # -----------------
-                        "regression": self.regression,
-                        "device": self.device,
                         **self.fixed_hp,  # Fixed HPs
-                        # -------------------------
-                        # Group-specific parameters
-                        # -------------------------
                         "seq_len": gp_seq_len,
                         "train_size": gp_train_size,
-                        # If per-gp setting, use adjusted max features for this group because we use nested tensors
-                        # If not per-gp setting, use global max features to fix size for concatenation
-                        "max_features": gp_max_features if self.seq_len_per_gp else self.max_features,
-                        # ----------------------------
-                        # Subgroup-specific parameters
-                        # ----------------------------
+                        # The sampled group width is the tensor width. It is
+                        # an upper bound for active features, not a batch-wide
+                        # padding width.
+                        "max_features": group_num_features,
                         **subgp_sampled_hp,  # sampled HPs for this group
                         "prior_type": subgp_prior_type,
-                        "num_features": subgp_num_features,
-                        # ---------------------------
-                        # Dataset-specific parameters
-                        # ---------------------------
-                        "num_classes": ds_num_classes,
+                        "num_features": group_num_features,
+                        "num_classes": sampled_num_classes,
+                        "device": self.device,
+                        "graph_backend": self.graph_backend,
+                        "graph_num_graphs": self.graph_num_graphs,
+                        "graph_min_train_neighbors": self.graph_min_train_neighbors,
+                        "graph_max_train_neighbors": self.graph_max_train_neighbors,
+                        "graph_cross_label_fraction": self.graph_cross_label_fraction,
+                        "graph_train_neighbors_per_test": self.graph_train_neighbors_per_test,
+                        "graph_seed": None if self.graph_seed is None else self.graph_seed + len(param_list),
+                        "graph_share_across_batch": self.graph_share_across_batch,
+                        "graph_v1_prob": self.graph_v1_prob,
+                        "graph_v2_prob": self.graph_v2_prob,
+                        "graph_prob": self.graph_prob,
                     }
                     param_list.append(params)
 
@@ -755,25 +749,18 @@ class SCMPrior(Prior):
         # However, 'threading' does not respect `inner_max_num_threads`.
         # Therefore, we stick with the 'loky' backend for parallelism, but this requires generating
         # the prior datasets separately from the training process and loading them from disk,
-        # rather than generating them on-the-fly.
-        # if self.n_jobs == 1:
-        #     results = [self.generate_dataset(params) for params in param_list]
-        # else:
-        #     with joblib.parallel_config(
-        #             n_jobs=self.n_jobs, backend="loky", inner_max_num_threads=self.num_threads_per_generate
-        #     ):
-        #         results = joblib.Parallel()(joblib.delayed(self.generate_dataset)(params) for params in param_list)
+        if self.n_jobs > 1 and self.device == "cpu":
+            with joblib.parallel_config(
+                n_jobs=self.n_jobs, backend="loky", inner_max_num_threads=self.num_threads_per_generate
+            ):
+                results = joblib.Parallel()(joblib.delayed(self.generate_dataset)(params) for params in param_list)
+        else:
+            results = [self.generate_dataset(params) for params in param_list]
 
-        with threadpoolctl.threadpool_limits(limits=1):
-            if self.n_jobs == 1:
-                n_threads_old = torch.get_num_threads()
-                torch.set_num_threads(1)
-                results = [self.generate_dataset(params) for params in param_list]
-                torch.set_num_threads(n_threads_old)
-            else:
-                results = run_parallel(self.generate_dataset, args=param_list, n_jobs=self.n_jobs)
-
-        X_list, y_list, d_list = zip(*results)
+        if self.graph_backend:
+            X_list, y_list, d_list, graph_sets = zip(*results)
+        else:
+            X_list, y_list, d_list = zip(*results)
 
         # Combine Results
         if self.seq_len_per_gp:
@@ -782,21 +769,27 @@ class SCMPrior(Prior):
             y = nested_tensor([y.to(self.device) for y in y_list], device=self.device)
         else:
             # Stack into regular tensors for fixed sequence length
-            X = torch.stack(X_list).to(self.device)  # (B, T, H)
+            max_batch_features = max(int(x.shape[-1]) for x in X_list)
+            padded_X = [
+                F.pad(x, (0, max_batch_features - x.shape[-1])) if x.shape[-1] < max_batch_features else x
+                for x in X_list
+            ]
+            X = torch.stack(padded_X).to(self.device)  # (B, T, max_group_width)
             y = torch.stack(y_list).to(self.device)  # (B, T)
 
         # Metadata (always regular tensors)
-        d = torch.stack(d_list).to(self.device)  # Actual number of features after filtering out constant ones
+        d = torch.stack(d_list).to(self.device)  # Nominal homogeneous width for each generated group
         seq_lens = torch.tensor([params["seq_len"] for params in param_list], device=self.device, dtype=torch.long)
         train_sizes = torch.tensor(
             [params["train_size"] for params in param_list], device=self.device, dtype=torch.long
         )
 
+        if self.graph_backend:
+            return X, y, d, seq_lens, train_sizes, stack_graph_sets(list(graph_sets))
         return X, y, d, seq_lens, train_sizes
 
     def get_prior(self) -> str:
-        """
-        Determine which prior type to use for generation.
+        """Determine which prior type to use for generation.
 
         For 'mix_scm' prior type, randomly selects between available priors
         based on configured probabilities.
@@ -804,390 +797,80 @@ class SCMPrior(Prior):
         Returns
         -------
         str
-            The selected prior type name
+            The selected prior type name.
         """
         if self.prior_type == "mix_scm":
-            return np.random.choice(["mlp_scm", "tree_scm"], p=self.fixed_hp.get("mix_probs", [0.7, 0.3]))
+            return np.random.choice(["mlp_scm", "tree_scm"], p=self.fixed_hp.get("mix_probas", [0.7, 0.3]))
         else:
             return self.prior_type
 
 
-class GraphPrior(Prior):
-    """
-    Generates synthetic datasets using Graph-based Structural Causal Models (SCM).
-
-    Parameters
-    ----------
-    regression : bool, default=False
-        If True, generates regression datasets. Otherwise, generates classification datasets.
-
-    batch_size : int, default=256
-        Total number of datasets to generate per batch
-
-    batch_size_per_gp : int, default=4
-        Number of datasets per group, sharing similar characteristics
-
-    batch_size_per_subgp : int, default=None
-        Number of datasets per subgroup, with more similar causal structures
-        If None, defaults to batch_size_per_gp
-
-    min_features : int, default=2
-        Minimum number of features per dataset
-
-    max_features : int, default=100
-        Maximum number of features per dataset
-
-    max_classes : int, default=10
-        Maximum number of target classes
-
-    min_seq_len : int, default=None
-        Minimum samples per dataset. If None, uses max_seq_len directly.
-
-    max_seq_len : int, default=1024
-        Maximum samples per dataset
-
-    log_seq_len : bool, default=False
-        If True, sample sequence length from a log-uniform distribution
-
-    log_n_features : bool, default=False
-        If True, sample the number of features from a log-uniform distribution
-
-    seq_len_per_gp : bool = False
-        If True, sample sequence length per group, allowing variable-sized datasets
-
-    min_train_size : int|float, default=0.1
-        Position or ratio for train/test split start. If int, absolute position.
-        If float between 0 and 1, specifies a fraction of sequence length.
-
-    max_train_size : int|float, default=0.9
-        Position or ratio for train/test split end. If int, absolute position.
-        If float between 0 and 1, specifies a fraction of sequence length.
-
-    replay_small : bool, default=False
-        If True, occasionally sample smaller sequence lengths with
-        specific distributions to ensure model robustness on smaller datasets
-
-    config : PriorConfig | None, default=None
-        Prior configuration.
-
-    n_jobs : int, default=-1
-        Number of parallel jobs to run (-1 means using all processors).
-
-    num_threads_per_generate : int, default=1
-        Number of threads per job for dataset generation
-
-    device : str, default="cpu"
-        Computation device ('cpu' or 'cuda')
-    """
-
-    def __init__(
-            self,
-            regression: bool = False,
-            batch_size: int = 256,
-            batch_size_per_gp: int = 4,
-            batch_size_per_subgp: Optional[int] = None,
-            min_features: int = 2,
-            max_features: int = 100,
-            max_classes: int = 10,
-            min_seq_len: Optional[int] = None,
-            max_seq_len: int = 1024,
-            log_seq_len: bool = False,
-            log_n_features: bool = False,
-            seq_len_per_gp: bool = False,
-            min_train_size: Union[int, float] = 0.1,
-            max_train_size: Union[int, float] = 0.9,
-            replay_small: bool = False,
-            config: Optional[PriorConfig] = None,
-            n_jobs: int = -1,
-            num_threads_per_generate: int = 1,
-            device: str = "cpu",
-    ):
-        super().__init__(
-            regression=regression,
-            batch_size=batch_size,
-            min_features=min_features,
-            max_features=max_features,
-            max_classes=max_classes,
-            min_seq_len=min_seq_len,
-            max_seq_len=max_seq_len,
-            log_seq_len=log_seq_len,
-            min_train_size=min_train_size,
-            max_train_size=max_train_size,
-            replay_small=replay_small,
-        )
-
-        self.batch_size_per_gp = batch_size_per_gp
-        self.batch_size_per_subgp = batch_size_per_subgp or batch_size_per_gp
-        self.seq_len_per_gp = seq_len_per_gp
-        self.log_n_features = log_n_features
-        self.config = config or PriorConfig()
-        self.n_jobs = n_jobs
-        self.num_threads_per_generate = num_threads_per_generate
-        self.device = device
-
-    @torch.no_grad()
-    def generate_dataset(self, params: Dict[str, Any]) -> Tuple[Tensor, Tensor, Tensor]:
-        """
-        Generates a single valid dataset based on the provided parameters.
-
-        This method implements a robust generation process with:
-        1. Multiple retry attempts for generating valid datasets
-        2. Feature filtering to remove non-informative columns
-        3. Validation checks to ensure class balance in train/test splits
-
-        Parameters
-        ----------
-        params : dict
-            Parameters accepted by `GraphSCM` for dataset generation including:
-            - regression: boolean flag for regression/classification
-            - seq_len: number of samples
-            - train_size: position to split train/test sets
-            - num_features: number of features
-            - max_features: maximum number of features
-            - num_classes: number of target classes
-            - device: computation device
-            - config: PriorConfig object
-
-        Returns
-        -------
-        tuple
-            (X, y, d) where:
-            - X: Features tensor of shape (seq_len, max_features)
-            - y: Targets tensor of shape (seq_len,)
-            - d: Number of active features after filtering (scalar Tensor)
-        """
-
-        while True:
-            X, y = GraphSCM(**params)()
-
-            # Add batch dim for single dataset to be compatible with delete_unique_features and sanity_check
-            X, y = X.unsqueeze(0), y.unsqueeze(0)
-            d = torch.tensor([params["num_features"]], device=self.device, dtype=torch.long)
-
-            # Only keep valid datasets with sufficient features and balanced classes
-            X, d = self.delete_unique_features(X, d)
-            if not (d > 0).all():
-                continue
-
-            if not (self.regression or self.cls_sanity_check(X, y, params["train_size"])):
-                continue
-
-            if should_filter(X[0], y[0], self.config, is_classif=not self.regression):
-                continue
-
-            return X.squeeze(0), y.squeeze(0), d.squeeze(0)
-
-    @torch.no_grad()
-    def get_batch(self, batch_size: Optional[int] = None) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        """
-        Generates a batch of datasets by first creating a parameter list and then processing it.
-
-        Parameters
-        ----------
-        batch_size : int, optional
-            Batch size override. If None, uses self.batch_size
-
-        Returns
-        -------
-        X : Tensor or NestedTensor
-            Features tensor. If seq_len_per_gp=False, shape is (batch_size, seq_len, max_features).
-            If seq_len_per_gp=True, returns a NestedTensor.
-
-        y : Tensor or NestedTensor
-            Targets tensor. If seq_len_per_gp=False, shape is (batch_size, seq_len).
-            If seq_len_per_gp=True, returns a NestedTensor.
-
-        d : Tensor
-            Number of active features per dataset after filtering, shape (batch_size,)
-
-        seq_lens : Tensor
-            Sequence length for each dataset, shape (batch_size,)
-
-        train_sizes : Tensor
-            Position for train/test split for each dataset, shape (batch_size,)
-        """
-        batch_size = batch_size or self.batch_size
-
-        # Calculate number of groups and subgroups
-        size_per_gp = min(self.batch_size_per_gp, batch_size)
-        num_gps = math.ceil(batch_size / size_per_gp)
-
-        size_per_subgp = min(self.batch_size_per_subgp, size_per_gp)
-
-        # Generate parameters list for all datasets, preserving group and subgroup structure
-        param_list = []
-        global_seq_len = None
-        global_train_size = None
-
-        # Determine global seq_len/train_size if not per-group
-        if not self.seq_len_per_gp:
-            global_seq_len = self.sample_seq_len(
-                self.min_seq_len, self.max_seq_len, log=self.log_seq_len, replay_small=self.replay_small
-            )
-            global_train_size = self.sample_train_size(self.min_train_size, self.max_train_size, global_seq_len)
-
-        # Generate parameters for each group
-        for gp_idx in range(num_gps):
-            # Determine actual size for this group (may be smaller for the last group)
-            actual_gp_size = min(size_per_gp, batch_size - gp_idx * size_per_gp)
-            if actual_gp_size <= 0:
-                break
-
-            # If per-group, sample seq_len and train_size for this group. Otherwise, use global ones
-            if self.seq_len_per_gp:
-                gp_seq_len = self.sample_seq_len(
-                    self.min_seq_len, self.max_seq_len, log=self.log_seq_len, replay_small=self.replay_small
-                )
-                gp_train_size = self.sample_train_size(self.min_train_size, self.max_train_size, gp_seq_len)
-                # Adjust max features based on seq_len for this group
-                gp_max_features = self.adjust_max_features(gp_seq_len, self.max_features)
-            else:
-                gp_seq_len = global_seq_len
-                gp_train_size = global_train_size
-                gp_max_features = self.max_features
-
-            # Calculate number of subgroups for this group
-            num_subgps_in_gp = math.ceil(actual_gp_size / size_per_subgp)
-
-            # Generate parameters for each subgroup
-            for subgp_idx in range(num_subgps_in_gp):
-                # Determine actual size for this subgroup
-                actual_subgp_size = min(size_per_subgp, actual_gp_size - subgp_idx * size_per_subgp)
-                if actual_subgp_size <= 0:
-                    break
-
-                # Each subgroup shares the same number of features
-                if self.log_n_features:
-                    subgp_num_features = int(loguniform.rvs(self.min_features, gp_max_features))
-                else:
-                    subgp_num_features = round(np.random.uniform(self.min_features, gp_max_features))
-
-                # Generate parameters for each dataset in this subgroup
-                for ds_idx in range(actual_subgp_size):
-                    if self.regression:
-                        ds_num_classes = None
-                    else:
-                        # Each dataset has its own number of classes
-                        ds_num_classes = np.random.randint(2, self.max_classes + 1)
-
-                    # Create parameters dictionary for this dataset
-                    params = {
-                        # -----------------
-                        # Global parameters
-                        # -----------------
-                        "regression": self.regression,
-                        "device": self.device,
-                        "config": self.config,
-                        # -------------------------
-                        # Group-specific parameters
-                        # -------------------------
-                        "seq_len": gp_seq_len,
-                        "train_size": gp_train_size,
-                        "max_features": gp_max_features,
-                        # ----------------------------
-                        # Subgroup-specific parameters
-                        # ----------------------------
-                        "num_features": subgp_num_features,
-                        # ---------------------------
-                        # Dataset-specific parameters
-                        # ---------------------------
-                        "num_classes": ds_num_classes,
-                        # ---------------------------
-                        # DAG generation parameters
-                        # ---------------------------
-                    }
-
-                    param_list.append(params)
-
-        with threadpoolctl.threadpool_limits(limits=1):
-            if self.n_jobs == 1:
-                n_threads_old = torch.get_num_threads()
-                torch.set_num_threads(1)
-                results = [self.generate_dataset(params) for params in param_list]
-                torch.set_num_threads(n_threads_old)
-            else:
-                results = run_parallel(self.generate_dataset, args=param_list, n_jobs=self.n_jobs)
-
-        X_list, y_list, d_list = zip(*results)
-
-        # Combine Results
-        if self.seq_len_per_gp:
-            # Use nested tensors for variable sequence lengths
-            X = nested_tensor([x.to(self.device) for x in X_list], device=self.device)
-            y = nested_tensor([y.to(self.device) for y in y_list], device=self.device)
-        else:
-            # Stack into regular tensors for fixed sequence length
-            X = torch.stack(X_list).to(self.device)  # (B, T, H)
-            y = torch.stack(y_list).to(self.device)  # (B, T)
-
-        # Metadata (always regular tensors)
-        d = torch.stack(d_list).to(self.device)  # Actual number of features after filtering out constant ones
-        seq_lens = torch.tensor([params["seq_len"] for params in param_list], device=self.device, dtype=torch.long)
-        train_sizes = torch.tensor(
-            [params["train_size"] for params in param_list], device=self.device, dtype=torch.long
-        )
-
-        return X, y, d, seq_lens, train_sizes
-
-
 class DummyPrior(Prior):
-    """This class creates purely random data. This is useful for testing and debugging
-    without the computational overhead of SCM-based generation.
+    """Create purely random data for testing and debugging.
+
+    This is useful for testing and debugging without the computational overhead
+    of SCM-based generation.
 
     Parameters
     ----------
-    regression : bool, default=False
-        If True, generates regression datasets. Otherwise, generates classification datasets.
-
     batch_size : int, default=256
-        Number of datasets to generate
+        Number of datasets to generate.
 
     min_features : int, default=2
-        Minimum number of features per dataset
+        Minimum number of features per dataset.
 
     max_features : int, default=100
-        Maximum number of features per dataset
+        Maximum number of features per dataset.
 
     max_classes : int, default=10
-        Maximum number of target classes
+        Maximum number of target classes.
 
-    min_seq_len : int, default=None
+    min_seq_len : int, optional
         Minimum samples per dataset. If None, uses max_seq_len directly.
 
     max_seq_len : int, default=1024
-        Maximum samples per dataset
+        Maximum samples per dataset.
 
     log_seq_len : bool, default=False
-        If True, sample sequence length from a log-uniform distribution
+        If True, sample sequence length from a log-uniform distribution.
 
-    min_train_size : int|float, default=0.1
+    min_train_size : int or float, default=0.1
         Position or ratio for train/test split start. If int, absolute position.
         If float between 0 and 1, specifies a fraction of sequence length.
 
-    max_train_size : int|float, default=0.9
+    max_train_size : int or float, default=0.9
         Position or ratio for train/test split end. If int, absolute position.
         If float between 0 and 1, specifies a fraction of sequence length.
 
     device : str, default="cpu"
-        Computation device
+        Computation device.
     """
 
     def __init__(
-            self,
-            regression: bool = False,
-            batch_size: int = 256,
-            min_features: int = 2,
-            max_features: int = 100,
-            max_classes: int = 10,
-            min_seq_len: Optional[int] = None,
-            max_seq_len: int = 1024,
-            log_seq_len: bool = False,
-            min_train_size: Union[int, float] = 0.1,
-            max_train_size: Union[int, float] = 0.9,
-            device: str = "cpu",
+        self,
+        batch_size: int = 256,
+        min_features: int = 2,
+        max_features: int = 100,
+        max_classes: int = 10,
+        min_seq_len: Optional[int] = None,
+        max_seq_len: int = 1024,
+        log_seq_len: bool = False,
+        min_train_size: Union[int, float] = 0.1,
+        max_train_size: Union[int, float] = 0.9,
+        device: str = "cpu",
+        graph_backend: bool = False,
+        graph_num_graphs: int = 1,
+        graph_min_train_neighbors: int = 8,
+        graph_max_train_neighbors: int = 15,
+        graph_cross_label_fraction: float = 0.1,
+        graph_train_neighbors_per_test: int = 8,
+        graph_seed: Optional[int] = None,
+        graph_share_across_batch: bool = False,
+        graph_v1_prob: float = 1.0,
+        graph_v2_prob: float = 0.0,
+        graph_prob: float = 0.0,
     ):
         super().__init__(
-            regression=regression,
             batch_size=batch_size,
             min_features=min_features,
             max_features=max_features,
@@ -1199,37 +882,47 @@ class DummyPrior(Prior):
             max_train_size=max_train_size,
         )
         self.device = device
+        self.graph_backend = graph_backend
+        self.graph_num_graphs = graph_num_graphs
+        self.graph_min_train_neighbors = graph_min_train_neighbors
+        self.graph_max_train_neighbors = graph_max_train_neighbors
+        self.graph_cross_label_fraction = graph_cross_label_fraction
+        self.graph_train_neighbors_per_test = graph_train_neighbors_per_test
+        self.graph_seed = graph_seed
+        self.graph_share_across_batch = graph_share_across_batch
+        self.graph_v1_prob = float(graph_v1_prob)
+        self.graph_v2_prob = float(graph_v2_prob)
+        self.graph_prob = float(graph_prob)
 
     @torch.no_grad()
-    def get_batch(self, batch_size: Optional[int] = None) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        """
-        Generates a batch of random datasets for testing purposes.
+    def get_batch(self, batch_size: Optional[int] = None) -> tuple:
+        """Generate a batch of random datasets for testing purposes.
 
         Parameters
         ----------
         batch_size : int, optional
-            Batch size override, if None, uses self.batch_size
+            Batch size override, if None, uses self.batch_size.
 
         Returns
         -------
         X : Tensor
-            Features tensor of shape (batch_size, seq_len, max_features).
+            Features tensor of shape ``(batch_size, seq_len, max_features)``.
             Contains random Gaussian values for all features.
 
         y : Tensor
-            Targets tensor of shape (batch_size, seq_len).
-            Contains randomly assigned class Targets.
+            Labels tensor of shape ``(batch_size, seq_len)``.
+            Contains randomly assigned class labels.
 
         d : Tensor
-            Number of features per dataset of shape (batch_size,).
+            Number of features per dataset of shape ``(batch_size,)``.
             Always set to max_features for DummyPrior.
 
         seq_lens : Tensor
-            Sequence length for each dataset of shape (batch_size,).
+            Sequence length for each dataset of shape ``(batch_size,)``.
             All datasets share the same sequence length.
 
         train_sizes : Tensor
-            Position for train/test split for each dataset of shape (batch_size,).
+            Position for train/test split for each dataset of shape ``(batch_size,)``.
             All datasets share the same split position.
         """
 
@@ -1240,72 +933,89 @@ class DummyPrior(Prior):
         X = torch.randn(batch_size, seq_len, self.max_features, device=self.device)
 
         num_classes = np.random.randint(2, self.max_classes + 1)
-        if self.regression:
-            y = torch.randn(batch_size, seq_len, device=self.device)
-        else:
-            y = torch.randint(0, num_classes, (batch_size, seq_len), device=self.device)
+        y = torch.randint(0, num_classes, (batch_size, seq_len), device=self.device)
 
         d = torch.full((batch_size,), self.max_features, device=self.device)
         seq_lens = torch.full((batch_size,), seq_len, device=self.device)
         train_sizes = torch.full((batch_size,), train_size, device=self.device)
 
+        if self.graph_backend:
+            params = {
+                "seq_len": seq_len,
+                "train_size": train_size,
+                "graph_num_graphs": self.graph_num_graphs,
+                "graph_min_train_neighbors": self.graph_min_train_neighbors,
+                "graph_max_train_neighbors": self.graph_max_train_neighbors,
+                "graph_cross_label_fraction": self.graph_cross_label_fraction,
+                "graph_train_neighbors_per_test": self.graph_train_neighbors_per_test,
+                "graph_seed": self.graph_seed,
+                "graph_share_across_batch": self.graph_share_across_batch,
+            }
+            graph_set = GraphPrior(
+                graph_v1_prob=self.graph_v1_prob,
+                graph_v2_prob=self.graph_v2_prob,
+                graph_prob=self.graph_prob,
+                min_train_neighbors=self.graph_min_train_neighbors,
+                max_train_neighbors=self.graph_max_train_neighbors,
+                cross_label_fraction=self.graph_cross_label_fraction,
+                train_neighbors_per_test=self.graph_train_neighbors_per_test,
+                seed=self.graph_seed,
+                share_graph_across_batch=self.graph_share_across_batch,
+            )(y, train_size, num_graphs=self.graph_num_graphs)
+            return X, y, d, seq_lens, train_sizes, graph_set
         return X, y, d, seq_lens, train_sizes
 
 
 class PriorDataset(IterableDataset):
-    """
-    Main dataset class that provides an infinite iterator over synthetic tabular datasets.
+    """Main dataset class that provides an infinite iterator over synthetic tabular datasets.
 
     Parameters
     ----------
-    regression : bool, default=False
-        If True, generates regression datasets. Otherwise, generates classification datasets.
-
     batch_size : int, default=256
-        Total number of datasets to generate per batch
+        Total number of datasets to generate per batch.
 
     batch_size_per_gp : int, default=4
-        Number of datasets per group, sharing similar characteristics
+        Number of datasets per group, sharing similar characteristics.
 
-    batch_size_per_subgp : int, default=None
-        Number of datasets per subgroup, with more similar causal structures
-        If None, defaults to batch_size_per_gp
+    batch_size_per_subgp : int, optional
+        Number of datasets per subgroup, with more similar causal structures.
+        If None, defaults to batch_size_per_gp.
 
     min_features : int, default=2
-        Minimum number of features per dataset
+        Minimum number of features per dataset.
 
     max_features : int, default=100
-        Maximum number of features per dataset
+        Maximum number of features per dataset.
 
     max_classes : int, default=10
-        Maximum number of target classes
+        Maximum number of target classes.
 
-    min_seq_len : int, default=None
+    min_seq_len : int, optional
         Minimum samples per dataset. If None, uses max_seq_len directly.
 
     max_seq_len : int, default=1024
-        Maximum samples per dataset
+        Maximum samples per dataset.
 
     log_seq_len : bool, default=False
-        If True, sample sequence length from a log-uniform distribution
+        If True, sample sequence length from a log-uniform distribution.
 
-    seq_len_per_gp : bool = False
-        If True, sample sequence length per group, allowing variable-sized datasets
+    seq_len_per_gp : bool, default=False
+        If True, sample sequence length per group, allowing variable-sized datasets.
 
-    min_train_size : int|float, default=0.1
+    min_train_size : int or float, default=0.1
         Position or ratio for train/test split start. If int, absolute position.
         If float between 0 and 1, specifies a fraction of sequence length.
 
-    max_train_size : int|float, default=0.9
+    max_train_size : int or float, default=0.9
         Position or ratio for train/test split end. If int, absolute position.
         If float between 0 and 1, specifies a fraction of sequence length.
 
     replay_small : bool, default=False
         If True, occasionally sample smaller sequence lengths with
-        specific distributions to ensure model robustness on smaller datasets
+        specific distributions to ensure model robustness on smaller datasets.
 
     prior_type : str, default="mlp_scm"
-        Type of prior: 'mlp_scm' (default), 'tree_scm', 'mix_scm', or 'dummy'
+        Type of prior: 'mlp_scm' (default), 'tree_scm', 'mix_scm', or 'dummy'.
 
         1. SCM-based: Structural causal models with complex feature relationships
          - 'mlp_scm': MLP-based causal models
@@ -1315,53 +1025,62 @@ class PriorDataset(IterableDataset):
         2. Dummy: Randomly generated datasets for debugging
 
     scm_fixed_hp : dict, default=DEFAULT_FIXED_HP
-        Fixed parameters for SCM-based priors
+        Fixed parameters for SCM-based priors.
 
     scm_sampled_hp : dict, default=DEFAULT_SAMPLED_HP
-        Parameters sampled during generation
-
-    config : PriorConfig | None, default=None
-        Prior configuration when using 'graph_scm' prior_type
+        Parameters sampled during generation.
 
     n_jobs : int, default=-1
-        Number of parallel jobs to run (-1 means using all processors)
+        Number of parallel jobs to run (-1 means using all processors).
 
     num_threads_per_generate : int, default=1
-        Number of threads per job for dataset generation
+        Number of threads per job for dataset generation.
 
     device : str, default="cpu"
-        Computation device ('cpu' or 'cuda')
+        Computation device ('cpu' or 'cuda').
     """
 
     def __init__(
-            self,
-            regression: bool = False,
-            batch_size: int = 256,
-            batch_size_per_gp: int = 4,
-            batch_size_per_subgp: Optional[int] = None,
-            min_features: int = 2,
-            max_features: int = 100,
-            max_classes: int = 10,
-            min_seq_len: Optional[int] = None,
-            max_seq_len: int = 1024,
-            log_seq_len: bool = False,
-            log_n_features: bool = False,
-            seq_len_per_gp: bool = False,
-            min_train_size: Union[int, float] = 0.1,
-            max_train_size: Union[int, float] = 0.9,
-            replay_small: bool = False,
-            prior_type: str = "mlp_scm",
-            scm_fixed_hp: Dict[str, Any] = DEFAULT_FIXED_HP,
-            scm_sampled_hp: Dict[str, Any] = DEFAULT_SAMPLED_HP,
-            config: Optional[PriorConfig] = None,
-            n_jobs: int = -1,
-            num_threads_per_generate: int = 1,
-            device: str = "cpu",
+        self,
+        batch_size: int = 256,
+        batch_size_per_gp: int = 4,
+        batch_size_per_subgp: Optional[int] = None,
+        min_features: int = 2,
+        max_features: int = 100,
+        max_classes: int = 10,
+        min_seq_len: Optional[int] = None,
+        max_seq_len: int = 1024,
+        log_seq_len: bool = False,
+        seq_len_per_gp: bool = False,
+        min_train_size: Union[int, float] = 0.1,
+        max_train_size: Union[int, float] = 0.9,
+        replay_small: bool = False,
+        prior_type: str = "nanotabicl",
+        scm_fixed_hp: Dict[str, Any] = DEFAULT_FIXED_HP,
+        scm_sampled_hp: Dict[str, Any] = DEFAULT_SAMPLED_HP,
+        n_jobs: int = -1,
+        num_threads_per_generate: int = 1,
+        device: str = "cpu",
+        normalization: str = "none",
+        graph_num_graphs: int = 1,
+        graph_backend: Optional[bool] = None,
+        graph_min_train_neighbors: int = 8,
+        graph_max_train_neighbors: int = 15,
+        graph_cross_label_fraction: float = 0.1,
+        graph_train_neighbors_per_test: int = 8,
+        graph_seed: Optional[int] = None,
+        graph_share_across_batch: bool = False,
+        graph_v1_prob: float = 1.0,
+        graph_v2_prob: float = 0.0,
+        graph_prob: float = 0.0,
     ):
         super().__init__()
+        # None preserves the historical direct-PriorDataset behavior. Training
+        # code passes an explicit backend flag, so non-graph backends stay on
+        # the original five-field path.
+        self.graph_backend = True if graph_backend is None else bool(graph_backend)
         if prior_type == "dummy":
             self.prior = DummyPrior(
-                regression=regression,
                 batch_size=batch_size,
                 min_features=min_features,
                 max_features=max_features,
@@ -1372,10 +1091,20 @@ class PriorDataset(IterableDataset):
                 min_train_size=min_train_size,
                 max_train_size=max_train_size,
                 device=device,
+                graph_backend=self.graph_backend,
+                graph_num_graphs=graph_num_graphs,
+                graph_min_train_neighbors=graph_min_train_neighbors,
+                graph_max_train_neighbors=graph_max_train_neighbors,
+                graph_cross_label_fraction=graph_cross_label_fraction,
+                graph_train_neighbors_per_test=graph_train_neighbors_per_test,
+                graph_seed=graph_seed,
+                graph_share_across_batch=graph_share_across_batch,
+                graph_v1_prob=graph_v1_prob,
+                graph_v2_prob=graph_v2_prob,
+                graph_prob=graph_prob,
             )
-        elif prior_type in ["mlp_scm", "tree_scm", "mix_scm"]:
+        elif prior_type in ["mlp_scm", "tree_scm", "mix_scm", "nanotabicl"]:
             self.prior = SCMPrior(
-                regression=regression,
                 batch_size=batch_size,
                 batch_size_per_gp=batch_size_per_gp,
                 batch_size_per_subgp=batch_size_per_subgp,
@@ -1385,7 +1114,6 @@ class PriorDataset(IterableDataset):
                 min_seq_len=min_seq_len,
                 max_seq_len=max_seq_len,
                 log_seq_len=log_seq_len,
-                log_n_features=log_n_features,
                 seq_len_per_gp=seq_len_per_gp,
                 min_train_size=min_train_size,
                 max_train_size=max_train_size,
@@ -1396,42 +1124,29 @@ class PriorDataset(IterableDataset):
                 n_jobs=n_jobs,
                 num_threads_per_generate=num_threads_per_generate,
                 device=device,
-                config=config,
-            )
-        elif prior_type == "graph_scm":
-            self.prior = GraphPrior(
-                regression=regression,
-                batch_size=batch_size,
-                batch_size_per_gp=batch_size_per_gp,
-                batch_size_per_subgp=batch_size_per_subgp,
-                min_features=min_features,
-                max_features=max_features,
-                max_classes=max_classes,
-                min_seq_len=min_seq_len,
-                max_seq_len=max_seq_len,
-                log_seq_len=log_seq_len,
-                log_n_features=log_n_features,
-                seq_len_per_gp=seq_len_per_gp,
-                min_train_size=min_train_size,
-                max_train_size=max_train_size,
-                replay_small=replay_small,
-                config=config,
-                n_jobs=n_jobs,
-                num_threads_per_generate=num_threads_per_generate,
-                device=device,
+                graph_backend=self.graph_backend,
+                graph_num_graphs=graph_num_graphs,
+                graph_min_train_neighbors=graph_min_train_neighbors,
+                graph_max_train_neighbors=graph_max_train_neighbors,
+                graph_cross_label_fraction=graph_cross_label_fraction,
+                graph_train_neighbors_per_test=graph_train_neighbors_per_test,
+                graph_seed=graph_seed,
+                graph_share_across_batch=graph_share_across_batch,
+                graph_v1_prob=graph_v1_prob,
+                graph_v2_prob=graph_v2_prob,
+                graph_prob=graph_prob,
             )
         else:
             raise ValueError(
-                f"Unknown prior type '{prior_type}'. Available options: 'mlp_scm', 'tree_scm', 'mix_scm', 'graph_scm', or 'dummy'."
+                f"Unknown prior type '{prior_type}'. Available options: 'mlp_scm', 'tree_scm', 'mix_scm', 'nanotabicl', or 'dummy'."
             )
 
-        self.regression = regression
         self.batch_size = batch_size
         self.batch_size_per_gp = batch_size_per_gp
         self.batch_size_per_subgp = batch_size_per_subgp or batch_size_per_gp
         self.min_features = min_features
         self.max_features = max_features
-        self.max_classes = 0 if regression else max_classes
+        self.max_classes = max_classes
         self.min_seq_len = min_seq_len
         self.max_seq_len = max_seq_len
         self.log_seq_len = log_seq_len
@@ -1440,67 +1155,84 @@ class PriorDataset(IterableDataset):
         self.max_train_size = max_train_size
         self.device = device
         self.prior_type = prior_type
+        if normalization not in ("none", "std", "robust"):
+            raise ValueError("normalization must be one of: 'none', 'std', 'robust'")
+        self.normalization = normalization
+        self.graph_num_graphs = int(graph_num_graphs)
+        self.graph_min_train_neighbors = graph_min_train_neighbors
+        self.graph_max_train_neighbors = graph_max_train_neighbors
+        self.graph_cross_label_fraction = graph_cross_label_fraction
+        self.graph_train_neighbors_per_test = graph_train_neighbors_per_test
+        self.graph_seed = graph_seed
+        self.graph_share_across_batch = graph_share_across_batch
 
-    def get_batch(self, batch_size: Optional[int] = None) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        """
-        Generate a new batch of datasets.
+    def get_batch(self, batch_size: Optional[int] = None) -> tuple:
+        """Generate a new batch of datasets.
 
         Parameters
         ----------
         batch_size : int, optional
-            If provided, overrides the default batch size for this call
+            If provided, overrides the default batch size for this call.
 
         Returns
         -------
         X : Tensor or NestedTensor
             1. For SCM-based priors:
-             - If seq_len_per_gp=False, shape is (batch_size, seq_len, max_features).
+             - If seq_len_per_gp=False, shape is ``(batch_size, seq_len, max_features)``.
              - If seq_len_per_gp=True, returns a NestedTensor.
 
-            2. For DummyPrior, random Gaussian values of (batch_size, seq_len, max_features).
+            2. For DummyPrior, random Gaussian values of
+            ``(batch_size, seq_len, max_features)``.
 
         y : Tensor or NestedTensor
             1. For SCM-based priors:
-             - If seq_len_per_gp=False, shape is (batch_size, seq_len).
+             - If seq_len_per_gp=False, shape is ``(batch_size, seq_len)``.
              - If seq_len_per_gp=True, returns a NestedTensor.
 
-            2. For DummyPrior, random class Targets of (batch_size, seq_len).
+            2. For DummyPrior, random class labels of ``(batch_size, seq_len)``.
 
         d : Tensor
-            Number of active features per dataset of shape (batch_size,).
+            Number of active features per dataset of shape ``(batch_size,)``.
 
         seq_lens : Tensor
-            Sequence length for each dataset of shape (batch_size,).
+            Sequence length for each dataset of shape ``(batch_size,)``.
 
         train_sizes : Tensor
-            Position for train/test split for each dataset of shape (batch_size,).
+            Position for train/test split for each dataset of shape ``(batch_size,)``.
         """
-        return self.prior.get_batch(batch_size or self.batch_size)
+
+        batch = self.prior.get_batch(batch_size)
+        if self.graph_backend:
+            X, y, d, seq_lens, train_sizes, graph_sets = batch
+        else:
+            X, y, d, seq_lens, train_sizes = batch
+        X = normalize_batch(X, d, seq_lens, train_sizes, self.normalization)
+        if self.graph_backend:
+            return X, y, d, seq_lens, train_sizes, graph_sets
+        return X, y, d, seq_lens, train_sizes
 
     def __iter__(self) -> "PriorDataset":
-        """
-        Returns an iterator that yields batches indefinitely.
+        """Return an iterator that yields batches indefinitely.
 
         Returns
         -------
         self
-            Returns self as an iterator
+            Returns self as an iterator.
         """
         return self
 
     def __next__(self) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Return the next batch from the iterator.
+
+        Since this is an infinite iterator, it never raises StopIteration
+        and instead continuously generates new synthetic data batches.
         """
-        Returns the next batch from the iterator. Since this is an infinite
-        iterator, it never raises StopIteration and instead continuously generates
-        new synthetic data batches.
-        """
-        # with DisablePrinting():
-        #     return self.get_batch()
+        #with DisablePrinting():
+        #    return self.get_batch()
         return self.get_batch()
 
     def __repr__(self) -> str:
-        """
-        Returns a string representation of the dataset.
+        """Return a string representation of the dataset.
 
         Provides a detailed view of the dataset configuration for debugging
         and logging purposes.
@@ -1508,11 +1240,10 @@ class PriorDataset(IterableDataset):
         Returns
         -------
         str
-            A formatted string with dataset parameters
+            A formatted string with dataset parameters.
         """
         return (
             f"PriorDataset(\n"
-            f"  task: {'regression' if self.regression else 'classification'}\n"
             f"  prior_type: {self.prior_type}\n"
             f"  batch_size: {self.batch_size}\n"
             f"  batch_size_per_gp: {self.batch_size_per_gp}\n"
@@ -1521,6 +1252,7 @@ class PriorDataset(IterableDataset):
             f"  seq_len: {self.min_seq_len or 'None'} - {self.max_seq_len}\n"
             f"  sequence length varies across groups: {self.seq_len_per_gp}\n"
             f"  train_size: {self.min_train_size} - {self.max_train_size}\n"
+            f"  normalization: {self.normalization}\n"
             f"  device: {self.device}\n"
             f")"
         )
@@ -1536,119 +1268,3 @@ class DisablePrinting:
     def __exit__(self, exc_type, exc_val, exc_tb):
         sys.stdout.close()
         sys.stdout = self.original_stdout
-
-
-def should_filter(
-        X: torch.Tensor,
-        y: torch.Tensor,
-        config: PriorConfig,
-        *,
-        is_classif: bool,
-        n_estimators: int = 25,
-        n_boot: int = 200,
-) -> bool:
-    if not (config.remove_trivial_datasets or config.filter_unpredictable_datasets):
-        return False
-
-    if is_classif:
-        y_int = y.to(torch.long)
-        C = int(y_int.max().item() + 1)
-        Y = F.one_hot(y_int, num_classes=C).to(torch.float32)  # (n, C)
-        if C == 2:
-            # drop one dimension to make it faster
-            Y = Y[:, :1]
-    else:
-        Y = y.reshape(-1, 1).to(torch.float32)  # (n, 1)
-
-    # sklearn needs numpy
-    X_np = X.detach().cpu().numpy()
-    Y_np = Y.detach().cpu().numpy()
-
-    # do the squeeze to avoid a sklearn warning
-    et = ExtraTreesRegressor(
-        n_estimators=n_estimators,
-        bootstrap=True,
-        oob_score=True,
-        n_jobs=1,
-        random_state=1,  # don't set to 0 because it doesn't give OOB scores for all samples for some 133 <= n <= 257
-        max_depth=6,  # make it faster
-    ).fit(X_np, np.squeeze(Y_np, axis=-1) if Y_np.shape[-1] == 1 else Y_np)
-
-    Yhat = et.oob_prediction_  # (n, d)
-    if len(Yhat.shape) == 1:
-        Yhat = Yhat[:, None]
-    mask = ~np.isnan(Yhat).any(axis=1)  # keep valid OOB rows
-    Yv, Yhatv = Y_np[mask], Yhat[mask]
-
-    baseline = Y_np.mean(axis=0, keepdims=True)  # (1, d)
-    imp = ((Yv - baseline) ** 2).sum(axis=1) - ((Yv - Yhatv) ** 2).sum(axis=1)
-
-    baseline_mse = ((Yv - baseline) ** 2).sum(axis=1).mean()
-    extratrees_mse = ((Yv - Yhatv) ** 2).sum(axis=1).mean()
-
-    # Vectorized bootstrap (no retraining)
-    rng = np.random.default_rng(0)
-    n = imp.shape[0]
-    idx = rng.integers(0, n, size=(n_boot, n))
-    pval = float(np.mean(imp[idx].mean(axis=1) <= 0.0))
-
-    if config.remove_trivial_datasets and np.sqrt(extratrees_mse) <= config.trivial_dataset_threshold * np.sqrt(baseline_mse):
-        return True
-    if config.filter_unpredictable_datasets and pval >= 0.05:
-        return True
-    return False
-
-
-def compute_predictability_pvalue(
-        X: torch.Tensor,
-        y: torch.Tensor,
-        *,
-        is_classif: bool,
-        n_estimators: int = 25,
-        n_boot: int = 200,
-) -> float:
-    """
-    Single-fit ExtraTreesRegressor with OOB predictions.
-    Metric: MSE (== multiclass Brier; binary up to a constant factor).
-    Baseline: mean target (== class-prior vector for classification).
-    Returns a one-sided bootstrap p-value for 'model > baseline'.
-    """
-    if is_classif:
-        y_int = y.to(torch.long)
-        C = int(y_int.max().item() + 1)
-        Y = F.one_hot(y_int, num_classes=C).to(torch.float32)  # (n, C)
-        if C == 2:
-            # drop one dimension to make it faster
-            Y = Y[:, :1]
-    else:
-        Y = y.reshape(-1, 1).to(torch.float32)  # (n, 1)
-
-    # sklearn needs numpy
-    X_np = X.detach().cpu().numpy()
-    Y_np = Y.detach().cpu().numpy()
-
-    # do the squeeze to avoid a sklearn warning
-    et = ExtraTreesRegressor(
-        n_estimators=n_estimators,
-        bootstrap=True,
-        oob_score=True,
-        n_jobs=1,
-        random_state=1,  # don't set to 0 because it doesn't give OOB scores for all samples for some 133 <= n <= 257
-        max_depth=6,  # make it faster
-    ).fit(X_np, np.squeeze(Y_np, axis=-1) if Y_np.shape[-1] == 1 else Y_np)
-
-    Yhat = et.oob_prediction_  # (n, d)
-    if len(Yhat.shape) == 1:
-        Yhat = Yhat[:, None]
-    mask = ~np.isnan(Yhat).any(axis=1)  # keep valid OOB rows
-    Yv, Yhatv = Y_np[mask], Yhat[mask]
-
-    baseline = Y_np.mean(axis=0, keepdims=True)  # (1, d)
-    imp = ((Yv - baseline) ** 2).sum(axis=1) - ((Yv - Yhatv) ** 2).sum(axis=1)
-
-    # Vectorized bootstrap (no retraining)
-    rng = np.random.default_rng(0)
-    n = imp.shape[0]
-    idx = rng.integers(0, n, size=(n_boot, n))
-    pval = float(np.mean(imp[idx].mean(axis=1) <= 0.0))
-    return pval

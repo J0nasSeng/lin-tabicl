@@ -21,6 +21,7 @@ from sklearn.preprocessing import (
     QuantileTransformer,
     RobustScaler,
 )
+from sklearn.decomposition import PCA
 from sklearn.utils.validation import check_is_fitted
 
 from .sklearn_utils import validate_data
@@ -178,6 +179,52 @@ class TransformToNumerical(TransformerMixin, BaseEstimator):
             Transformed array with numerical representations.
         """
         return self.tfm_.transform(X)
+
+
+class FeatureReducer(TransformerMixin, BaseEstimator):
+    """Reduce numerical features with PCA or UMAP."""
+
+    def __init__(self, method: str, n_components: int, random_state: Optional[int] = None):
+        self.method = method
+        self.n_components = n_components
+        self.random_state = random_state
+
+    def fit(self, X, y=None):
+        X = np.asarray(X)
+        if self.method not in {"pca", "umap"}:
+            raise ValueError("method must be either 'pca' or 'umap'.")
+        if not isinstance(self.n_components, (int, np.integer)) or self.n_components <= 0:
+            raise ValueError("n_components must be a positive integer.")
+        if self.n_components > X.shape[1]:
+            raise ValueError(
+                f"n_components={self.n_components} cannot exceed the number of input features ({X.shape[1]})."
+            )
+
+        if self.method == "pca":
+            if self.n_components > min(X.shape):
+                raise ValueError(
+                    f"n_components={self.n_components} cannot exceed min(n_samples, n_features)={min(X.shape)} for PCA."
+                )
+            self.reducer_ = PCA(n_components=self.n_components, random_state=self.random_state)
+        else:
+            try:
+                from umap import UMAP
+            except ImportError as exc:  # pragma: no cover - dependency is declared
+                raise ImportError("UMAP reduction requires the 'umap-learn' package.") from exc
+            self.reducer_ = UMAP(n_components=self.n_components, random_state=self.random_state)
+
+        self.reducer_.fit(X)
+        self.n_features_in_ = X.shape[1]
+        return self
+
+    def transform(self, X):
+        check_is_fitted(self, ["reducer_"])
+        X = np.asarray(X)
+        if X.shape[1] != self.n_features_in_:
+            raise ValueError(
+                f"X has {X.shape[1]} features, but the fitted reducer expects {self.n_features_in_}."
+            )
+        return self.reducer_.transform(X)
 
 
 class UniqueFeatureFilter(TransformerMixin, BaseEstimator):

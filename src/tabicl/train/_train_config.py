@@ -2,22 +2,9 @@
 
 import argparse
 
-from tabicl.prior.graph_lib._config import PriorConfig
-
 
 def str2bool(value):
     return value.lower() == "true"
-
-
-def bool_or_str(value):
-    """Parse ``"true"``/``"false"`` into a bool, otherwise pass the string through.
-
-    Used for ``--col_feature_group``, which is either ``False`` (no grouping, the value
-    stored in the checkpoint configs) or a named grouping mode (``"same"`` or ``"valid"``).
-    """
-    if value.lower() in ("true", "false"):
-        return value.lower() == "true"
-    return value
 
 
 def train_size_type(value):
@@ -62,14 +49,26 @@ def build_parser():
     ###########################################################################
     parser.add_argument("--device", default="cuda", type=str, help="Device for training: cpu, cuda, cuda:0")
     parser.add_argument(
-        "--dtype", default="float32", type=str, help="Data type (supported for float16, float32) used for training"
+        "--dtype",
+        default="float32",
+        type=str,
+        choices=["float16", "bfloat16", "float32"],
+        help="Data type (supported: float16, bfloat16, float32) used for training",
     )
     parser.add_argument("--np_seed", type=int, default=42, help="Random seed for numpy")
     parser.add_argument("--torch_seed", type=int, default=42, help="Random seed for torch")
     parser.add_argument("--max_steps", type=int, default=60000, help="Training steps")
-    parser.add_argument("--batch_size", type=int, default=512, help="Batch size")
     parser.add_argument(
-        "--micro_batch_size", type=int, default=8, help="Size of micro-batches for gradient accumulation"
+        "--batch_size",
+        type=int,
+        default=512,
+        help="Logical number of datasets processed per optimizer update",
+    )
+    parser.add_argument(
+        "--micro_batch_size",
+        type=int,
+        default=8,
+        help="Number of datasets generated and processed per streamed micro-batch",
     )
     parser.add_argument(
         "--log_conf_mat_every",
@@ -111,23 +110,6 @@ def build_parser():
     parser.add_argument("--gradient_clipping", type=float, default=1.0, help="If > 0, clip gradients.")
     parser.add_argument("--weight_decay", type=float, default=0, help="Weight decay / L2 regularization penalty")
     parser.add_argument(
-        "--muon",
-        default=False,
-        type=str2bool,
-        help="If True, use the Muon optimizer instead of AdamW. All parameters are placed in a "
-        "single Muon group and updated via Newton-Schulz orthogonalization (non-2D parameters "
-        "are reshaped to 2D for this).",
-    )
-    parser.add_argument("--beta1", type=float, default=0.9, help="First moment decay (AdamW beta1 / Muon momentum)")
-    parser.add_argument("--beta2", type=float, default=0.999, help="Second moment decay for AdamW (not used by Muon)")
-    parser.add_argument(
-        "--use_cautious_wd",
-        default=False,
-        type=str2bool,
-        help="If True, use cautious weight decay for Muon (only decay where update and parameter share sign). "
-        "Note: the released TabICLv2 checkpoints were trained with this left at False.",
-    )
-    parser.add_argument(
         "--cosine_num_cycles",
         type=int,
         default=1,
@@ -166,9 +148,21 @@ def build_parser():
         type=str2bool,
         help="Delete prior data after loading. Only used when prior_dir is set.",
     )
-    parser.add_argument("--batch_size_per_gp", type=int, default=4, help="Batch size per group")
+    parser.add_argument(
+        "--batch_size_per_gp",
+        type=int,
+        default=8,
+        help="Datasets per generated homogeneous micro-batch; must equal micro_batch_size",
+    )
     parser.add_argument("--min_features", type=int, default=5, help="The minimum number of features")
     parser.add_argument("--max_features", type=int, default=100, help="The maximum number of features")
+    parser.add_argument(
+        "--train-col-embed-only",
+        "--train_col_embed_only",
+        default=False,
+        type=str2bool,
+        help="Stage 1.5 mode: expand and train only the TabICL column embedder from a checkpoint",
+    )
     parser.add_argument("--max_classes", type=int, default=10, help="The maximum number of classes")
     parser.add_argument("--min_seq_len", type=int, default=None, help="Minimum samples per dataset")
     parser.add_argument("--max_seq_len", type=int, default=1024, help="Maximum samples per dataset")
@@ -203,35 +197,19 @@ def build_parser():
         help="If True, occasionally sample smaller sequence lengths to ensure model robustness on smaller datasets",
     )
     parser.add_argument(
-        "--prior_type", default="mix_scm", type=str, help="Prior type: dummy, mlp_scm, tree_scm, mix_scm"
+        "--prior_type",
+        default="mix_scm",
+        type=str,
+        help="Prior type: dummy, mlp_scm, tree_scm, mix_scm, nanotabicl",
     )
     parser.add_argument("--prior_device", default="cpu", type=str, help="Device for prior data generation")
     parser.add_argument(
-        "--n_jobs",
-        type=int,
-        default=-1,
-        help="Number of dataloader workers for on-the-fly prior generation. If <= 0, use the number of "
-        "physical CPU cores. Ignored when loading pre-generated data from prior_dir.",
+        "--normalization",
+        choices=("none", "std", "robust"),
+        default="none",
+        help="Optional feature normalization applied before the model (default: none).",
     )
-    parser.add_argument(
-        "--log_n_features",
-        default=False,
-        type=str2bool,
-        help="If True, sample the number of features from a log-uniform distribution.",
-    )
-    parser.add_argument(
-        "--regression_method",
-        default=None,
-        type=str,
-        help="If None, train for classification. If 'quantile', train for quantile regression with a "
-        "pinball loss (requires num_quantiles > 0). Other values are not supported.",
-    )
-    parser.add_argument(
-        "--num_quantiles",
-        type=int,
-        default=999,
-        help="Number of quantiles predicted for regression. Only used when regression_method is set.",
-    )
+    parser.add_argument("--recompute", default=False, type=bool, help="If True, apply checkpointing in forward pass")
 
     ###########################################################################
     ##### Model Architecture Config ###########################################
@@ -249,12 +227,11 @@ def build_parser():
         help="If True, compile the model using torch.compile for speedup",
     )
     parser.add_argument(
-        "--ignore_d",
-        default=True,
-        type=str2bool,
-        help="If True (the v2 default), ignore the per-dataset feature count d during training and "
-        "pass d=None to the model. This lets the model's feature grouping operate over all (padded) "
-        "columns and works with variable-feature priors such as graph_scm.",
+        "--model_type",
+        type=str,
+        default="tabicl",
+        choices=["tabicl", "nanotabicl"],
+        help="Model architecture to train: full TabICL or lightweight NanoTabICL",
     )
 
     # Column Embedding Config
@@ -262,40 +239,6 @@ def build_parser():
     parser.add_argument("--col_num_blocks", type=int, default=3, help="Number of blocks in column embedder")
     parser.add_argument("--col_nhead", type=int, default=4, help="Number of attention heads in column embedder")
     parser.add_argument("--col_num_inds", type=int, default=128, help="Number of inducing points in column embedder")
-    parser.add_argument(
-        "--col_affine",
-        default=True,
-        type=str2bool,
-        help="If True (TabICLv1), the column embedder produces per-column affine weights/biases. "
-        "TabICLv2 uses False.",
-    )
-    parser.add_argument(
-        "--col_feature_group",
-        default=False,
-        type=bool_or_str,
-        help="Feature grouping mode in the column embedder: False (no grouping, TabICLv1), "
-        "'same' (repeated feature grouping through circular shifts, TabICLv2), or 'valid' "
-        "(disjoint groups of consecutive columns, TabPFN-style).",
-    )
-    parser.add_argument(
-        "--col_feature_group_size",
-        default=3,
-        type=int,
-        help="Number of columns per feature group. Only used when --col_feature_group is not False.",
-    )
-    parser.add_argument(
-        "--col_target_aware",
-        default=False,
-        type=str2bool,
-        help="If True (TabICLv2), add target embeddings to the training rows of every column "
-        "before the column set transformer. TabICLv1 uses False.",
-    )
-    parser.add_argument(
-        "--col_ssmax",
-        default=False,
-        type=str2bool,
-        help="Whether to use SSMax in the column embedder (the variant is chosen by --ssmax_type)",
-    )
     parser.add_argument("--freeze_col", default=False, type=str2bool, help="Whether to freeze the column embedder")
 
     # Row Interaction Config
@@ -303,32 +246,93 @@ def build_parser():
     parser.add_argument("--row_nhead", type=int, default=8, help="Number of attention heads in row interactor")
     parser.add_argument("--row_num_cls", type=int, default=4, help="Number of CLS tokens in row interactor")
     parser.add_argument("--row_rope_base", type=float, default=100000, help="RoPE base value for row interactor")
-    parser.add_argument(
-        "--row_rope_interleaved",
-        default=True,
-        type=str2bool,
-        help="RoPE rotation layout in the row interactor: True = interleaved dimension pairs "
-        "(TabICLv1), False = split-half rotation (TabICLv2). The two are not equivalent.",
-    )
     parser.add_argument("--freeze_row", default=False, type=str2bool, help="Whether to freeze the row interactor")
 
     # ICL Config
     parser.add_argument("--icl_num_blocks", type=int, default=12, help="Number of transformer blocks in ICL predictor")
+    parser.add_argument(
+        "--graph_num_graphs",
+        type=int,
+        default=None,
+        help="Number of independently sampled graphs; defaults to one graph per ICL block",
+    )
     parser.add_argument("--icl_nhead", type=int, default=4, help="Number of attention heads in ICL predictor")
     parser.add_argument(
-        "--icl_ssmax",
+        "--icl_backend",
+        type=str,
+        default="graph",
+        choices=[
+            "encoder", "graph", "graph-pyg", "graph-2d", "graph-2d-pyg", "graph-1d", "graph-1d-pyg"
+        ],
+        help="ICL backbone type: encoder, legacy graph, or PyTorch Geometric graph",
+    )
+    parser.add_argument(
+        "--icl_decoder_type",
+        type=str,
+        default="mlp",
+        choices=["mlp", "soft_kmeans", "rbf", "euclidean"],
+        help="ICL decoder type: MLP, dot-product soft_kmeans, RBF, or Euclidean-distance assignment decoder",
+    )
+    parser.add_argument(
+        "--icl_soft_kmeans_temperature",
+        type=float,
+        default=1.0,
+        help="Temperature for soft_kmeans similarity, RBF bandwidth, or Euclidean assignment",
+    )
+    parser.add_argument(
+        "--label_smoothing",
+        type=float,
+        default=0.1,
+        help="Label-smoothing factor used by the classification cross-entropy loss",
+    )
+    parser.add_argument(
+        "--learnable-residual",
+        "--learnable_residual",
+        dest="learnable_residual",
         default=False,
         type=str2bool,
-        help="Whether to use SSMax in the ICL predictor (the variant is chosen by --ssmax_type)",
+        help="Use learnable sigmoid-alpha GAT residual mixing instead of a standard residual connection",
     )
-    parser.add_argument("--freeze_icl", default=False, type=str2bool, help="Whether to freeze the ICL predictor")
     parser.add_argument(
-        "--ssmax_type",
-        default="ssmax",
-        type=str,
-        help="SSMax variant used where --col_ssmax/--icl_ssmax is True: 'ssmax', 'ssmax-mlp', "
-        "'ssmax-mlp-elementwise', 'qassmax-mlp', or 'qassmax-mlp-elementwise' (TabICLv2).",
+        "--graph_min_train_neighbors",
+        type=int,
+        default=8,
+        help="Minimum train-train incoming neighbors per train node for graph ICL backend",
     )
+    parser.add_argument(
+        "--graph_max_train_neighbors",
+        type=int,
+        default=15,
+        help="Maximum train-train incoming neighbors per train node for graph ICL backend",
+    )
+    parser.add_argument(
+        "--graph_cross_label_fraction",
+        type=float,
+        default=0.1,
+        help="Fraction of train-train edges connecting different labels",
+    )
+    parser.add_argument(
+        "--graph_train_neighbors_per_test",
+        type=int,
+        default=8,
+        help="Minimum number of train neighbors per class for each test node",
+    )
+    parser.add_argument(
+        "--graph_seed",
+        type=int,
+        default=None,
+        help="Optional random seed for deterministic graph sampling",
+    )
+    parser.add_argument(
+        "--graph_share_across_batch",
+        default=False,
+        type=str2bool,
+        help="If True, reuse one graph for all items in a batch",
+    )
+    parser.add_argument("--graph_v1_prob", type=float, default=1.0, help="Weight for the legacy v1 graph prior")
+    parser.add_argument("--graph_v2_prob", type=float, default=0.0, help="Weight for the tabular v2 graph prior")
+    parser.add_argument("--graph_prob", type=float, default=0.0, help="Weight for the full graph prior")
+    parser.add_argument("--freeze_icl", default=False, type=str2bool, help="Whether to freeze the ICL predictor")
 
     # Shared Architecture Config
     parser.add_argument("--ff_factor", type=int, default=2, help="Expansion factor for feedforward dimensions")
@@ -336,34 +340,6 @@ def build_parser():
     parser.add_argument("--activation", type=str, default="gelu", help="Activation function type")
     parser.add_argument(
         "--norm_first", default=True, type=str2bool, help="If True, use pre-norm transformer architecture"
-    )
-    parser.add_argument(
-        "--norm_type",
-        default="default",
-        type=str,
-        help="Normalization type: 'default' (LayerNorm with bias) or 'layernorm_nobias' (LayerNorm without bias, "
-        "used by the TabICLv2 regression checkpoint; the v2 classifier uses the default).",
-    )
-    parser.add_argument(
-        "--zero_init",
-        default=True,
-        type=str2bool,
-        help="If True (TabICLv1), zero-initialize attention output projections and second feedforward "
-        "linears so residual branches start as identity. TabICLv2 pre-training uses False "
-        "(standard PyTorch initialization).",
-    )
-    parser.add_argument(
-        "--use_flash_attn3",
-        default=False,
-        type=str2bool,
-        help="If True, use FlashAttention-3 during training when it is installed (attention runs in fp16). "
-        "The TabICLv2 recipe enables this only for pre-training stages 2 and 3.",
-    )
-    parser.add_argument(
-        "--recompute",
-        default=False,
-        type=str2bool,
-        help="If True, use gradient checkpointing (activation recomputation) to reduce memory at the cost of speed.",
     )
 
     ###########################################################################
@@ -380,13 +356,5 @@ def build_parser():
     )
     parser.add_argument("--checkpoint_path", default=None, type=str, help="Path to specific checkpoint file to load")
     parser.add_argument("--only_load_model", default=False, type=str2bool, help="Whether to only load model weights")
-
-    ###########################################################################
-    ###### Graph prior (graph_scm) config #####################################
-    ###########################################################################
-    # Adds the graph_scm PriorConfig options (e.g. --graph_noise, --filter_unpredictable_graphs,
-    # --max_n_nodes, --cauchy_dag_offset, ...) using the same names as the standalone generator.
-    # These are only used when --prior_type graph_scm and on-the-fly generation is enabled.
-    PriorConfig.add_args_to_parser(parser)
 
     return parser

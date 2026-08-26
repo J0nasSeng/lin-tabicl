@@ -172,8 +172,11 @@ class MemoryEstimator:
         """
         if target_memory <= 0:
             return 1
-        coefs = MemoryEstimator.coefficients[enc_name]
-        intercept = MemoryEstimator.intercepts[enc_name]
+        # Graph backends use the same sequence-level batching machinery but do
+        # not yet have separately profiled coefficients. Fall back to the ICL
+        # encoder estimate rather than failing during inference setup.
+        coefs = MemoryEstimator.coefficients.get(enc_name, MemoryEstimator.coefficients["tf_icl"])
+        intercept = MemoryEstimator.intercepts.get(enc_name, MemoryEstimator.intercepts["tf_icl"])
 
         numerator = target_memory - coefs[1] * seq_len - intercept
         denominator = coefs[0] + coefs[2] * seq_len

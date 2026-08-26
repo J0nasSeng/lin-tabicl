@@ -1,31 +1,7 @@
 In development
 ==============
 
-New features
-------------
-
-- Add TabICLv2 pre-training code (`python -m tabicl.train`): quantile regression training via a
-  pinball loss (`--regression_method quantile`) in addition to classification, and the Muon
-  optimizer (`--muon True`) alongside AdamW. The training CLI now also exposes the `graph_scm`
-  prior options, layernorm-without-bias (`--norm_type layernorm_nobias`), SSMax
-  (`--col_ssmax`/`--icl_ssmax` with `--ssmax_type`), feature grouping and target-aware embeddings
-  (`--col_feature_group`, `--col_target_aware`, `--col_affine`), the RoPE variant
-  (`--row_rope_interleaved`; v1 interleaved by default, v2 uses `False`), residual initialization
-  (`--zero_init`; v2 uses `False`), and FlashAttention-3 during training (`--use_flash_attn3`;
-  the v2 recipe enables it for stages 2 and 3 only). All CLI defaults reproduce the TabICLv1
-  model configuration; resuming a run re-seeds the data stream with the current step. Ships the
-  three-stage TabICLv2 curriculum scripts, separately for the classifier and regressor
-  checkpoints (`scripts/train_v2_{clf,reg}_stage{1,2,3}.sh`).
-
-Bug fixes
----------
-
-- When unpickling a TabICL estimator, the fitted attributes `device_`, `model_`, etc. are only state if the pickled model was fitted. ([PR#121](https://github.com/soda-inria/tabicl/pull/121))
-
-- Improve non-CUDA GPU inference reliability and performance (including XPU): inference now consistently runs on the configured backend device, uses backend-appropriate autocast, and queries available memory plus async stream/event primitives through backend-agnostic `torch.<backend>` APIs (with safe synchronous fallbacks when async is unavailable). This fixes pathological auto-batch sizing (e.g. batch size forced to 1) and restores expected accelerated inference behavior on supported non-CUDA GPU backends. When `device=None`, estimators now default to CUDA when available, otherwise XPU, then MPS, and then CPU. ([PR#144](https://github.com/soda-inria/tabicl/pull/144))
-
-- Improve Apple Silicon MPS inference: MPS now uses the same AMP, auto-batching, and memory-aware inference path as other accelerators instead of falling back to the CPU path. `use_amp="auto"` is device-aware (off on CPU; size heuristic on CUDA/XPU/MPS), and float16 KV caches are kept on MPS when AMP is enabled. MPS is included in the default device order (CUDA → XPU → MPS → CPU). ([PR#144](https://github.com/soda-inria/tabicl/pull/144))
-
+- Store generated graph edge indices as signed 32-bit integers, removing the previous 65,535-node limit for class-conditioned graphs. Existing model checkpoints remain compatible, and legacy serialized graph batches are normalized when loaded. Large graphs remain subject to available memory and attention limits.
 
 2.1.0
 =====

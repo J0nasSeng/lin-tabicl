@@ -141,21 +141,14 @@ docs/tutorials/
 
 # logs
 wandb/
-checkpoints/
-# Claude Code local sandbox/workflow artifacts
-.venv/
-.claude/settings.local.json
-
-# Downloaded reference papers (local only)
-papers/
-
-CLAUDE.md
-ckpts/
-src_private/
-
-# evals
-eval/
-gat_eval/
-gat_investigation/
-data/
 checkpoints*
+gat_eval/
+prior_eval/
+gat_investigation/
+
+# benchmark data
+src/tabicl/eval/benchmarks/graph_land/data/
+experiments/
+data/
+eval/
+*.csv

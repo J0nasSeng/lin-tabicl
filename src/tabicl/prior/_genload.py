@@ -28,18 +28,17 @@ import time
 import json
 import warnings
 import argparse
-
-import random
 from tqdm import tqdm
 from pathlib import Path
 from typing import Optional, List
 
 import torch
 import numpy as np
-from torch.utils.data import IterableDataset, DataLoader
+from torch.utils.data import IterableDataset
 
 from tabicl.prior._dataset import PriorDataset
-from tabicl.prior.graph_lib._config import PriorConfig
+from tabicl._model.graph import CompactGraphSet, SparseGraphBatch, SparseGraphSet, concat_compact_graph_sets, stack_graph_sets
+from tabicl._preprocessing.normalizer import normalize_batch
 from tabicl.prior._prior_config import DEFAULT_FIXED_HP, DEFAULT_SAMPLED_HP
 
 warnings.filterwarnings(
@@ -47,12 +46,15 @@ warnings.filterwarnings(
 )
 
 
-def seed_worker(worker_id: int):
-    # Ensure Python & NumPy match the worker’s torch seed.
-    s = torch.initial_seed() % (2**32)
-    print(f'Initializing worker {worker_id} with seed {s}', flush=True)
-    random.seed(s)
-    np.random.seed(s)
+def _normalize_graph_edge_index(edge_index: torch.Tensor) -> torch.Tensor:
+    """Load graph indices from any supported historical integer dtype."""
+    if not isinstance(edge_index, torch.Tensor):
+        raise TypeError("Serialized graph edge_index must be a torch.Tensor")
+    if edge_index.ndim != 2 or edge_index.shape[0] != 2:
+        raise ValueError("Serialized graph edge_index must have shape (2, E)")
+    if edge_index.dtype not in (torch.uint16, torch.int32, torch.int64):
+        raise TypeError(f"Serialized graph edge_index must be an integer tensor, got {edge_index.dtype}")
+    return edge_index.to(dtype=torch.int32)
 
 
 def dense2sparse(
@@ -63,20 +65,20 @@ def dense2sparse(
     Parameters
     ----------
     dense_tensor : torch.Tensor
-        Input tensor of shape (num_rows, num_cols) where each row may contain
-        trailing zeros beyond the valid entries
+        Input tensor of shape ``(num_rows, num_cols)`` where each row may contain
+        trailing zeros beyond the valid entries.
 
     row_lengths : torch.Tensor
-        Tensor of shape (num_rows,) specifying the number of valid entries
-        in each row of the dense tensor
+        Tensor of shape ``(num_rows,)`` specifying the number of valid entries
+        in each row of the dense tensor.
 
     dtype : torch.dtype, default=torch.float32
-        Output data type for the sparse representation
+        Output data type for the sparse representation.
 
     Returns
     -------
     torch.Tensor
-        1D tensor of shape (sum(row_lengths),) containing only the valid entries
+        1D tensor of shape ``(sum(row_lengths),)`` containing only the valid entries.
     """
 
     assert dense_tensor.dim() == 2, "dense_tensor must be 2D"
@@ -106,21 +108,22 @@ def sparse2dense(
     Parameters
     ----------
     sparse_tensor : torch.Tensor
-        1D tensor containing the valid entries from the original dense tensor
+        1D tensor containing the valid entries from the original dense tensor.
 
     row_lengths : torch.Tensor
-        Number of valid entries for each row in the output tensor
+        Number of valid entries for each row in the output tensor.
 
-    max_len : Optional[int], default=None
-        Maximum length for each row in the output. If None, uses max(row_lengths)
+    max_len : int, optional
+        Maximum length for each row in the output. If None, uses
+        ``max(row_lengths)``.
 
     dtype : torch.dtype, default=torch.float32
-        Output data type for the dense representation
+        Output data type for the dense representation.
 
     Returns
     -------
     torch.Tensor
-        Dense tensor of shape (num_rows, max_len) with zeros padding
+        Dense tensor of shape ``(num_rows, max_len)`` with zeros padding.
     """
 
     assert sparse_tensor.dim() == 1, "data must be 1D"
@@ -186,16 +189,16 @@ def cat_slice_nested_tensors(tensors: List, dim=0) -> SliceNestedTensor:
 
     Parameters
     ----------
-    tensors : List
-        List of tensors to concatenate
+    tensors : list
+        List of tensors to concatenate.
 
     dim : int, default=0
-        Dimension along which to concatenate
+        Dimension along which to concatenate.
 
     Returns
     -------
     SliceNestedTensor
-        Concatenated tensor wrapped in SliceNestedTensor
+        Concatenated tensor wrapped in SliceNestedTensor.
     """
     # Extract the wrapped nested tensors
     nested_tensors = [t.nested_tensor if isinstance(t, SliceNestedTensor) else t for t in tensors]
@@ -203,36 +206,36 @@ def cat_slice_nested_tensors(tensors: List, dim=0) -> SliceNestedTensor:
 
 
 class LoadPriorDataset(IterableDataset):
-    """Loads pre-generated prior data sequentially for distributed training.
+    """Load pre-generated prior data sequentially for distributed training.
 
     Parameters
     ----------
     data_dir : str or Path
-        Directory containing the batch files
+        Directory containing the batch files.
 
     batch_size : int, default=512
-        Number of datasets to return in each iteration
+        Number of datasets to return in each iteration.
 
     ddp_world_size : int, default=1
-        Total number of distributed processes
+        Total number of distributed processes.
 
     ddp_rank : int, default=0
-        Rank of current process
+        Rank of current process.
 
     start_from : int, default=0
-        Batch index to start loading from
+        Batch index to start loading from.
 
     max_batches : int, optional
         Maximum number of batches to load. If None, load indefinitely.
 
-    timeout : int, default=600
-        Maximum time in seconds to wait for a batch file
+    timeout : int, default=60
+        Maximum time in seconds to wait for a batch file.
 
     delete_after_load : bool, default=False
-        Whether to delete batch files after loading them
+        Whether to delete batch files after loading them.
 
     device : str, default='cpu'
-        Device to load tensors to
+        Device to load tensors to.
     """
 
     def __init__(
@@ -243,9 +246,11 @@ class LoadPriorDataset(IterableDataset):
         ddp_rank=0,
         start_from=0,
         max_batches=None,
-        timeout=600,
+        timeout=60,
         delete_after_load=False,
         device="cpu",
+        normalization="none",
+        graph_backend=False,
     ):
         super().__init__()
         self.data_dir = Path(data_dir)
@@ -257,6 +262,8 @@ class LoadPriorDataset(IterableDataset):
         self.timeout = timeout
         self.delete_after_load = delete_after_load
         self.device = device
+        self.normalization = normalization
+        self.graph_backend = bool(graph_backend)
 
         # Load metadata if available
         self.metadata = None
@@ -274,6 +281,7 @@ class LoadPriorDataset(IterableDataset):
         self.buffer_d = None
         self.buffer_seq_lens = None
         self.buffer_train_sizes = None
+        self.buffer_graph_sets = None
         self.buffer_size = 0
 
     def __iter__(self):
@@ -285,7 +293,7 @@ class LoadPriorDataset(IterableDataset):
         Returns
         -------
         tuple
-            A tuple containing X, y, d, seq_lens, train_sizes and the size of the batch
+            A tuple containing (X, y, d, seq_lens, train_sizes, batch_size).
         """
         batch_file = self.data_dir / f"batch_{self.current_idx:06d}.pt"
 
@@ -304,6 +312,34 @@ class LoadPriorDataset(IterableDataset):
         seq_lens = batch["seq_lens"]
         train_sizes = batch["train_sizes"]
         batch_size = batch["batch_size"]
+        graph_sets = None
+        if "graph_sets" in batch:
+            stored_graphs = batch["graph_sets"]
+            if isinstance(stored_graphs, dict) and "edge_index" in stored_graphs:
+                graph_sets = CompactGraphSet(
+                    edge_index=_normalize_graph_edge_index(stored_graphs["edge_index"]),
+                    edge_offsets=stored_graphs["edge_offsets"],
+                    num_nodes=int(stored_graphs["num_nodes"]),
+                )
+            else:
+                graph_sets = [
+                    SparseGraphSet(
+                        graphs=[
+                            SparseGraphBatch(
+                                edge_index=[_normalize_graph_edge_index(edge) for edge in graph["edge_index"]],
+                                num_nodes=int(graph["num_nodes"]),
+                            )
+                            for graph in graph_set
+                        ]
+                    )
+                    for graph_set in stored_graphs
+                ]
+                graph_sets = stack_graph_sets(graph_sets)
+        elif self.graph_backend:
+            raise RuntimeError(
+                f"Graph backend requested but {batch_file} has no precomputed graph metadata. "
+                "Regenerate the prior with graph mode enabled."
+            )
 
         if X.is_nested:
             # Wrap nested tensors with SliceNestedTensor
@@ -320,7 +356,7 @@ class LoadPriorDataset(IterableDataset):
         # Prepare next index for this process
         self.current_idx += self.ddp_world_size
 
-        return X, y, d, seq_lens, train_sizes, batch_size
+        return X, y, d, seq_lens, train_sizes, batch_size, graph_sets
 
     def __next__(self):
         """Load datasets until we have at least batch_size, then return exactly batch_size.
@@ -331,13 +367,20 @@ class LoadPriorDataset(IterableDataset):
 
         Returns
         -------
-        tuple
-            A tuple containing:
-            - X: Input features [batch_size, seq_len, features] or nested tensor
-            - y: Target labels [batch_size, seq_len] or nested tensor
-            - d: Number of features per dataset
-            - seq_lens: Sequence length for each dataset
-            - train_sizes: Position at which to split training and evaluation data
+        X : Tensor or NestedTensor
+            Input features ``[batch_size, seq_len, features]`` or nested tensor.
+
+        y : Tensor or NestedTensor
+            Target labels ``[batch_size, seq_len]`` or nested tensor.
+
+        d : Tensor
+            Number of features per dataset.
+
+        seq_lens : Tensor
+            Sequence length for each dataset.
+
+        train_sizes : Tensor
+            Position at which to split training and evaluation data.
         """
         # Check if we've reached the maximum number of batches and have no buffered data
         if self.max_batches is not None and self.current_idx >= self.max_batches and (self.buffer_size == 0):
@@ -346,24 +389,32 @@ class LoadPriorDataset(IterableDataset):
         # Initialize or use existing buffer
         if self.buffer_size == 0:
             # Load the first batch
-            X, y, d, seq_lens, train_sizes, file_batch_size = self._load_batch_file()
+            X, y, d, seq_lens, train_sizes, file_batch_size, graph_sets = self._load_batch_file()
             self.buffer_X = X
             self.buffer_y = y
             self.buffer_d = d
             self.buffer_seq_lens = seq_lens
             self.buffer_train_sizes = train_sizes
+            self.buffer_graph_sets = graph_sets
             self.buffer_size = file_batch_size
 
-        # Keep loading files until we have enough data or no more files
+        # Keep loading files until we have a complete full training batch.
         while self.buffer_size < self.batch_size:
             # Check if we've reached max_batches
             if self.max_batches is not None and self.current_idx >= self.max_batches:
-                # If we can't get a full batch, return what we have
-                break
+                # Do not expose a partial item at finite stream exhaustion.
+                self.buffer_X = None
+                self.buffer_y = None
+                self.buffer_d = None
+                self.buffer_seq_lens = None
+                self.buffer_train_sizes = None
+                self.buffer_graph_sets = None
+                self.buffer_size = 0
+                raise StopIteration
 
             try:
                 # Load another batch and append to buffer
-                X, y, d, seq_lens, train_sizes, file_batch_size = self._load_batch_file()
+                X, y, d, seq_lens, train_sizes, file_batch_size, graph_sets = self._load_batch_file()
 
                 # Concatenate with existing buffer
                 if self.buffer_X is None:
@@ -373,6 +424,7 @@ class LoadPriorDataset(IterableDataset):
                     self.buffer_d = d
                     self.buffer_seq_lens = seq_lens
                     self.buffer_train_sizes = train_sizes
+                    self.buffer_graph_sets = graph_sets
                     self.buffer_size = file_batch_size
                 else:
                     # Otherwise concatenate, handling SliceNestedTensor if needed
@@ -386,14 +438,23 @@ class LoadPriorDataset(IterableDataset):
                     self.buffer_d = torch.cat([self.buffer_d, d], dim=0)
                     self.buffer_seq_lens = torch.cat([self.buffer_seq_lens, seq_lens], dim=0)
                     self.buffer_train_sizes = torch.cat([self.buffer_train_sizes, train_sizes], dim=0)
+                    if self.graph_backend:
+                        if isinstance(self.buffer_graph_sets, CompactGraphSet) and isinstance(graph_sets, CompactGraphSet):
+                            self.buffer_graph_sets = concat_compact_graph_sets(self.buffer_graph_sets, graph_sets)
+                        else:
+                            self.buffer_graph_sets.extend(graph_sets or [])
                     self.buffer_size += file_batch_size
             except Exception as e:
-                # If we can't load more files, use what we have
-                print(f"Warning: Could not load more files: {str(e)}")
-                break
+                if self.max_batches is not None and self.current_idx >= self.max_batches:
+                    raise StopIteration from e
+                raise RuntimeError(
+                    f"Could not load enough datasets for a complete batch of "
+                    f"{self.batch_size}: {e}"
+                ) from e
 
-        # Extract batch_size datasets (or all if we have fewer)
-        output_size = min(self.batch_size, self.buffer_size)
+        # A loader item is always a complete logical batch. The Trainer splits
+        # it into homogeneous feature groups for gradient accumulation.
+        output_size = self.batch_size
 
         # Prepare output
         X_out = self.buffer_X[:output_size]
@@ -401,6 +462,7 @@ class LoadPriorDataset(IterableDataset):
         d_out = self.buffer_d[:output_size]
         seq_lens_out = self.buffer_seq_lens[:output_size]
         train_sizes_out = self.buffer_train_sizes[:output_size]
+        graph_sets_out = self.buffer_graph_sets[:output_size] if self.graph_backend else None
 
         # Update buffer with remaining data
         if output_size < self.buffer_size:
@@ -409,6 +471,8 @@ class LoadPriorDataset(IterableDataset):
             self.buffer_d = self.buffer_d[output_size:]
             self.buffer_seq_lens = self.buffer_seq_lens[output_size:]
             self.buffer_train_sizes = self.buffer_train_sizes[output_size:]
+            if self.graph_backend:
+                self.buffer_graph_sets = self.buffer_graph_sets[output_size:]
             self.buffer_size -= output_size
         else:
             # Buffer is now empty
@@ -417,22 +481,30 @@ class LoadPriorDataset(IterableDataset):
             self.buffer_d = None
             self.buffer_seq_lens = None
             self.buffer_train_sizes = None
+            self.buffer_graph_sets = None
             self.buffer_size = 0
 
         if isinstance(X_out, SliceNestedTensor):
             X_out = X_out.nested_tensor
             y_out = y_out.nested_tensor
 
-        return X_out, y_out, d_out, seq_lens_out, train_sizes_out
+        X_out = normalize_batch(
+            X_out,
+            d_out,
+            seq_lens_out,
+            train_sizes_out,
+            self.normalization,
+        )
+        result = (X_out, y_out, d_out, seq_lens_out, train_sizes_out)
+        return result + (graph_sets_out,) if self.graph_backend else result
 
     def __repr__(self) -> str:
-        """
-        Returns a string representation of the LoadPriorDataset.
+        """Return a string representation of the LoadPriorDataset.
 
         Returns
         -------
         str
-            A formatted string with dataset parameters
+            A formatted string with dataset parameters.
         """
         repr_str = (
             f"LoadPriorDataset(\n"
@@ -448,7 +520,6 @@ class LoadPriorDataset(IterableDataset):
         )
         if self.metadata:
             repr_str += "  Loaded Metadata:\n"
-            repr_str += f"    regression: {self.metadata.get('regression', 'N/A')}\n"
             repr_str += f"    prior_type: {self.metadata.get('prior_type', 'N/A')}\n"
             repr_str += f"    batch_size (generated): {self.metadata.get('batch_size', 'N/A')}\n"
             repr_str += f"    batch_size_per_gp: {self.metadata.get('batch_size_per_gp', 'N/A')}\n"
@@ -484,7 +555,6 @@ class SavePriorDataset:
         self.save_metadata()
 
         self.prior = PriorDataset(
-            regression=self.args.regression,
             batch_size=self.args.batch_size,
             batch_size_per_gp=self.args.batch_size_per_gp,
             min_features=self.args.min_features,
@@ -493,35 +563,32 @@ class SavePriorDataset:
             min_seq_len=self.args.min_seq_len,
             max_seq_len=self.args.max_seq_len,
             log_seq_len=self.args.log_seq_len,
-            log_n_features=self.args.log_n_features,
             seq_len_per_gp=self.args.seq_len_per_gp,
             min_train_size=self.args.min_train_size,
             max_train_size=self.args.max_train_size,
             replay_small=self.args.replay_small,
             prior_type=self.args.prior_type,
-            config=PriorConfig.from_args(self.args),
             scm_fixed_hp=DEFAULT_FIXED_HP,
             scm_sampled_hp=DEFAULT_SAMPLED_HP,
-            n_jobs=1,  # parallelize across batches instead of within batches
+            n_jobs=self.args.n_jobs,
             num_threads_per_generate=self.args.num_threads_per_generate,
             device=self.args.device,
+            normalization="none",
+            graph_backend=getattr(self.args, "graph_backend", False),
+            graph_num_graphs=getattr(self.args, "graph_num_graphs", 1),
+            graph_min_train_neighbors=getattr(self.args, "graph_min_train_neighbors", 8),
+            graph_max_train_neighbors=getattr(self.args, "graph_max_train_neighbors", 15),
+            graph_cross_label_fraction=getattr(self.args, "graph_cross_label_fraction", 0.1),
+            graph_train_neighbors_per_test=getattr(self.args, "graph_train_neighbors_per_test", 8),
+            graph_v1_prob=getattr(self.args, "graph_v1_prob", 1.0),
+            graph_v2_prob=getattr(self.args, "graph_v2_prob", 0.0),
+            graph_prob=getattr(self.args, "graph_prob", 0.0),
         )
-        self.dataloader = DataLoader(
-            self.prior,
-            batch_size=None,  # No additional batching since PriorDataset handles batching internally
-            shuffle=False,
-            num_workers=self.args.n_jobs,
-            prefetch_factor=2,
-            worker_init_fn=seed_worker,
-            persistent_workers=True,
-        )
-        self.dl_iter = iter(self.dataloader)
         print(self.prior)
 
     def save_metadata(self):
         """Save metadata about the dataset generation configuration to a JSON file."""
         metadata = {
-            "regression": self.args.regression,
             "prior_type": self.args.prior_type,
             "batch_size": self.args.batch_size,
             "batch_size_per_gp": self.args.batch_size_per_gp,
@@ -535,12 +602,13 @@ class SavePriorDataset:
             "min_train_size": self.args.min_train_size,
             "max_train_size": self.args.max_train_size,
             "replay_small": self.args.replay_small,
-            "graph_noise": self.args.graph_noise,
+            "graph_backend": getattr(self.args, "graph_backend", False),
+            "graph_num_graphs": getattr(self.args, "graph_num_graphs", 1),
         }
         with open(self.save_dir / "metadata.json", "w") as f:
             json.dump(metadata, f, indent=2)
 
-    def save_batch_sparse(self, batch_idx, X, y, d, seq_lens, train_sizes):
+    def save_batch_sparse(self, batch_idx, X, y, d, seq_lens, train_sizes, graph_sets=None):
         """Save batch data in sparse format for efficient storage.
 
         This method handles the conversion between dense and sparse tensor formats
@@ -551,23 +619,24 @@ class SavePriorDataset:
         Parameters
         ----------
         batch_idx : int
-            Index of the current batch used for file naming
+            Index of the current batch used for file naming.
 
         X : torch.Tensor
-            Input features tensor, either in dense format [batch_size, seq_len, features]
-            or in nested tensor format for variable sequence lengths
+            Input features tensor, either in dense format
+            ``[batch_size, seq_len, features]`` or in nested tensor format for
+            variable sequence lengths.
 
         y : torch.Tensor
-            Target labels tensor
+            Target labels tensor.
 
         d : torch.Tensor
-            Number of features for each dataset
+            Number of features for each dataset.
 
         seq_lens : torch.Tensor
-            Sequence length for each dataset
+            Sequence length for each dataset.
 
         train_sizes : torch.Tensor
-            Position at which to split training and evaluation data
+            Position at which to split training and evaluation data.
         """
 
         if self.args.seq_len_per_gp:
@@ -580,10 +649,23 @@ class SavePriorDataset:
         # Create temporary file first
         batch_file = self.save_dir / f"batch_{batch_idx:06d}.pt"
         temp_file = self.save_dir / f"batch_{batch_idx:06d}.pt.tmp"
-        torch.save(
-            {"X": X, "y": y, "d": d, "seq_lens": seq_lens, "train_sizes": train_sizes, "batch_size": B},
-            temp_file,
-        )
+        payload = {"X": X, "y": y, "d": d, "seq_lens": seq_lens, "train_sizes": train_sizes, "batch_size": B}
+        if graph_sets is not None:
+            if isinstance(graph_sets, CompactGraphSet):
+                payload["graph_sets"] = {
+                    "edge_index": graph_sets.edge_index.cpu(),
+                    "edge_offsets": graph_sets.edge_offsets.cpu(),
+                    "num_nodes": graph_sets.num_nodes,
+                }
+            else:
+                payload["graph_sets"] = [
+                    [
+                        {"edge_index": [edge.cpu() for edge in graph.edge_index], "num_nodes": graph.num_nodes}
+                        for graph in graph_set.graphs
+                    ]
+                    for graph_set in graph_sets
+                ]
+        torch.save(payload, temp_file)
         # Atomic rename to ensure file integrity
         temp_file.replace(batch_file)
 
@@ -595,16 +677,20 @@ class SavePriorDataset:
         for batch_idx in tqdm(
             range(self.args.resume_from, self.args.resume_from + self.args.num_batches),
             desc="Generating batches",
-            disable=True,
         ):
-            X, y, d, seq_lens, train_sizes = next(self.dl_iter)
+            batch = self.prior.get_batch()
+            if len(batch) == 6:
+                X, y, d, seq_lens, train_sizes, graph_sets = batch
+            else:
+                X, y, d, seq_lens, train_sizes = batch
+                graph_sets = None
             # Move tensors to CPU before saving
             X = X.cpu()
             y = y.cpu()
             d = d.cpu()
             seq_lens = seq_lens.cpu()
             train_sizes = train_sizes.cpu()
-            self.save_batch_sparse(batch_idx, X, y, d, seq_lens, train_sizes)
+            self.save_batch_sparse(batch_idx, X, y, d, seq_lens, train_sizes, graph_sets)
 
 
 if __name__ == "__main__":
@@ -631,7 +717,6 @@ if __name__ == "__main__":
     parser.add_argument("--torch_seed", type=int, default=42, help="Random seed for torch")
     parser.add_argument("--num_batches", type=int, default=10000, help="Number of batches to generate")
     parser.add_argument("--resume_from", type=int, default=0, help="Resume generation from this batch index")
-    parser.add_argument("--regression", default=False, type=str2bool, help="If True, generate regression datasets")
     parser.add_argument("--batch_size", type=int, default=512, help="Total batch size")
     parser.add_argument("--batch_size_per_gp", type=int, default=4, help="Batch size per group")
     parser.add_argument("--min_features", type=int, default=2, help="Minimum number of features")
@@ -644,12 +729,6 @@ if __name__ == "__main__":
         default=False,
         type=str2bool,
         help="If True, sample sequence length from log-uniform distribution between min_seq_len and max_seq_len",
-    )
-    parser.add_argument(
-        "--log_n_features",
-        default=False,
-        type=str2bool,
-        help="If True, sample number of features from log-uniform distribution between max_features and min_features"
     )
     parser.add_argument(
         "--seq_len_per_gp",
@@ -672,19 +751,27 @@ if __name__ == "__main__":
     parser.add_argument(
         "--prior_type",
         type=str,
-        default="graph_scm",
-        choices=["mlp_scm", "tree_scm", "mix_scm", "graph_scm"],
+        default="mix_scm",
+        choices=["mlp_scm", "tree_scm", "mix_scm", "nanotabicl"],
         help="Type of prior to use",
     )
-    PriorConfig.add_args_to_parser(parser)
     parser.add_argument("--n_jobs", type=int, default=-1, help="Number of jobs for parallel processing")
     parser.add_argument("--num_threads_per_generate", type=int, default=1, help="Threads per generation")
     parser.add_argument(
         "--device", type=str, default="cpu", choices=["cpu", "cuda"], help="Device to use for generation"
     )
+    parser.add_argument("--graph_backend", type=str2bool, default=False)
+    parser.add_argument("--graph_num_graphs", type=int, default=1)
+    parser.add_argument("--graph_min_train_neighbors", type=int, default=3)
+    parser.add_argument("--graph_max_train_neighbors", type=int, default=6)
+    parser.add_argument("--graph_cross_label_fraction", type=float, default=0.1)
+    parser.add_argument("--graph_train_neighbors_per_test", type=int, default=2)
+    parser.add_argument("--graph_v1_prob", type=float, default=1.0)
+    parser.add_argument("--graph_v2_prob", type=float, default=0.0)
+    parser.add_argument("--graph_prob", type=float, default=0.0)
 
     args = parser.parse_args()
-    # np.random.seed(args.np_seed)
-    # torch.manual_seed(args.torch_seed)
+    np.random.seed(args.np_seed)
+    torch.manual_seed(args.torch_seed)
     saver = SavePriorDataset(args)
     saver.run()
