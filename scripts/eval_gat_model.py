@@ -26,7 +26,6 @@ from sklearn.preprocessing import StandardScaler
 from xgboost import XGBClassifier
 
 from tabicl.eval._run import EvalSample, _build_model_from_checkpoint, _evaluate_one_dataset
-from tabicl._preprocessing.normalizer import RobustScaler, Standardizer, infer_feature_types
 from tabicl.prior._dataset import PriorDataset
 from tabicl.prior._prior_config import DEFAULT_FIXED_HP
 from tabicl import TabICLClassifier
@@ -176,7 +175,7 @@ def build_parser() -> argparse.ArgumentParser:
 	parser.add_argument("--min-seq-len", type=int, default=None)
 	parser.add_argument("--min-train-size", type=float, default=0.1)
 	parser.add_argument("--max-train-size", type=float, default=0.9)
-	parser.add_argument("--prior-type", choices=["mlp_scm", "tree_scm", "mix_scm", "nanotabicl"], default="nanotabicl")
+	parser.add_argument("--prior-type", choices=["mlp_scm", "tree_scm", "mix_scm", "graph_scm"], default="graph_scm")
 	parser.add_argument("--prior-device", default="cpu")
 	parser.add_argument("--device", default=None, help="Inference device (default: cuda when available)")
 	parser.add_argument("--seed", type=int, default=42)

@@ -1,7 +1,7 @@
 """Isolated investigation of graph-1d GAT layers in a frozen TabICL checkpoint.
 
-The script evaluates one prior-sampled dataset with skip-GAT, cumulative GAT
-prefixes, and the full GAT stack. Prefixes are applied externally by replacing
+The script evaluates prior-sampled datasets with selectable ablations and
+layer-wise representation UMAPs. Prefixes are applied externally by replacing
 ``graph_blocks`` temporarily; no prefix-specific model code is required.
 """
 
@@ -9,14 +9,78 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import torch
 from sklearn.metrics import log_loss, recall_score
+from tqdm.auto import tqdm
 
 from tabicl import TabICLClassifier
 from tabicl.prior._dataset import PriorDataset
+
+
+@dataclass
+class DatasetContext:
+    """One valid prior-sampled task shared by all investigation passes."""
+
+    dataset: int
+    x: np.ndarray
+    labels: np.ndarray
+    train_size: int
+
+    @property
+    def x_train(self) -> np.ndarray:
+        return self.x[:self.train_size]
+
+    @property
+    def x_test(self) -> np.ndarray:
+        return self.x[self.train_size:]
+
+    @property
+    def y_train(self) -> np.ndarray:
+        return self.labels[:self.train_size]
+
+    @property
+    def y_test(self) -> np.ndarray:
+        return self.labels[self.train_size:]
+
+
+@dataclass
+class InvestigationResults:
+    """Records and representations produced while investigating one task."""
+
+    metrics: list[dict] = field(default_factory=list)
+    attention: list[dict] = field(default_factory=list)
+    graph_metrics: list[dict] = field(default_factory=list)
+    graph_attention: list[dict] = field(default_factory=list)
+
+
+class ProgressReporter:
+    """Display dataset progress while exposing the active ablation step."""
+
+    def __init__(self, total: int) -> None:
+        self.bar = tqdm(total=total, desc="GAT investigation", unit="dataset")
+
+    def step(self, ablation: str, step: int, total_steps: int) -> None:
+        self.bar.set_postfix_str(
+            f"ablation={ablation} step={step}/{total_steps}", refresh=True,
+        )
+
+    def dataset_done(self) -> None:
+        self.bar.update(1)
+
+    def close(self) -> None:
+        self.bar.close()
+
+
+ProgressCallback = Callable[[str, int, int], None]
+
+
+def _noop_progress(_ablation: str, _step: int, _total_steps: int) -> None:
+    pass
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -36,7 +100,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-seq-len", type=int, default=2048)
     parser.add_argument("--min-train-size", type=float, default=0.1)
     parser.add_argument("--max-train-size", type=float, default=0.9)
-    parser.add_argument("--prior-type", default="nanotabicl")
+    parser.add_argument("--prior-type", default="graph_scm", choices=["mlp_scm", "tree_scm", "mix_scm", "graph_scm"])
     parser.add_argument("--prior-device", default="cpu")
     parser.add_argument("--normalization", choices=("none", "std", "robust"), default="std")
     parser.add_argument("--device", default=None)
@@ -51,8 +115,15 @@ def _parser() -> argparse.ArgumentParser:
         help="Overlay graph edges on UMAP plots. Requires --num-graphs 1.",
     )
     parser.add_argument(
-        "--graph-ablation", action="store_true",
-        help="Run empty, fully-connected, 70%% cross-label, and 10%% cross-label graph ablations.",
+        "--ablations", nargs="+", default=["none"],
+        choices=(
+            "none", "all", "skip_gat", "temperature", "depth", "graph",
+            "empty", "fully_connected", "cross_label_70", "cross_label_10",
+        ),
+        help=(
+            "Ablations to run. 'none' (the default) only compares representations; "
+            "'all' runs every ablation. Multiple values are allowed."
+        ),
     )
     parser.add_argument("--graph-ablation-temperature", type=float, default=1.0)
     parser.add_argument(
@@ -65,7 +136,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--blocks", type=int, nargs="+", default=None,
-        help="GAT prefix lengths. 0 means skip-GAT; default is 0 and every prefix.",
+        help="GAT prefix lengths for depth/representation evaluation. 0 means skip-GAT.",
     )
     parser.add_argument("--umap-n-neighbors", type=int, default=10)
     parser.add_argument("--umap-n-epochs", type=int, default=100)
@@ -123,6 +194,46 @@ def _build_encoder_classifier(
         n_jobs=1,
         norm_methods="none",
     )
+
+
+def _selected_ablations(args: argparse.Namespace) -> set[str]:
+    """Resolve and expand the user-selected ablations."""
+    selected = set(args.ablations)
+    if "none" in selected and len(selected) > 1:
+        raise ValueError("--ablations none cannot be combined with another ablation")
+    if selected == {"none"}:
+        return set()
+    if "all" in selected:
+        selected.remove("all")
+        selected.update(("skip_gat", "temperature", "depth", "graph"))
+    if "graph" in selected:
+        selected.remove("graph")
+        selected.update(("empty", "fully_connected", "cross_label_70", "cross_label_10"))
+    return selected
+
+
+def _dataset_context(batch: tuple[object, ...], index: int, dataset: int) -> DatasetContext | None:
+    """Extract one task and skip tasks whose test labels are unseen in training."""
+    seq_len = int(batch[3][index].item())
+    train_size = int(batch[4][index].item())
+    labels = batch[1][index, :seq_len].numpy().astype(int)
+    x = batch[0][index, :seq_len, : int(batch[2][index].item())].numpy()
+    if not np.isin(np.unique(labels[train_size:]), np.unique(labels[:train_size])).all():
+        return None
+    return DatasetContext(dataset, x, labels, train_size)
+
+
+def _prediction_record(
+    context: DatasetContext, variant: str, blocks: int, temperature: float | None,
+    probabilities: np.ndarray, classes: np.ndarray,
+) -> dict:
+    predictions = classes[np.argmax(probabilities, axis=1)]
+    return {
+        "dataset": context.dataset, "variant": variant, "blocks": blocks,
+        "temperature": temperature,
+        "cross_entropy": float(log_loss(context.y_test, probabilities, labels=classes)),
+        "balanced_accuracy": _balanced_accuracy(context.y_test, predictions),
+    }
 
 
 def _encoder_layer_representations(
@@ -216,7 +327,8 @@ def _run_prefix(
     labels: np.ndarray,
     temperature: float,
     attention_top_k: list[int],
-) -> tuple[np.ndarray, np.ndarray, list[dict]]:
+    collect_diagnostics: bool,
+) -> tuple[np.ndarray | None, np.ndarray, list[dict]]:
     """Run standard inference with a temporary graph-block prefix."""
     engine = classifier.model_
     gat = engine.model.icl_predictor.gat_icl
@@ -227,14 +339,177 @@ def _run_prefix(
         gat.graph_blocks = torch.nn.ModuleList(list(original_blocks)[:prefix])
         classifier.fit(x_train, y_train)
         _set_temperature(classifier, temperature)
-        probabilities = classifier.predict_proba(x_test)
-        representation = classifier.predict_representation(x_test)
-        attention = _attention_statistics(
-            engine, labels, y_train.shape[0], attention_top_k
+        probabilities = classifier.predict_proba(x_test) if collect_diagnostics else None
+        representation = classifier.predict_representation(
+            np.concatenate((x_train, x_test), axis=0)
+        )
+        attention = (
+            _attention_statistics(engine, labels, y_train.shape[0], attention_top_k)
+            if collect_diagnostics else []
         )
         return probabilities, representation, attention
     finally:
         gat.graph_blocks = original_blocks
+
+
+def _run_skip_gat_ablation(
+    context: DatasetContext, checkpoint: Path, device: str, seed: int,
+    graph_config: dict[str, object] | None,
+    progress: ProgressCallback = _noop_progress,
+) -> tuple[np.ndarray, dict]:
+    """Evaluate the model with its GAT stack disabled."""
+    progress("skip_gat", 1, 1)
+    classifier = _build_classifier(
+        checkpoint, device, seed, skip_gat=True, graph_config=graph_config,
+    )
+    classifier.fit(context.x_train, context.y_train)
+    probabilities = classifier.predict_proba(context.x_test)
+    representation = classifier.predict_representation(context.x)
+    return representation, _prediction_record(
+        context, "skip_gat", 0, None, probabilities, classifier.classes_,
+    )
+
+
+def _run_graph_ablation(
+    context: DatasetContext, ablation: str, args: argparse.Namespace,
+    graph_config: dict[str, object] | None,
+    progress: ProgressCallback = _noop_progress,
+) -> tuple[dict, list[dict]]:
+    """Evaluate one controlled graph topology and its attention statistics."""
+    progress(ablation, 1, 1)
+    ablation_config = dict(graph_config or {})
+    ablation_config["graph_ablation"] = ablation
+    classifier = _build_classifier(
+        args.checkpoint, args.device, args.seed + context.dataset + 1000,
+        graph_config=ablation_config,
+    )
+    classifier.fit(context.x_train, context.y_train)
+    _set_temperature(classifier, args.graph_ablation_temperature)
+    prefixes = _prefixes(classifier, args.blocks)
+    prefix = max(prefixes)
+    if prefix == 0:
+        raise ValueError("Graph ablation requires at least one GAT block")
+    gat = classifier.model_.model.icl_predictor.gat_icl
+    original_blocks = gat.graph_blocks
+    try:
+        gat.graph_blocks = torch.nn.ModuleList(list(original_blocks)[:prefix])
+        probabilities = classifier.predict_proba(context.x_test)
+        record = _prediction_record(
+            context, ablation, prefix, args.graph_ablation_temperature,
+            probabilities, classifier.classes_,
+        )
+        attention = [
+            {
+                "dataset": context.dataset, "graph_ablation": ablation,
+                "blocks": prefix, "temperature": args.graph_ablation_temperature,
+                **item,
+            }
+            for item in _attention_statistics(
+                classifier.model_, context.labels, context.train_size, args.attention_top_k
+            )
+        ]
+        return record, attention
+    finally:
+        gat.graph_blocks = original_blocks
+
+
+def _run_gat_pass(
+    context: DatasetContext, args: argparse.Namespace,
+    graph_config: dict[str, object] | None, base_representations: dict[str, np.ndarray],
+    temperatures: list[float], collect_diagnostics: bool,
+    progress: ProgressCallback = _noop_progress,
+) -> tuple[dict[str, np.ndarray], InvestigationResults]:
+    """Evaluate GAT prefixes for a temperature list and return representations."""
+    representations = dict(base_representations)
+    results = InvestigationResults()
+    graph_edges: tuple[np.ndarray, np.ndarray] | None = None
+    for temperature_index, temperature in enumerate(temperatures, start=1):
+        progress(
+            "temperature" if collect_diagnostics else "representations",
+            temperature_index, len(temperatures),
+        )
+        classifier = _build_classifier(
+            args.checkpoint, args.device, args.seed + context.dataset,
+            graph_config=graph_config,
+        )
+        classifier.fit(context.x_train, context.y_train)
+        _set_temperature(classifier, temperature)
+        prefixes = _prefixes(classifier, args.blocks)
+        for prefix_index, prefix in enumerate(prefixes, start=1):
+            progress(
+                "depth" if collect_diagnostics else "representations",
+                prefix_index, len(prefixes),
+            )
+            if prefix == 0:
+                continue
+            probabilities, representation, attention = _run_prefix(
+                classifier, context.x_train, context.y_train, context.x_test,
+                prefix, context.labels, temperature, args.attention_top_k,
+                collect_diagnostics,
+            )
+            representations[f"gat_{prefix}"] = representation
+            if probabilities is not None:
+                results.metrics.append(_prediction_record(
+                    context, f"gat_{prefix}", prefix, temperature,
+                    probabilities, classifier.classes_,
+                ))
+            results.attention.extend(
+                {"dataset": context.dataset, "blocks": prefix,
+                 "temperature": temperature, **item}
+                for item in attention
+            )
+            if args.show_graph and graph_edges is None:
+                graph_edges = _cached_graph_edges(classifier)
+        _plot_umap(
+            representations, context.labels, context.train_size,
+            args.output_dir / "umap" / f"temperature_{temperature:g}"
+            / f"dataset{context.dataset:05d}.png",
+            args.seed + context.dataset, args.umap_n_neighbors, args.umap_n_epochs,
+            graph_edges=graph_edges if args.show_graph else None,
+        )
+    return representations, results
+
+
+def _run_layerwise_umap(
+    context: DatasetContext, args: argparse.Namespace,
+    graph_config: dict[str, object] | None, base_representations: dict[str, np.ndarray],
+    progress: ProgressCallback = _noop_progress,
+) -> InvestigationResults:
+    """Run the default representation-only layer-wise UMAP analysis."""
+    _run_gat_pass(
+        context, args, graph_config, base_representations,
+        sorted(set(args.temperatures)), collect_diagnostics=False,
+        progress=progress,
+    )
+    return InvestigationResults()
+
+
+def _run_depth_ablation(
+    context: DatasetContext, args: argparse.Namespace,
+    graph_config: dict[str, object] | None, base_representations: dict[str, np.ndarray],
+    progress: ProgressCallback = _noop_progress,
+) -> InvestigationResults:
+    """Evaluate GAT prefix depth with prediction and attention diagnostics."""
+    _, results = _run_gat_pass(
+        context, args, graph_config, base_representations,
+        [max(sorted(set(args.temperatures)))], collect_diagnostics=True,
+        progress=progress,
+    )
+    return results
+
+
+def _run_temperature_ablation(
+    context: DatasetContext, args: argparse.Namespace,
+    graph_config: dict[str, object] | None, base_representations: dict[str, np.ndarray],
+    progress: ProgressCallback = _noop_progress,
+) -> InvestigationResults:
+    """Evaluate GAT behavior across the requested attention temperatures."""
+    _, results = _run_gat_pass(
+        context, args, graph_config, base_representations,
+        sorted(set(args.temperatures)), collect_diagnostics=True,
+        progress=progress,
+    )
+    return results
 
 
 def _cached_graph_edges(classifier: TabICLClassifier) -> tuple[np.ndarray, np.ndarray] | None:
@@ -370,9 +645,10 @@ def _plot_umap(
     import matplotlib.pyplot as plt
     from umap import UMAP
 
-    variants = list(representations)
-    fig, axes = plt.subplots(2, len(variants), figsize=(5 * len(variants), 8), squeeze=False, dpi=150)
-    for column, variant in enumerate(variants):
+    def draw(axis, representation: np.ndarray | None, start: int, end: int, title: str) -> None:
+        if representation is None:
+            axis.axis("off")
+            return
         coords = UMAP(
             n_components=2,
             n_neighbors=min(n_neighbors, len(labels) - 1),
@@ -380,28 +656,57 @@ def _plot_umap(
             metric="euclidean",
             n_jobs=1,
             random_state=seed,
-        ).fit_transform(np.nan_to_num(representations[variant]))
-        for row, (start, end, title) in enumerate(((0, train_size, "Train"), (train_size, len(labels), "Test"))):
-            if graph_edges is not None:
-                edge_src, edge_dst = graph_edges
-                valid_edges = (
-                    (edge_src >= start) & (edge_src < end)
-                    & (edge_dst >= start) & (edge_dst < end)
-                )
-                for source, destination in zip(
-                    edge_src[valid_edges], edge_dst[valid_edges]
-                ):
-                    axes[row, column].plot(
-                        (coords[source, 0], coords[destination, 0]),
-                        (coords[source, 1], coords[destination, 1]),
-                        color="black", alpha=0.12, linewidth=0.5, zorder=1,
-                    )
-            axes[row, column].scatter(
-                coords[start:end, 0], coords[start:end, 1], c=labels[start:end],
-                cmap="tab10", s=16, alpha=0.8, zorder=2,
+        ).fit_transform(np.nan_to_num(representation))
+        if graph_edges is not None:
+            edge_src, edge_dst = graph_edges
+            valid_edges = (
+                (edge_src >= start) & (edge_src < end)
+                & (edge_dst >= start) & (edge_dst < end)
             )
-            axes[row, column].set(title=f"{variant}: {title}", xlabel="UMAP-1", ylabel="UMAP-2")
-            axes[row, column].grid(alpha=0.2)
+            for source, destination in zip(edge_src[valid_edges], edge_dst[valid_edges]):
+                axis.plot(
+                    (coords[source, 0], coords[destination, 0]),
+                    (coords[source, 1], coords[destination, 1]),
+                    color="black", alpha=0.12, linewidth=0.5, zorder=1,
+                )
+        axis.scatter(
+            coords[start:end, 0], coords[start:end, 1], c=labels[start:end],
+            cmap="tab10", s=16, alpha=0.8, zorder=2,
+        )
+        axis.set(title=title, xlabel="UMAP-1", ylabel="UMAP-2")
+        axis.grid(alpha=0.2)
+
+    if any(name.startswith("encoder_") for name in representations):
+        encoder_layers = sorted(
+            int(name.split("_")[1]) for name in representations if name.startswith("encoder_")
+        )
+        gat_layers = sorted(
+            int(name.split("_")[1]) for name in representations if name.startswith("gat_")
+        )
+        n_columns = max([len(encoder_layers), len(gat_layers), 1]) + 1
+        fig, axes = plt.subplots(
+            4, n_columns, figsize=(5 * n_columns, 16), squeeze=False, dpi=150,
+        )
+        draw(axes[0, 0], representations.get("skip_gat"), 0, train_size, "skip_gat: Train")
+        draw(axes[1, 0], representations.get("skip_gat"), train_size, len(labels), "skip_gat: Test")
+        axes[2, 0].axis("off")
+        axes[3, 0].axis("off")
+        for column in range(1, n_columns):
+            layer = column
+            encoder = representations.get(f"encoder_{layer}")
+            gat = representations.get(f"gat_{layer}")
+            draw(axes[0, column], encoder, 0, train_size, f"encoder_{layer}: Train")
+            draw(axes[1, column], gat, 0, train_size, f"gat_{layer}: Train")
+            draw(axes[2, column], encoder, train_size, len(labels), f"encoder_{layer}: Test")
+            draw(axes[3, column], gat, train_size, len(labels), f"gat_{layer}: Test")
+    else:
+        variants = list(representations)
+        fig, axes = plt.subplots(
+            2, len(variants), figsize=(5 * len(variants), 8), squeeze=False, dpi=150,
+        )
+        for column, variant in enumerate(variants):
+            draw(axes[0, column], representations[variant], 0, train_size, f"{variant}: Train")
+            draw(axes[1, column], representations[variant], train_size, len(labels), f"{variant}: Test")
     fig.tight_layout()
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output)
@@ -656,7 +961,10 @@ def _plot_attention_diagnostics(
     plt.close(fig)
 
 
-def _plot_graph_ablation(rows: list[dict], attention_rows: list[dict], output_dir: Path) -> None:
+def _plot_graph_ablation(
+    rows: list[dict], attention_rows: list[dict], output_dir: Path,
+    variants: tuple[str, ...],
+) -> None:
     """Plot prediction and enrichment results for controlled graph topologies."""
     import matplotlib
     matplotlib.use("Agg", force=True)
@@ -664,8 +972,11 @@ def _plot_graph_ablation(rows: list[dict], attention_rows: list[dict], output_di
 
     if not rows:
         return
-    variants = ["empty", "fully_connected", "cross_label_70", "cross_label_10"]
-    labels = ["empty", "fully connected", "70% cross-label", "10% cross-label"]
+    labels_by_variant = {
+        "empty": "empty", "fully_connected": "fully connected",
+        "cross_label_70": "70% cross-label", "cross_label_10": "10% cross-label",
+    }
+    labels = [labels_by_variant[variant] for variant in variants]
     fig, axes = plt.subplots(1, 2, figsize=(12, 5), dpi=150, constrained_layout=True)
     for axis, field, title, ylabel in zip(
         axes[:2],
@@ -717,6 +1028,12 @@ def _plot_graph_ablation(rows: list[dict], attention_rows: list[dict], output_di
 
 def main() -> None:
     args = _parser().parse_args()
+    selected_ablations = _selected_ablations(args)
+    graph_ablation_names = tuple(
+        name for name in ("empty", "fully_connected", "cross_label_70", "cross_label_10")
+        if name in selected_ablations
+    )
+    collect_diagnostics = bool(selected_ablations)
     if args.num_datasets < 1 or args.num_classes < 2:
         raise ValueError("num-datasets must be positive and num-classes must be at least 2")
     if args.n_estimators < 1:
@@ -730,6 +1047,7 @@ def main() -> None:
     if not attention_top_k or any(k <= 0 for k in attention_top_k):
         raise ValueError(f"Attention top-k values must be positive, got {args.attention_top_k}")
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    args.device = device
     if args.show_graph and args.num_graphs != 1:
         raise ValueError("--show-graph requires --num-graphs 1")
 
@@ -753,166 +1071,106 @@ def main() -> None:
     graph_ablation_rows: list[dict] = []
     graph_ablation_attention_rows: list[dict] = []
     graph_config = {"graph_num_graphs": args.num_graphs} if args.num_graphs is not None else None
-    graph_edges: tuple[np.ndarray, np.ndarray] | None = None
+    progress = ProgressReporter(args.num_datasets)
     processed = 0
     while processed < args.num_datasets:
         batch = _regular_batch(prior.get_batch())
         for index in range(int(batch[0].shape[0])):
             if processed >= args.num_datasets:
                 break
-            graph_edges = None
-            seq_len = int(batch[3][index].item())
-            train_size = int(batch[4][index].item())
-            labels = batch[1][index, :seq_len].numpy().astype(int)
-            x = batch[0][index, :seq_len, : int(batch[2][index].item())].numpy()
-            y_train, y_test = labels[:train_size], labels[train_size:]
-            if not np.isin(np.unique(y_test), np.unique(y_train)).all():
+            context = _dataset_context(batch, index, processed)
+            if context is None:
                 processed += 1
+                progress.dataset_done()
                 continue
 
-            skip = _build_classifier(
-                args.checkpoint, device, args.seed + processed,
-                skip_gat=True, graph_config=graph_config,
-            )
-            skip.fit(x[:train_size], y_train)
-            skip_proba = skip.predict_proba(x[train_size:])
-            skip_repr = skip.predict_representation(x[train_size:])
-            skip_labels = skip.classes_
-            skip_pred = skip_labels[np.argmax(skip_proba, axis=1)]
-            rows.append({
-                "dataset": processed, "variant": "skip_gat", "blocks": 0,
-                "temperature": None,
-                "cross_entropy": float(log_loss(y_test, skip_proba, labels=skip_labels)),
-                "balanced_accuracy": _balanced_accuracy(y_test, skip_pred),
-            })
+            dataset_results = InvestigationResults()
+            base_representations: dict[str, np.ndarray] = {}
+            if "skip_gat" in selected_ablations:
+                skip_repr, skip_metrics = _run_skip_gat_ablation(
+                    context, args.checkpoint, device, args.seed + processed, graph_config,
+                    progress.step,
+                )
+                base_representations["skip_gat"] = skip_repr
+                dataset_results.metrics.append(skip_metrics)
+            elif not selected_ablations:
+                skip = _build_classifier(
+                    args.checkpoint, device, args.seed + processed,
+                    skip_gat=True, graph_config=graph_config,
+                )
+                skip.fit(context.x_train, context.y_train)
+                base_representations["skip_gat"] = skip.predict_representation(context.x)
 
-            encoder_representations: dict[str, np.ndarray] = {}
             if args.encoder_checkpoint is not None:
                 encoder = _build_encoder_classifier(
-                    args.encoder_checkpoint,
-                    device,
-                    args.seed + processed + 100000,
+                    args.encoder_checkpoint, device, args.seed + processed + 100000,
                     args.n_estimators,
                 )
-                encoder.fit(x[:train_size], y_train)
-                encoder_proba = encoder.predict_proba(x[train_size:])
-                encoder_representations = _encoder_layer_representations(encoder, x)
-                encoder_pred = encoder.classes_[np.argmax(encoder_proba, axis=1)]
-                rows.append({
-                    "dataset": processed, "variant": "encoder", "blocks": -1,
-                    "temperature": None,
-                    "cross_entropy": float(log_loss(
-                        y_test, encoder_proba, labels=encoder.classes_
-                    )),
-                    "balanced_accuracy": _balanced_accuracy(y_test, encoder_pred),
-                })
+                encoder.fit(context.x_train, context.y_train)
+                base_representations.update(_encoder_layer_representations(encoder, context.x))
+                if collect_diagnostics:
+                    probabilities = encoder.predict_proba(context.x_test)
+                    dataset_results.metrics.append(_prediction_record(
+                        context, "encoder", -1, None, probabilities, encoder.classes_,
+                    ))
 
-            if args.graph_ablation:
-                ablation_names = ("empty", "fully_connected", "cross_label_70", "cross_label_10")
-                for ablation_index, ablation in enumerate(ablation_names):
-                    ablation_config = dict(graph_config or {})
-                    ablation_config["graph_ablation"] = ablation
-                    classifier = _build_classifier(
-                        args.checkpoint, device,
-                        args.seed + processed + 1000 + ablation_index,
-                        graph_config=ablation_config,
+            if graph_ablation_names:
+                for ablation in graph_ablation_names:
+                    metric, attention = _run_graph_ablation(
+                        context, ablation, args, graph_config, progress.step,
                     )
-                    classifier.fit(x[:train_size], y_train)
-                    _set_temperature(classifier, args.graph_ablation_temperature)
-                    prefixes = _prefixes(classifier, args.blocks)
-                    prefix = max(prefixes)
-                    if prefix == 0:
-                        raise ValueError("Graph ablation requires at least one GAT block")
-                    gat = classifier.model_.model.icl_predictor.gat_icl
-                    original_blocks = gat.graph_blocks
-                    try:
-                        gat.graph_blocks = torch.nn.ModuleList(list(original_blocks)[:prefix])
-                        probabilities = classifier.predict_proba(x[train_size:])
-                        representation = classifier.predict_representation(x[train_size:])
-                        predicted = classifier.classes_[np.argmax(probabilities, axis=1)]
-                        graph_ablation_rows.append({
-                            "dataset": processed,
-                            "graph_ablation": ablation,
-                            "blocks": prefix,
-                            "temperature": args.graph_ablation_temperature,
-                            "cross_entropy": float(log_loss(
-                                y_test, probabilities, labels=classifier.classes_
-                            )),
-                            "balanced_accuracy": _balanced_accuracy(y_test, predicted),
-                        })
-                        for record in _attention_statistics(
-                            classifier.model_, labels, train_size, attention_top_k
-                        ):
-                            graph_ablation_attention_rows.append({
-                                "dataset": processed,
-                                "graph_ablation": ablation,
-                                "blocks": prefix,
-                                "temperature": args.graph_ablation_temperature,
-                                **record,
-                            })
-                    finally:
-                        gat.graph_blocks = original_blocks
-
-            for temperature in temperatures:
-                classifier = _build_classifier(
-                    args.checkpoint, device, args.seed + processed,
-                    graph_config=graph_config,
+                    dataset_results.graph_metrics.append(metric)
+                    dataset_results.graph_attention.extend(attention)
+            if not selected_ablations:
+                _run_layerwise_umap(
+                    context, args, graph_config, base_representations, progress.step,
                 )
-                classifier.fit(x[:train_size], y_train)
-                _set_temperature(classifier, temperature)
-                prefixes = _prefixes(classifier, args.blocks)
-                full_repr: dict[str, np.ndarray] = {"skip_gat": skip_repr}
-                full_repr.update(encoder_representations)
-                for prefix in prefixes:
-                    if prefix == 0:
-                        continue
-                    proba, representation, attention = _run_prefix(
-                        classifier, x[:train_size], y_train, x[train_size:],
-                        prefix, labels, temperature, attention_top_k,
-                    )
-                    variant = f"gat_{prefix}"
-                    full_repr[variant] = representation
-                    predicted = classifier.classes_[np.argmax(proba, axis=1)]
-                    rows.append({
-                        "dataset": processed, "variant": variant, "blocks": prefix,
-                        "temperature": temperature,
-                        "cross_entropy": float(log_loss(y_test, proba, labels=classifier.classes_)),
-                        "balanced_accuracy": _balanced_accuracy(y_test, predicted),
-                    })
-                    for record in attention:
-                        attention_rows.append({
-                            "dataset": processed, "blocks": prefix,
-                            "temperature": temperature, **record,
-                        })
-                    if args.show_graph and graph_edges is None:
-                        graph_edges = _cached_graph_edges(classifier)
-
-                _plot_umap(
-                    full_repr, labels, train_size,
-                    args.output_dir / "umap" / f"temperature_{temperature:g}"
-                    / f"dataset{processed:05d}.png",
-                    args.seed + processed, args.umap_n_neighbors, args.umap_n_epochs,
-                    graph_edges=graph_edges if args.show_graph else None,
+            elif "depth" in selected_ablations and "temperature" in selected_ablations:
+                depth_results = _run_temperature_ablation(
+                    context, args, graph_config, base_representations, progress.step,
                 )
+                dataset_results.metrics.extend(depth_results.metrics)
+                dataset_results.attention.extend(depth_results.attention)
+            elif "depth" in selected_ablations:
+                depth_results = _run_depth_ablation(
+                    context, args, graph_config, base_representations, progress.step,
+                )
+                dataset_results.metrics.extend(depth_results.metrics)
+                dataset_results.attention.extend(depth_results.attention)
+            elif "temperature" in selected_ablations:
+                temperature_results = _run_temperature_ablation(
+                    context, args, graph_config, base_representations, progress.step,
+                )
+                dataset_results.metrics.extend(temperature_results.metrics)
+                dataset_results.attention.extend(temperature_results.attention)
+            rows.extend(dataset_results.metrics)
+            attention_rows.extend(dataset_results.attention)
+            graph_ablation_rows.extend(dataset_results.graph_metrics)
+            graph_ablation_attention_rows.extend(dataset_results.graph_attention)
             processed += 1
+            progress.dataset_done()
 
+    progress.close()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     (args.output_dir / "metrics.json").write_text(json.dumps(rows, indent=2))
     (args.output_dir / "attention_statistics.json").write_text(json.dumps(attention_rows, indent=2))
-    if args.graph_ablation:
+    if graph_ablation_names:
         (args.output_dir / "graph_ablation_metrics.json").write_text(
             json.dumps(graph_ablation_rows, indent=2)
         )
         (args.output_dir / "graph_ablation_attention_statistics.json").write_text(
             json.dumps(graph_ablation_attention_rows, indent=2)
         )
-    _plot_metrics(rows, args.output_dir)
-    _plot_attention_statistics(attention_rows, args.output_dir)
-    _plot_attention_enrichment(attention_rows, args.output_dir)
-    _plot_attention_diagnostics(attention_rows, args.output_dir, attention_top_k)
-    if args.graph_ablation:
+    if rows:
+        _plot_metrics(rows, args.output_dir)
+    if attention_rows:
+        _plot_attention_statistics(attention_rows, args.output_dir)
+        _plot_attention_enrichment(attention_rows, args.output_dir)
+        _plot_attention_diagnostics(attention_rows, args.output_dir, attention_top_k)
+    if graph_ablation_names:
         _plot_graph_ablation(
-            graph_ablation_rows, graph_ablation_attention_rows, args.output_dir
+            graph_ablation_rows, graph_ablation_attention_rows, args.output_dir,
+            graph_ablation_names,
         )
     print(f"Saved {len(rows)} metric records to {args.output_dir / 'metrics.json'}")
     print(f"Saved {len(attention_rows)} attention records to {args.output_dir / 'attention_statistics.json'}")

@@ -19,22 +19,36 @@
 # v2 uses standard residual init (--zero_init False; v1 zero-initializes residual
 # branches) and enables FlashAttention-3 only in stages 2 & 3 (--use_flash_attn3).
 #
-# Adjust the placeholder paths and --nproc_per_node / --n_jobs for your hardware.
+# Runtime configuration can be overridden from the environment, for example:
+#   ICL_BACKEND=encoder WAND_LOG=True DEVICE=cuda:1 NUM_GPUS=1 ./train_v2_clf_stage1.sh
 
-NUM_GPUS=4                                   # the paper used 4 GPUs for pre-training
-CKPT_DIR=/path/to/checkpoints/tabiclv2-clf/stage1
+ICL_BACKEND=${ICL_BACKEND:-graph-1d}
+WAND_LOG=${WAND_LOG:-True}
+WAND_MODE=${WAND_MODE:-online}
+WAND_DIR=${WAND_DIR:-/workspace/wandb/}
+DEVICE=${DEVICE:-cuda}
+NUM_GPUS=${NUM_GPUS:-4}                       # the paper used 4 GPUs for pre-training
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,5}
+LOG_CONF_MAT_EVERY=${LOG_CONF_MAT_EVERY:-100000000} # no confusion matrix logging in stage 1
+
+export CUDA_VISIBLE_DEVICES
+
+CKPT_DIR=/workspace/checkpoints/tabiclv2-clf-graph-1d/stage1
 
 torchrun --standalone --nproc_per_node=$NUM_GPUS -m tabicl.train \
-            --wandb_log False \
+            --wandb_log ${WAND_LOG} \
             --wandb_project TabICLv2 \
             --wandb_name tabiclv2_clf_stage1 \
-            --device cuda \
+            --wandb_dir ${WAND_DIR} \
+            --wandb_mode ${WAND_MODE} \
+            --device ${DEVICE} \
             --dtype float32 \
             --np_seed 42 \
             --torch_seed 42 \
             --max_steps 500000 \
             --batch_size 64 \
-            --micro_batch_size 4 \
+            --micro_batch_size 2 \
+            --log_conf_mat_every ${LOG_CONF_MAT_EVERY} \
             --lr 8e-4 \
             --muon True \
             --beta1 0.9 \
@@ -48,15 +62,16 @@ torchrun --standalone --nproc_per_node=$NUM_GPUS -m tabicl.train \
             --gradient_clipping 10.0 \
             --prior_type graph_scm \
             --prior_device cpu \
+            --icl_backend ${ICL_BACKEND} \
             --n_jobs 16 \
             --batch_size_per_gp 4 \
             --min_features 1 \
-            --max_features 100 \
+            --max_features 256 \
             --max_classes 10 \
             --max_seq_len 1024 \
             --min_train_size 0.3 \
             --max_train_size 0.9 \
-            --seq_len_per_gp True \
+            --seq_len_per_gp False \
             --graph_noise False \
             --filter_unpredictable_graphs True \
             --filter_unpredictable_datasets True \
@@ -87,8 +102,9 @@ torchrun --standalone --nproc_per_node=$NUM_GPUS -m tabicl.train \
             --zero_init False \
             --use_flash_attn3 False \
             --checkpoint_dir $CKPT_DIR \
-            --save_temp_every 500 \
-            --save_perm_every 5000
+            --save_temp_every 1000 \
+            --save_perm_every 5000 \
+            --graph_num_graphs 6
 
 # Note on cautious weight decay: the paper reports using cautious weight decay (parameter
 # 0.01), but the reference pretraining runs that produced the released checkpoints

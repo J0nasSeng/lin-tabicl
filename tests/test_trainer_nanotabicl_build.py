@@ -1,6 +1,6 @@
 from argparse import Namespace
 
-from src.tabicl.train._run import Trainer
+from tabicl.train._run_legacy import Trainer
 from tabicl._model.nanotabicl import NanoTabICLv2
 
 
