@@ -1,0 +1,119 @@
+
+\documentclass{article} % For LaTeX2e
+\usepackage{iclr2027_conference,times}
+
+% Optional math commands from https://github.com/goodfeli/dlbook_notation.
+\input{math_commands.tex}
+
+\usepackage{hyperref}
+\usepackage{url}
+
+
+\title{GraTICL: A Unified Foundation Model for Tabular and Homophilic Graph in-context Learning}
+
+% Authors must not appear in the submitted version. They should be hidden
+% as long as the \iclrfinalcopy macro remains commented out below.
+% Non-anonymous submissions will be rejected without review.
+
+\author{}
+
+% The \author macro works with any number of authors. There are two commands
+% used to separate the names and addresses of multiple authors: \And and \AND.
+%
+% Using \And between authors leaves it to \LaTeX{} to determine where to break
+% the lines. Using \AND forces a linebreak at that point. So, if \LaTeX{}
+% puts 3 of 4 authors names on the first line, and the last on the second
+% line, try using \AND instead of \And before the third author name.
+
+\newcommand{\fix}{\marginpar{FIX}}
+\newcommand{\new}{\marginpar{NEW}}
+
+%\iclrfinalcopy % Uncomment for camera-ready version, but NOT for submission.
+\begin{document}
+
+
+\maketitle
+
+\begin{abstract}
+In-context Learning (ICL) for tabular and graph data gained significant traction in recent years. Tabular ICL approaches still struggle with large-scale datasets. At the same time, ICL for graph structures has yielded mixed results so far. We introduce Graph TabICL (GraTICL), a unified foundation model that can handle both data modalities (tabular data and graph data with tabular feature layouts). Building on Graph Attention Networks (GATs), GraTICL enables scaling to extremely large datasets on tabular data while at the same time enabling ICL for homophily graph structures. We find that extending popular tabular priors by a relatively simple graph generation mechanism yields a strong prior to achieve both tabular ICL and graph ICL in one unified foundation model. Our experiments demonstrate that GraTICL achieves strong performance on both tabular and node classification tasks and enables scaling to very large datasets due to the sparsity and locality of graph-based computations. 
+\end{abstract}
+
+\section{Introduction}
+
+Tabular Foundation Models (TFMs) have pioneered a shift in tabular learning by replacing traditional per-dataset fitting with in-context learning (ICL). Pre-trained on millions of synthetic datasets, TFMs effectively learn the underlying learning algorithms themselves, demonstrating remarkable zero-shot generalization for classification and regression. Naturally, this success raises a critical question: Can the principles of tabular ICL be extended to other structured modalities, such as graph data? While Graph Foundation Models (GFMs) have recently emerged to tackle node classification and link prediction, they have largely developed in isolation from TFMs, yielding mixed empirical success.
+
+In this work, we bridge this divide by demonstrating that tabular and graph ICL are fundamentally tightly coupled. We introduce a unified framework that formalizes both tabular classification and node classification under a shared prior and message passing paradigm. Specifically, we leverage the message-passing mechanism of Graph Attention Networks (GATs) as the bridge between modalities: tabular ICL can be naturally viewed as message passing over sparsely and semi-randomly connected tabular samples.
+
+Building on this insight, we propose Graph TabICL (GraTICL), a single foundation model capable of solving both tabular and node classification tasks. Unlike prior TFMs that train standard transformers on tabular data, GraTICL trains a GAT using an adapted version of the TabICL prior, allowing a single architecture to effectively process both modalities. Our empirical evaluation demonstrates that GraTICL achieves strong, competitive performance across standard tabular and graph benchmarks. Ultimately, our results suggest that tabular and graph modalities should not be treated as separate domains, but rather as two sides of the same algorithmic coin.
+
+We make the following contributions:
+
+\begin{enumerate}
+    \item \textbf{Unified Formalism:} We formalize tabular and graph in-context learning within a single, unified framework grounded in message passing.
+
+    \item \textbf{Architecture \& Method:} We introduce GraTICL, a single GAT-based foundation model trained on a generalized prior to solve both tabular and node classification tasks.
+
+    \item \textbf{Empirical Validation:} We perform extensive evaluations across standard tabular and graph benchmarks, demonstrating that a joint perspective yields strong zero-shot performance across both modalities.
+\end{enumerate}
+
+\section{GraTICL: Unifying Tabular and Node Classification}
+In the following, the problem setup and our methodology are presented.
+
+\subsection{Problem Statement}
+We aim to solve an in-context learning problem in the tabular/graph domain: Assume a labeled set of support instances $\mathcal{D}_S = \{(\mathbf{x}, y)_{i=0}^n \}$, an unlabeled query instance $\mathbf{x}_q$, and a graph $G \in \mathcal{G}(\{1, \dots, |\mathcal{D}_S| + 1\})$ without self-loops where $\mathcal{G}(\cdot)$ is the set of all graphs connecting samples from $\mathcal{D}_S \cup \{\mathbf{x}_q\}$. The goal is to predict the query instance's label $y_q$ in one forward pass. That is, we aim to learn $p_{\theta}(y_q | \mathcal{D}_S, G, \mathbf{x}_q)$ where $\theta$ are parameters of a neural network. We further assume $\mathbf{x} \in \mathcal{X}_S^{d_S}$ for all feature vectors, regardless of whether from the support or query set, where $\mathcal{X}_S$ is the feature space. It is assumed that $\mathcal{X}_S$ can contain real-valued and discrete variables and be of different dimensions for different tasks. The labels $y \in \{1, \dots, C\}$ are assumed to represent one of $C$ classes.
+
+\subsection{Architecture}
+To learn $p_{\theta}(y_q | \mathcal{D}_S, G, \mathbf{x}_q)$, we propose to leverage an adaptation of Graph Attention Transformers (GATs) performing message passing among the instances connected in $G$. From now on, let us denote $\mathcal{D}_s$ as an $n \times p$ matrix $\mathbf{X}_S$ where $p$ is the number of features. 
+
+\textbf{Encoding.} First, each cell of $x_{i j} \in \mathbf{X}_S$ is encoded into a $d$-dimensional vector $\mathbf{x}_{i j} = e(x_{i j})$ where $e: \mathbb{R} \rightarrow \mathbb{R}^d$ is a shared linear layer. This yields a tensor $\mathbf{X} \in \mathbb{R}^{n \times p \times d}$. Column/feature identity is encoded additively, i.e., $\mathbf{x}_i = \mathbf{x}_{i j} + \text{col}(j)$ for each encoded cell $\mathbf{x}_{i j}$. Analogously, label information is encoded additively for all support samples, i.e., $\mathbf{x}_{i j} = \mathbf{x}_{i j} + h(y_i)$ where $h: \mathbb{R} \rightarrow \mathbb{R}^d$ is a linear transformation. Finally, a learnable $d$-dimensional $\text{CLS}$ token is appended as an additional dimension for each sample.
+
+\textbf{ICL via Message Passing.} After encoding each cell, we perform message passing along the edges defined in $G$. Note that $G$ contains exactly one node for each support and query sample. Additionally, column-wise attention is employed to capture dependencies across columns. Consider a sample $\mathbf{x}_i \in \mathbf{X}$ and let $\mathbf{X}_{\mathcal{N}}$ be the set of neighbors of $\mathbf{x}_i$ in matrix form. Note that $\mathbf{x}_i$ is a $p \times d$ matrix. Our message passing operation is performed for each feature dimension $j$ independently and is defined as follows:
+
+\begin{equation}
+    \mathbf{x}_{i j} = \text{LayerNorm}(\mathbf{x}_{i j} + \text{MLP}(\text{CrossAttn}(\mathbf{x}_{i j}, \mathbf{X}_{\mathcal{N}})))
+\end{equation}
+
+To capture feature correlations, a standard multi-head attention along the feature dimension is employed:
+
+\begin{equation}
+    \mathbf{X} = \mathbf{X} + \text{MultiHeadAttn}(\mathbf{X})
+\end{equation}
+
+Finally, a soft-knn readout layer is used to compute $p_{\theta}(y_q | \mathcal{D}_S, G, \mathbf{x}_q)$ using the distance between the encoding given by the $\text{CLS}$ token of the query and support instances. For this, for a query sample $\mathbf{x}_q$, the cosine distance to each support sample $\mathbf{x}_i$ is computed. This yields a vector of distances $\mathbf{v} = (\text{cos}(\mathbf{x}_q, \mathbf{x}_1), \dots, \text{cos}(\mathbf{x}_q, \mathbf{x}_n))$. Applying softmax gives us an affinity vector $\mathbf{a} = \text{softmax}(\mathbf{v})$ which we use to compute a weighted sum of one-hot encoded labels.
+
+\begin{equation}
+    p_{\theta}(y_q | \mathcal{D}_S, G, \mathbf{x}_q) = \sum_{i=1}^n \mathbf{a}_i \cdot \text{OneHot}(y_i)
+\end{equation}
+
+\subsection{Graph Construction \& Prior}
+
+Since our model is conditioned on both a labeled dataset and a graph structure, we need to extend the prior commonly used to train TFMs by also sampling meaningful graphs that enable in-context learning. 
+
+\textbf{Graph Prior.}
+To enable ICL while maintaining linear attention complexity, we construct sparse, directed, class-conditioned graphs $G = (V, E)$ over the set of batch instances. The node set $V = V_{S} \cup V_{Q}$ comprises $\vert{}V_{S}\vert{} = n_S$ labeled support samples and $\vert{}V_{q}\vert{} = n_Q$ unlabeled test samples, where directed edges $u \to v$ permit node $v$ to attend to node $u$. Edges are generated through two complementary procedures governing internal training connectivity and target test aggregation.
+
+\textit{Internal training topology ($V_{S} \to V_{S}$)} relies on symmetric directed pairs to encourage both intra-class representation clustering and inter-class boundary awareness. For each graph, we sample a global pair budget $B \sim U(n_S \cdot k_{\text{min}}, n_S \cdot k_{\text{max}})$ and allocate a targeted fraction $\alpha$ to cross-class connections and $(1 - \alpha)$ to same-class connections. Edges are drawn uniformly via stochastic index sampling, with any residual budget from saturated class pools reallocated to the remaining pool. Restricting node degrees within this bounded range maintains linear $\mathcal{O}(n_S + n_Q)$ global message-passing complexity, while the stochastic sampling acts as a graph-level regularizer across training iterations.
+
+\textit{Target test connections ($V_S \to V_{Q}$)} treat test nodes strictly as information sinks to prevent data leakage and isolate target predictions. For every test node $v \in V_{Q}$ and each class label $c \in C$, we sample $m$ training neighbors from class $c$ without replacement, falling back to sampling with replacement only when class size is smaller than $m$. Enforcing zero outbound edge capacity for test instances ensures that test features never propagate into training representations or interfere across parallel test queries. Furthermore, guaranteeing a fixed context allocation of $m$ neighbors per class ensures balanced representations during target aggregation, shielding the model from majority-class bias under severe training class imbalance.
+
+\textbf{Data Prior.} We use the TabICLv2 data prior without modification. This choice provides a fully open-source tabular foundation-model reference: both the released TabICLv2 weights and the data prior used for its training are available. Holding the prior fixed allows us to systematically compare GraTICL with TabICLv2 and to meaningfully isolate the effect of sparsifying the computations through graph-based message passing.
+
+\subsection{Training}
+
+
+\section{Empirical Evaluation}
+
+\section{Related Work}
+
+\section{Conclusion}
+
+
+\bibliography{iclr2027_conference}
+\bibliographystyle{iclr2027_conference}
+
+\appendix
+\section{Appendix}
+You may include other additional sections here.
+
+
+\end{document}

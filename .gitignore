@@ -159,3 +159,47 @@ gat_eval/
 gat_investigation/
 data/
 checkpoints*
+
+###### Latex stuff
+
+# LaTeX core
+*.aux
+*.log
+*.out
+*.toc
+*.lof
+*.lot
+
+# latexmk
+*.fls
+*.fdb_latexmk
+
+# XeLaTeX / SyncTeX
+*.xdv
+*.synctex.gz
+
+# Bibliography
+*.bbl
+*.blg
+*.bcf
+*.run.xml
+
+# Glossaries / acronyms
+*.acn
+*.acr
+*.alg
+*.glg
+*.glo
+*.gls
+*.glsdefs
+*.ist
+
+# Index
+*.idx
+*.ilg
+*.ind
+
+# Optional: beamer
+*.nav
+*.snm
+*.vrb
