@@ -1,0 +1,135 @@
+
+\documentclass{article} % For LaTeX2e
+\usepackage{iclr2027_conference,times}
+
+% Optional math commands from https://github.com/goodfeli/dlbook_notation.
+\input{math_commands.tex}
+
+\usepackage{hyperref}
+\usepackage{url}
+
+
+\title{GraTICL: A Unified Foundation Model for Tabular and Homophilic Graph in-context Learning}
+
+% Authors must not appear in the submitted version. They should be hidden
+% as long as the \iclrfinalcopy macro remains commented out below.
+% Non-anonymous submissions will be rejected without review.
+
+\author{}
+
+% The \author macro works with any number of authors. There are two commands
+% used to separate the names and addresses of multiple authors: \And and \AND.
+%
+% Using \And between authors leaves it to \LaTeX{} to determine where to break
+% the lines. Using \AND forces a linebreak at that point. So, if \LaTeX{}
+% puts 3 of 4 authors names on the first line, and the last on the second
+% line, try using \AND instead of \And before the third author name.
+
+\newcommand{\fix}{\marginpar{FIX}}
+\newcommand{\new}{\marginpar{NEW}}
+
+%\iclrfinalcopy % Uncomment for camera-ready version, but NOT for submission.
+\begin{document}
+
+
+\maketitle
+
+\begin{abstract}
+Tabular Foundation Models (TFMs) solve classification and regression tasks through in-context learning (ICL), without any gradient updates at test time. Almost all of them realize ICL through dense attention over the samples of a dataset, so that every sample can exchange information with every other sample, at a cost that grows quadratically with the size of the context. We ask whether this dense layout is necessary, or whether a much sparser one suffices. To study this, we reframe tabular classification as node classification in a sparse graph: each sample becomes a node, and a sparsely connected, label-informed graph determines which samples may exchange information, so that ICL is carried out by message passing instead of dense attention. We instantiate this idea in GraTICL, a Graph Attention Network trained on the open-source TabICLv2 prior. We find that the number of attention operations can be reduced substantially while retaining most of the predictive performance, suggesting that dense sample-to-sample attention is largely redundant. Because the graph is an explicit input rather than a fixed architectural choice, the model is additionally promptable through its connectivity, which opens up test-time optimization over the graph structure, and the same recipe carries over to node classification on graph data, indicating a unified pathway of tabular and graph foundation models.
+\end{abstract}
+
+\section{Introduction}
+
+Tabular Foundation Models (TFMs) have pioneered a shift in tabular learning by replacing traditional per-dataset fitting with in-context learning (ICL). Pre-trained on millions of synthetic datasets, TFMs effectively learn the underlying learning algorithm itself and achieve remarkable performance on classification and regression tasks without any gradient updates at test time~\citep{hollmann2025accurate, qu2026tabiclv2, zhang2025limixunleashingstructureddatamodeling, zhang2025mitra}.
+
+Almost all current TFMs realize ICL through dense attention over the samples of a dataset: every test sample attends to every training sample, and training samples attend to each other. This design places no restriction on which samples may exchange information, but it makes the cost of a forward pass grow quadratically with the number of samples in the context. As a consequence, the very regime in which tabular models are most useful, namely datasets with many rows, is also the regime in which TFMs are most expensive to apply.
+
+This raises the question we study in this work: \emph{is a dense sample-to-sample attention layout actually necessary for in-context learning on tabular data, or can it be replaced by a much sparser one?} To answer it, we reframe tabular classification as node classification in a sparse graph. Each sample of a dataset, whether labeled or unlabeled, becomes a node, and a sparsely connected, label-informed graph determines which samples are allowed to exchange information. ICL is then carried out by message passing along these edges rather than by dense attention, which reduces the number of attention operations from quadratic to linear in the number of samples~\citep{gilmer2017neural_msg_passing}. Since this formulation conditions the model on an explicit graph, it applies unchanged to data that already comes with a graph structure.
+
+Our study yields three findings. First, the number of attention operations required for tabular ICL can be reduced substantially without sacrificing much predictive performance, indicating that dense sample-to-sample attention is largely redundant. Second, because the graph is an explicit input rather than a fixed architectural choice, the resulting model becomes promptable through its graph structure, which opens up test-time optimization over the connectivity pattern. Third, the same recipe transfers to node classification on graph data, where the sampled graph is simply replaced by the observed one.
+
+We make the following contributions:
+
+\begin{enumerate}
+    \item \textbf{Sparse Reformulation:} We reframe tabular in-context learning as node classification in a sparse, label-informed graph, replacing dense sample-to-sample attention by message passing with linear cost in the number of samples.
+
+    \item \textbf{Architecture \& Method:} We introduce GraTICL, a GAT-based foundation model trained on an otherwise unmodified tabular prior, so that the effect of sparsification can be isolated.
+
+    \item \textbf{Empirical Validation:} We evaluate the effect of sparsification on tabular benchmarks, study the model's promptability through the graph structure at test time, and demonstrate that the approach transfers to node classification.
+\end{enumerate}
+
+\section{GraTICL: Unifying Tabular and Node Classification}
+In the following, the problem setup and our methodology are presented.
+
+\subsection{Problem Statement}
+We aim to solve an in-context learning problem in the tabular/graph domain: Assume a labeled set of support instances $\mathcal{D}_S = \{(\mathbf{x}, y)_{i=0}^n \}$, an unlabeled query instance $\mathbf{x}_q$, and a graph $G \in \mathcal{G}(\{1, \dots, |\mathcal{D}_S| + 1\})$ without self-loops where $\mathcal{G}(\cdot)$ is the set of all graphs connecting samples from $\mathcal{D}_S \cup \{\mathbf{x}_q\}$. The goal is to predict the query instance's label $y_q$ in one forward pass. That is, we aim to learn $p_{\theta}(y_q | \mathcal{D}_S, G, \mathbf{x}_q)$ where $\theta$ are parameters of a neural network. We further assume $\mathbf{x} \in \mathcal{X}_S^{d_S}$ for all feature vectors, regardless of whether from the support or query set, where $\mathcal{X}_S$ is the feature space. It is assumed that $\mathcal{X}_S$ can contain real-valued and discrete variables and be of different dimensions for different tasks. The labels $y \in \{1, \dots, C\}$ are assumed to represent one of $C$ classes.
+
+\subsection{Architecture}
+To learn $p_{\theta}(y_q | \mathcal{D}_S, G, \mathbf{x}_q)$, we propose to leverage an adaptation of Graph Attention Transformers (GATs) performing message passing among the instances connected in $G$. From now on, let us denote $\mathcal{D}_s$ as an $n \times p$ matrix $\mathbf{X}_S$ where $p$ is the number of features. 
+
+\textbf{Encoding.} First, each cell of $x_{i j} \in \mathbf{X}_S$ is encoded into a $d$-dimensional vector $\mathbf{x}_{i j} = e(x_{i j})$ where $e: \mathbb{R} \rightarrow \mathbb{R}^d$ is a shared linear layer. This yields a tensor $\mathbf{X} \in \mathbb{R}^{n \times p \times d}$. Column/feature identity is encoded additively, i.e., $\mathbf{x}_i = \mathbf{x}_{i j} + \text{col}(j)$ for each encoded cell $\mathbf{x}_{i j}$. Analogously, label information is encoded additively for all support samples, i.e., $\mathbf{x}_{i j} = \mathbf{x}_{i j} + h(y_i)$ where $h: \mathbb{R} \rightarrow \mathbb{R}^d$ is a linear transformation. Finally, a learnable $d$-dimensional $\text{CLS}$ token is appended as an additional dimension for each sample.
+
+\textbf{ICL via Message Passing.} After encoding each cell, we perform message passing along the edges defined in $G$. Note that $G$ contains exactly one node for each support and query sample. Additionally, column-wise attention is employed to capture dependencies across columns. Consider a sample $\mathbf{x}_i \in \mathbf{X}$ and let $\mathbf{X}_{\mathcal{N}}$ be the set of neighbors of $\mathbf{x}_i$ in matrix form. Note that $\mathbf{x}_i$ is a $p \times d$ matrix. Our message passing operation is performed for each feature dimension $j$ independently and is defined as follows:
+
+\begin{equation}
+    \mathbf{x}_{i j} = \text{LayerNorm}(\mathbf{x}_{i j} + \text{MLP}(\text{CrossAttn}(\mathbf{x}_{i j}, \mathbf{X}_{\mathcal{N}})))
+\end{equation}
+
+To capture feature correlations, a standard multi-head attention along the feature dimension is employed:
+
+\begin{equation}
+    \mathbf{X} = \mathbf{X} + \text{MultiHeadAttn}(\mathbf{X})
+\end{equation}
+
+Finally, a soft-knn readout layer is used to compute $p_{\theta}(y_q | \mathcal{D}_S, G, \mathbf{x}_q)$ using the distance between the encoding given by the $\text{CLS}$ token of the query and support instances. For this, for a query sample $\mathbf{x}_q$, the cosine distance to each support sample $\mathbf{x}_i$ is computed. This yields a vector of distances $\mathbf{v} = (\text{cos}(\mathbf{x}_q, \mathbf{x}_1), \dots, \text{cos}(\mathbf{x}_q, \mathbf{x}_n))$. Applying softmax gives us an affinity vector $\mathbf{a} = \text{softmax}(\mathbf{v})$ which we use to compute a weighted sum of one-hot encoded labels.
+
+\begin{equation}
+    p_{\theta}(y_q | \mathcal{D}_S, G, \mathbf{x}_q) = \sum_{i=1}^n \mathbf{a}_i \cdot \text{OneHot}(y_i)
+\end{equation}
+
+\subsection{Graph Construction \& Prior}
+
+Since our model is conditioned on both a labeled dataset and a graph structure, we need to extend the prior commonly used to train TFMs by also sampling meaningful graphs that enable in-context learning. 
+
+\textbf{Graph Prior.}
+To enable ICL while maintaining linear attention complexity, we construct sparse, directed, class-conditioned graphs $G = (V, E)$ over the set of batch instances. The node set $V = V_{S} \cup V_{Q}$ comprises $\vert{}V_{S}\vert{} = n_S$ labeled support samples and $\vert{}V_{q}\vert{} = n_Q$ unlabeled test samples, where directed edges $u \to v$ permit node $v$ to attend to node $u$. Edges are generated through two complementary procedures governing internal training connectivity and target test aggregation.
+
+\textit{Internal training topology ($V_{S} \to V_{S}$)} relies on symmetric directed pairs to encourage both intra-class representation clustering and inter-class boundary awareness. For each graph, we sample a global pair budget $B \sim U(n_S \cdot k_{\text{min}}, n_S \cdot k_{\text{max}})$ and allocate a targeted fraction $\alpha$ to cross-class connections and $(1 - \alpha)$ to same-class connections. Edges are drawn uniformly via stochastic index sampling, with any residual budget from saturated class pools reallocated to the remaining pool. Restricting node degrees within this bounded range maintains linear $\mathcal{O}(n_S + n_Q)$ global message-passing complexity, while the stochastic sampling acts as a graph-level regularizer across training iterations.
+
+\textit{Target test connections ($V_S \to V_{Q}$)} treat test nodes strictly as information sinks to prevent data leakage and isolate target predictions. For every test node $v \in V_{Q}$ and each class label $c \in C$, we sample $m$ training neighbors from class $c$ without replacement, falling back to sampling with replacement only when class size is smaller than $m$. Enforcing zero outbound edge capacity for test instances ensures that test features never propagate into training representations or interfere across parallel test queries. Furthermore, guaranteeing a fixed context allocation of $m$ neighbors per class ensures balanced representations during target aggregation, shielding the model from majority-class bias under severe training class imbalance.
+
+\textbf{Data Prior.} We use the TabICLv2 data prior without modification. This choice provides a fully open-source tabular foundation-model reference: both the released TabICLv2 weights and the data prior used for its training are available. Holding the prior fixed allows us to systematically compare GraTICL with TabICLv2 and to meaningfully isolate the effect of sparsifying the computations through graph-based message passing.
+
+\subsection{Training}
+
+GraTICL is pre-trained from scratch on synthetic datasets that are generated on the fly by the prior described above. We mostly reuse the TabICLv2 pre-training recipe and replace the dense ICL backbone by the graph-based message-passing backbone.
+
+\textbf{Objective.} Each training example is a synthetic dataset that is split into a support and a query part. The model observes all features together with the support labels and predicts the query labels in a single forward pass; we minimize the cross-entropy between the predicted class distribution and the true query labels. Prior datasets contain between $1$ and $256$ features and at most $10$ classes; the number of features seen by the model is padded to a common width within a micro-batch, and the per-dataset feature count is not passed to the model, so that all (padded) columns are treated uniformly.
+
+\textbf{Curriculum.} Training proceeds in three stages with a batch size of $64$ datasets throughout. Stage 1 runs for $500{,}000$ steps on datasets of $2{,}048$ samples with a support fraction drawn uniformly from $[0.3, 0.9]$, a peak learning rate of $8 \cdot 10^{-4}$, and gradient clipping at $10$. Stage 2 runs for $40{,}000$ steps on datasets whose size is drawn log-uniformly from $[400, 10{,}240]$ with a support fraction in $[0.79, 0.81]$, a peak learning rate of $10^{-4}$, and gradient clipping at $10$. Stage 3 runs for $10{,}000$ steps on datasets of up to $60{,}000$ samples (again log-uniform, starting at $400$), a peak learning rate of $2 \cdot 10^{-5}$, and gradient clipping at $1$. Each stage is initialized from the weights of the preceding stage; optimizer and scheduler state are not carried over across stages.
+
+\textbf{Optimization.} We use the Muon optimizer with momentum $0.9$, Nesterov updates, five Newton--Schulz iterations, and weight decay $0.01$. The learning rate follows a cosine schedule with a warmup of $1\%$ of the total steps, a single cycle, and a final learning rate of $10^{-7}$. The batch of $64$ datasets is split into micro-batches whose gradients are accumulated, so that the effective batch size is independent of the available memory. We use mixed-precision training throughout all training stages.
+
+\textbf{Model configuration.} All experiments use an embedding dimension of $128$. The column embedder and the row interactor each consist of three blocks with eight attention heads, and the ICL backbone consists of $12$ message-passing blocks with eight heads. Note that the GAT-based ICL backend uses residual connections to prevent oversmoothing. Further, we sample $6$ graphs per dataset from the graph prior, so that each sampled graph is shared by two consecutive message-passing blocks, and resampling across blocks exposes the model to several connectivity patterns per forward pass. This not only provides each training and test sample with different "views`` w.r.t. the context, but also prevents oversmoothing. Feed-forward layers use an expansion factor of $2$ with pre-normalization. Unless stated otherwise, the graph prior uses a degree budget of $k_{\text{min}} = 8$ and $k_{\text{max}} = 15$ pairs per support node, a cross-class fraction of $\alpha = 0.1$, and $m = 8$ support neighbors per class for each query node.
+
+
+\section{Empirical Evaluation}
+
+\section{Related Work}
+
+\textbf{Tabular Foundation Models.} Prior-Data Fitted Networks~\citep{muller2022transformers} introduced the idea of pre-training a transformer on datasets drawn from a synthetic prior so that it approximates Bayesian inference by in-context learning. TabPFN~\citep{hollmann2023tabpfn} instantiated this idea for tabular classification on small datasets, and its successor extended it to regression and to larger, more heterogeneous data~\citep{hollmann2025accurate}. Because performance depends strongly on the pre-training distribution, a line of work targets the prior itself, for instance by mixing several synthetic data-generating mechanisms~\citep{zhang2025mitra}. A second line targets scale and architecture: TabICL~\citep{qu2025tabicl} employs a two-stage column-then-row attention scheme aimed at larger datasets, TabICLv2~\citep{qu2026tabiclv2} additionally releases its prior alongside the weights, and LimiX~\citep{zhang2025limixunleashingstructureddatamodeling} treats structured data as a joint distribution over variables and missingness to cover several tabular tasks with one model. Despite these differences, the models above perform in-context learning through attention in which every sample can attend to every other sample, so the cost of a forward pass grows quadratically with the context. Existing remedies largely preserve this all-pairs interaction: inducing-point attention reduces set self-attention to linear cost in the number of elements~\citep{lee2019set}, while IO-aware kernels reduce memory traffic without changing the attention pattern~\citep{dao2022flashattention}. In language modeling, sparse and low-rank attention mechanisms relax the all-pairs assumption~\citep{zaheer2020bigbird, beltagy2020longformer, choromanski2021rethinking}, but their sparsity patterns are defined over token positions rather than over labeled samples. We instead make the interaction pattern an explicit, label-informed graph over samples, which allows the effect of sparsification to be studied directly. Independently of these developments, tuned tree ensembles remain strong baselines on medium-sized tabular data~\citep{grinsztajn2022why_do_tree_models}.
+
+\textbf{Graph Neural Networks and Graph Foundation Models.} Message passing is the standard computational pattern for learning on graphs, unified by the MPNN framework~\citep{gilmer2017neural_msg_passing}. Graph convolutional networks aggregate over neighborhoods with fixed weights~\citep{kipf2017semi}, whereas graph attention networks weight neighbors by learned attention~\citep{velickovic2018graph}; GATv2 shows that the original formulation realizes only static attention and proposes a dynamic variant~\citep{brody2022how_attentive}. Since exact aggregation is expensive on large graphs, neighbor sampling is a common remedy~\citep{hamilton2017inductive}, and our bounded degree budget plays an analogous role. Stacking many message-passing layers is known to make node representations increasingly indistinguishable, which motivates normalization~\citep{zhao2020pairnorm} and stochastic edge removal~\citep{rong2020dropedge}; the latter is also the closest precedent for resampling several graphs within a single forward pass. Most of these architectures perform best when connected nodes tend to share labels, and their behavior degrades under heterophily, which has prompted dedicated designs~\citep{zhu2020beyond, pei2020geomgcn}; accordingly, we restrict our claims to the homophilic setting. Closest to our work, PRODIGY~\citep{huang2023prodigy} enables in-context learning over graphs by connecting prompt examples and queries in a prompt graph, and thereby conditions a graph model on labeled context at inference time. Our setting differs in the direction of transfer: rather than pre-training on observed graphs, we sample graphs as part of a tabular prior and treat an observed graph as a special case at test time. Standardized node classification benchmarks provide the evaluation protocols for this modality~\citep{hu2020open}.
+
+\section{Conclusion}
+
+
+\bibliography{iclr2027_conference}
+\bibliographystyle{iclr2027_conference}
+
+\appendix
+\section{Appendix}
+You may include other additional sections here.
+
+
+\end{document}
