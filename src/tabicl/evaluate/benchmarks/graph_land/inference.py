@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 import torch
 from sklearn.metrics import (
+	average_precision_score,
 	balanced_accuracy_score,
 	f1_score,
 	precision_score,
@@ -110,8 +111,10 @@ def _metrics(
 				f"Binary classification requires two probability columns for ROC AUC, got shape {probabilities.shape}"
 			)
 		result["roc_auc"] = float(roc_auc_score(y_true, probabilities[:, 1]))
+		result["average_precision"] = float(average_precision_score(y_true, probabilities[:, 1]))
 	else:
 		result["roc_auc"] = float("nan")
+		result["average_precision"] = float("nan")
 	return result
 
 
