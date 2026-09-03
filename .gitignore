@@ -138,6 +138,7 @@ docs/tutorials/
 
 # resources
 *.png
+*.csv
 
 # logs
 wandb/

@@ -27,8 +27,8 @@ WAND_LOG=${WAND_LOG:-True}
 WAND_MODE=${WAND_MODE:-online}
 WAND_DIR=${WAND_DIR:-/workspace/wandb/}
 DEVICE=${DEVICE:-cuda}
-NUM_GPUS=${NUM_GPUS:-4}                       # the paper used 4 GPUs for pre-training
-CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,5}
+NUM_GPUS=${NUM_GPUS:-2}                       # the paper used 4 GPUs for pre-training
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
 LOG_CONF_MAT_EVERY=${LOG_CONF_MAT_EVERY:-100000000} # no confusion matrix logging in stage 1
 
 export CUDA_VISIBLE_DEVICES

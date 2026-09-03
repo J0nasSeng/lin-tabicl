@@ -25,7 +25,7 @@ from sklearn.preprocessing import StandardScaler
 
 from xgboost import XGBClassifier
 
-from tabicl.eval._run import EvalSample, _build_model_from_checkpoint, _evaluate_one_dataset
+from tabicl.evaluate._run import EvalSample, _build_model_from_checkpoint, _evaluate_one_dataset
 from tabicl.prior._dataset import PriorDataset
 from tabicl.prior._prior_config import DEFAULT_FIXED_HP
 from tabicl import TabICLClassifier
