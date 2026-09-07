@@ -729,9 +729,7 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
     def _batch_forward_with_repr(
         self, Xs: np.ndarray, ys: np.ndarray, feature_shuffles: Optional[np.ndarray] = None
     ) -> np.ndarray:
-        """Return graph-backend representations for a batch of ensemble views."""
-        if not isinstance(self.model_, GATInferenceEngine):
-            raise ValueError("Representations are only exposed for graph-backend TabICL models.")
+        """Return post-ICL representations for a batch of ensemble views."""
 
         batch_size = self.batch_size or Xs.shape[0]
         n_batches = int(np.ceil(Xs.shape[0] / batch_size))
@@ -749,26 +747,36 @@ class TabICLClassifier(ClassifierMixin, TabICLBaseEstimator):
             if shuffle_batch is not None:
                 shuffle_batch = shuffle_batch.tolist()
             with torch.no_grad():
-                _, representation = self.model_(
-                    X=X_batch,
-                    y_train=y_batch,
-                    feature_shuffles=shuffle_batch,
-                    return_logits=True,
-                    inference_config=self.inference_config_,
-                    return_repr=True,
-                )
+                if isinstance(self.model_, GATInferenceEngine):
+                    _, representation = self.model_(
+                        X=X_batch,
+                        y_train=y_batch,
+                        feature_shuffles=shuffle_batch,
+                        return_logits=True,
+                        inference_config=self.inference_config_,
+                        return_repr=True,
+                    )
+                else:
+                    _, representation = self.model_(
+                        X=X_batch,
+                        y_train=y_batch,
+                        feature_shuffles=shuffle_batch,
+                        return_logits=True,
+                        inference_config=self.inference_config_,
+                        return_pre_decoder_repr=True,
+                    )
             representations.append(representation.float().cpu().numpy())
         return np.concatenate(representations, axis=0)
 
     def predict_representation(self, X: np.ndarray) -> np.ndarray:
-        """Return the fitted graph TabICL representation for train and test rows.
+        """Return fitted TabICL representations for train and test rows.
 
         The returned representation is produced by the same sklearn ensemble
         views and GAT inference engine used by :meth:`predict_proba`.
         """
         check_is_fitted(self)
-        if not isinstance(self.model_, GATInferenceEngine):
-            raise ValueError("Representations are only exposed for graph-backend TabICL models.")
+        if not isinstance(self.model_, (GATInferenceEngine, TabICL)):
+            raise ValueError("Representations are only exposed for supported TabICL backends.")
 
         X = validate_data(self, X, reset=False, dtype=None, skip_check_array=True)
         X = self.X_encoder_.transform(X)

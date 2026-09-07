@@ -236,6 +236,17 @@ def _prediction_record(
     }
 
 
+def _validate_representation(
+    representation: np.ndarray, expected_rows: int, name: str,
+) -> np.ndarray:
+    if representation.ndim != 2 or representation.shape[0] != expected_rows:
+        raise ValueError(
+            f"{name} representation has shape {representation.shape}; "
+            f"expected ({expected_rows}, representation_dim)"
+        )
+    return representation
+
+
 def _encoder_layer_representations(
     classifier: TabICLClassifier, X: np.ndarray
 ) -> dict[str, np.ndarray]:
@@ -340,8 +351,9 @@ def _run_prefix(
         classifier.fit(x_train, y_train)
         _set_temperature(classifier, temperature)
         probabilities = classifier.predict_proba(x_test) if collect_diagnostics else None
-        representation = classifier.predict_representation(
-            np.concatenate((x_train, x_test), axis=0)
+        representation = classifier.predict_representation(x_test)
+        representation = _validate_representation(
+            representation, x_train.shape[0] + x_test.shape[0], "GAT",
         )
         attention = (
             _attention_statistics(engine, labels, y_train.shape[0], attention_top_k)
@@ -364,7 +376,10 @@ def _run_skip_gat_ablation(
     )
     classifier.fit(context.x_train, context.y_train)
     probabilities = classifier.predict_proba(context.x_test)
-    representation = classifier.predict_representation(context.x)
+    representation = classifier.predict_representation(context.x_test)
+    representation = _validate_representation(
+        representation, context.labels.shape[0], "skip-GAT",
+    )
     return representation, _prediction_record(
         context, "skip_gat", 0, None, probabilities, classifier.classes_,
     )
@@ -645,11 +660,12 @@ def _plot_umap(
     import matplotlib.pyplot as plt
     from umap import UMAP
 
-    def draw(axis, representation: np.ndarray | None, start: int, end: int, title: str) -> None:
+    coordinates: dict[str, np.ndarray] = {}
+    for name, representation in representations.items():
         if representation is None:
-            axis.axis("off")
-            return
-        coords = UMAP(
+            continue
+        representation = _validate_representation(representation, len(labels), name)
+        coordinates[name] = UMAP(
             n_components=2,
             n_neighbors=min(n_neighbors, len(labels) - 1),
             n_epochs=n_epochs,
@@ -657,6 +673,12 @@ def _plot_umap(
             n_jobs=1,
             random_state=seed,
         ).fit_transform(np.nan_to_num(representation))
+
+    def draw(axis, name: str, start: int, end: int, title: str) -> None:
+        coords = coordinates.get(name)
+        if coords is None:
+            axis.axis("off")
+            return
         if graph_edges is not None:
             edge_src, edge_dst = graph_edges
             valid_edges = (
@@ -687,26 +709,26 @@ def _plot_umap(
         fig, axes = plt.subplots(
             4, n_columns, figsize=(5 * n_columns, 16), squeeze=False, dpi=150,
         )
-        draw(axes[0, 0], representations.get("skip_gat"), 0, train_size, "skip_gat: Train")
-        draw(axes[1, 0], representations.get("skip_gat"), train_size, len(labels), "skip_gat: Test")
+        draw(axes[0, 0], "skip_gat", 0, train_size, "skip_gat: Train")
+        draw(axes[1, 0], "skip_gat", train_size, len(labels), "skip_gat: Test")
         axes[2, 0].axis("off")
         axes[3, 0].axis("off")
         for column in range(1, n_columns):
             layer = column
             encoder = representations.get(f"encoder_{layer}")
             gat = representations.get(f"gat_{layer}")
-            draw(axes[0, column], encoder, 0, train_size, f"encoder_{layer}: Train")
-            draw(axes[1, column], gat, 0, train_size, f"gat_{layer}: Train")
-            draw(axes[2, column], encoder, train_size, len(labels), f"encoder_{layer}: Test")
-            draw(axes[3, column], gat, train_size, len(labels), f"gat_{layer}: Test")
+            draw(axes[0, column], f"encoder_{layer}", 0, train_size, f"encoder_{layer}: Train")
+            draw(axes[1, column], f"gat_{layer}", 0, train_size, f"gat_{layer}: Train")
+            draw(axes[2, column], f"encoder_{layer}", train_size, len(labels), f"encoder_{layer}: Test")
+            draw(axes[3, column], f"gat_{layer}", train_size, len(labels), f"gat_{layer}: Test")
     else:
         variants = list(representations)
         fig, axes = plt.subplots(
             2, len(variants), figsize=(5 * len(variants), 8), squeeze=False, dpi=150,
         )
         for column, variant in enumerate(variants):
-            draw(axes[0, column], representations[variant], 0, train_size, f"{variant}: Train")
-            draw(axes[1, column], representations[variant], train_size, len(labels), f"{variant}: Test")
+            draw(axes[0, column], variant, 0, train_size, f"{variant}: Train")
+            draw(axes[1, column], variant, train_size, len(labels), f"{variant}: Test")
     fig.tight_layout()
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output)
@@ -1099,7 +1121,10 @@ def main() -> None:
                     skip_gat=True, graph_config=graph_config,
                 )
                 skip.fit(context.x_train, context.y_train)
-                base_representations["skip_gat"] = skip.predict_representation(context.x)
+                base_representations["skip_gat"] = _validate_representation(
+                    skip.predict_representation(context.x_test),
+                    context.labels.shape[0], "skip-GAT",
+                )
 
             if args.encoder_checkpoint is not None:
                 encoder = _build_encoder_classifier(
@@ -1107,7 +1132,11 @@ def main() -> None:
                     args.n_estimators,
                 )
                 encoder.fit(context.x_train, context.y_train)
-                base_representations.update(_encoder_layer_representations(encoder, context.x))
+                encoder_representations = _encoder_layer_representations(encoder, context.x_test)
+                base_representations.update({
+                    name: _validate_representation(value, context.labels.shape[0], name)
+                    for name, value in encoder_representations.items()
+                })
                 if collect_diagnostics:
                     probabilities = encoder.predict_proba(context.x_test)
                     dataset_results.metrics.append(_prediction_record(

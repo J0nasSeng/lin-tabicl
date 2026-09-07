@@ -472,8 +472,9 @@ class TabICL(nn.Module):
         return_logits: bool = True,
         softmax_temperature: float = 0.9,
         inference_config: Optional[InferenceConfig] = None,
+        return_pre_decoder_repr: bool = False,
         graph_set: Optional[SparseGraphSet] = None,
-    ) -> Tensor:
+    ) -> Tensor | tuple[Tensor, Tensor]:
         """Column-wise embedding -> row-wise interaction -> dataset-wise in-context learning.
 
         Parameters
@@ -564,6 +565,7 @@ class TabICL(nn.Module):
             return_logits=return_logits,
             softmax_temperature=softmax_temperature,
             mgr_config=inference_config.ICL_CONFIG,
+            return_pre_decoder_repr=return_pre_decoder_repr,
             pre_col_embeddings=pre_col_embeddings if self.icl_backend in GRAPH_2D_BACKENDS else None,
             base_col_embeddings=col_embeddings if self.icl_backend in GRAPH_2D_BACKENDS else None,
             graph_set=graph_set,
@@ -785,6 +787,7 @@ class TabICL(nn.Module):
                 return_logits=return_logits,
                 softmax_temperature=softmax_temperature,
                 inference_config=inference_config,
+                return_pre_decoder_repr=return_pre_decoder_repr,
                 graph_set=graph_set,
             )
 

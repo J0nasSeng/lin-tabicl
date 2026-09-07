@@ -1037,7 +1037,8 @@ class ICLearning(nn.Module):
         return_logits: bool = True,
         softmax_temperature: float = 0.9,
         mgr_config: MgrConfig = None,
-    ) -> Tensor:
+        return_pre_decoder_repr: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor]:
         """In-context learning based on learned row representations for inference.
 
         Parameters
@@ -1075,6 +1076,25 @@ class ICLearning(nn.Module):
         if mgr_config is None:
             mgr_config = InferenceConfig().ICL_CONFIG
         self.inference_mgr.configure(**mgr_config)
+        if return_pre_decoder_repr:
+            if self.max_classes > 0 and len(torch.unique(y_train[0])) > self.max_classes:
+                raise ValueError("Encoder representations are not supported for hierarchical inference")
+            out, representation = self._icl_predictions(
+                R,
+                y_train,
+                return_pre_decoder_repr=True,
+            )
+            train_size = y_train.shape[1]
+            out = out[:, train_size:]
+            if self.max_classes > 0:
+                num_classes = len(torch.unique(y_train[0]))
+                out = out[:, :, :num_classes]
+                if self.decoder_type in ("soft_kmeans", "rbf", "euclidean"):
+                    if not return_logits:
+                        out = out.exp()
+                elif not return_logits:
+                    out = torch.softmax(out / softmax_temperature, dim=-1)
+            return out, representation
 
         if self.max_classes == 0:  # Regression
             out = self._predict_standard(R, y_train)
@@ -1259,7 +1279,14 @@ class ICLearning(nn.Module):
                         elif not return_logits:
                             out = torch.softmax(out / softmax_temperature, dim=-1)
             else:
-                out = self._inference_forward(R, y_train, return_logits, softmax_temperature, mgr_config)
+                out = self._inference_forward(
+                    R,
+                    y_train,
+                    return_logits=return_logits,
+                    softmax_temperature=softmax_temperature,
+                    mgr_config=mgr_config,
+                    return_pre_decoder_repr=return_pre_decoder_repr,
+                )
 
         return out
 

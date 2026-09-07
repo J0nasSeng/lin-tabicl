@@ -27,6 +27,11 @@ else:
 
 from tabicl import TabICLClassifier
 
+try:
+	from tabarena.benchmark.experiment.experiment_runner import OOFExperimentRunner
+except ImportError:
+	OOFExperimentRunner = None
+
 
 GRAPH_BACKENDS = {
 	"graph",
@@ -56,6 +61,31 @@ else:
 	AbstractModelBase = AbstractModel
 
 
+if OOFExperimentRunner is not None:
+	class TabArenaUMAPRunner(OOFExperimentRunner):
+		"""Add ground-truth labels to the optional model representation plot."""
+
+		def post_evaluate(self, out: dict) -> dict:
+			out = super().post_evaluate(out)
+			model = self.model
+			while model is not None and not hasattr(model, "_plot_umap"):
+				model = getattr(model, "model", None)
+			if model is None or not getattr(model, "_umap_plot_requested", False):
+				return out
+			ground_truth_labels = self._load_y_test()
+			transform_y = getattr(self.model, "transform_y", None)
+			if callable(transform_y):
+				ground_truth_labels = transform_y(ground_truth_labels)
+			model._plot_umap(
+				model._pending_umap_X,
+				model._pending_umap_predictions,
+				ground_truth_labels,
+			)
+			return out
+else:
+	TabArenaUMAPRunner = None
+
+
 class TabICLGraphModel(AbstractModelBase):
 	"""AutoGluon model wrapper for a trained graph-backend TabICL checkpoint."""
 
@@ -77,6 +107,9 @@ class TabICLGraphModel(AbstractModelBase):
 		self._umap_plotted = False
 		self._train_X: Any = None
 		self._train_y: Any = None
+		self._umap_plot_requested = False
+		self._pending_umap_X: Any = None
+		self._pending_umap_predictions: np.ndarray | None = None
 		super().__init__(**kwargs)
 
 	def _set_default_params(self) -> None:
@@ -119,10 +152,9 @@ class TabICLGraphModel(AbstractModelBase):
 		config = checkpoint["config"]
 		if str(config.get("model_type", "tabicl")).lower() != "tabicl":
 			raise ValueError("TabICLGraphModel requires a TabICL checkpoint")
-		if config.get("icl_backend", "encoder") not in GRAPH_BACKENDS:
+		if config.get("icl_backend", "encoder") not in {"encoder", *GRAPH_BACKENDS}:
 			raise ValueError(
-				"TabICLGraphModel requires a checkpoint with a graph backend "
-				"(graph, graph-1d, or graph-2d)"
+				"TabICLGraphModel requires a checkpoint with an encoder or graph backend"
 			)
 	def _tabicl_kwargs(self) -> dict[str, Any]:
 		params = self.params.copy()
@@ -144,9 +176,9 @@ class TabICLGraphModel(AbstractModelBase):
 		params["batch_size"] = 1
 		params["max_chunk_size"] = self.params.get("max_chunk_size")
 		params["decoder_chunk_size"] = self.params.get("decoder_chunk_size", 5000)
-		params["n_estimators"] = 1
+		params["n_estimators"] = 8
 		params["norm_methods"] = "none"
-		params["softmax_temperature"] = 0.2
+		params["softmax_temperature"] = 0.05
 		return params
 
 	def _fit(self, X: "pd.DataFrame", y: "pd.Series", **kwargs: Any) -> None:
@@ -161,6 +193,7 @@ class TabICLGraphModel(AbstractModelBase):
 		self,
 		X_test: "pd.DataFrame",
 		predicted_labels: np.ndarray | None = None,
+		ground_truth_labels: np.ndarray | None = None,
 	) -> None:
 		if not self.params.get("plot_umap", False) or self._umap_plotted:
 			return
@@ -212,7 +245,18 @@ class TabICLGraphModel(AbstractModelBase):
 			train_labels = np.asarray([class_indices[label] for label in self._train_y])
 			if predicted_labels is None:
 				predicted_labels = classes[np.argmax(self._tabicl.predict_proba(X_test_array), axis=1)]
+			predicted_labels = np.asarray(predicted_labels)
+			if predicted_labels.shape[0] != X_test_array.shape[0]:
+				raise ValueError("Predicted labels do not match the number of test rows")
 			test_labels = np.asarray([class_indices[label] for label in predicted_labels])
+			true_test_labels = None
+			if ground_truth_labels is not None:
+				ground_truth_labels = np.asarray(ground_truth_labels)
+				if ground_truth_labels.shape[0] != X_test_array.shape[0]:
+					raise ValueError("Ground-truth labels do not match the number of test rows")
+				true_test_labels = np.asarray(
+					[class_indices[label] for label in ground_truth_labels]
+				)
 		except KeyError as error:
 			raise RuntimeError("UMAP labels contain a class unknown to TabICL") from error
 		labels = np.concatenate((train_labels, test_labels))
@@ -222,13 +266,23 @@ class TabICLGraphModel(AbstractModelBase):
 			min_dist=0.1,
 			random_state=0,
 		).fit_transform(representations)
-		fig, axes = plt.subplots(1, 2, figsize=(12, 5), dpi=150, constrained_layout=True)
-		for axis, name, sl in (
-			(axes[0], "Train", slice(0, train_size)),
-			(axes[1], "Test", slice(train_size, None)),
+		fig, axes = plt.subplots(1, 3, figsize=(18, 5), dpi=150, constrained_layout=True)
+		for axis, name, sl, plot_labels in (
+			(axes[0], "Train", slice(0, train_size), labels),
+			(axes[1], "Test (predicted labels)", slice(train_size, None), labels),
+			(
+				axes[2], "Test (ground-truth labels)", slice(train_size, None),
+				None if true_test_labels is None else np.concatenate((train_labels, true_test_labels)),
+			),
 		):
+			if plot_labels is None:
+				axis.text(0.5, 0.5, "Ground-truth labels unavailable", ha="center", va="center")
+				axis.set(title=name)
+				axis.set_axis_off()
+				continue
 			axis.scatter(
-				coordinates[sl, 0], coordinates[sl, 1], c=labels[sl], cmap="tab10", s=16, alpha=0.8
+				coordinates[sl, 0], coordinates[sl, 1], c=plot_labels[sl],
+				cmap="tab10", s=16, alpha=0.8,
 			)
 			axis.set(title=name, xlabel="UMAP-1", ylabel="UMAP-2")
 			axis.grid(alpha=0.2)
@@ -245,7 +299,10 @@ class TabICLGraphModel(AbstractModelBase):
 			raise RuntimeError("TabICLGraphModel has not been fitted")
 		probabilities = np.asarray(self._tabicl.predict_proba(X))
 		predicted_labels = self._tabicl.classes_[np.argmax(probabilities, axis=1)]
-		self._plot_umap(X, predicted_labels)
+		if self.params.get("plot_umap", False):
+			self._umap_plot_requested = True
+			self._pending_umap_X = X.copy()
+			self._pending_umap_predictions = predicted_labels
 		# AutoGluon uses a unified representation internally: binary models must
 		# return only the positive-class probability. Passing the full (N, 2)
 		# matrix makes bagged OOF accumulation broadcast against its (N,) buffer.
@@ -405,6 +462,11 @@ def compare_against_leaderboard(args: argparse.Namespace) -> Any:
 			n_configs,
 		)]
 	).build_experiments(time_limit=1*60*60)
+	if args.plot_umap:
+		if TabArenaUMAPRunner is None:
+			raise ImportError("--plot-umap requires the TabArena experiment runner package")
+		for experiment in experiments:
+			experiment.experiment_cls = TabArenaUMAPRunner
 
 	context = TabArenaContext()
 	context.build_and_run_jobs(

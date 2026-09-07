@@ -50,6 +50,8 @@ GRAPH_EVALUATION_CONFIG = {
 	"graph_prob": 0.0,
 }
 
+ABLATION_PRIOR_TYPE = "graph_scm"
+
 
 # Registries make adding another baseline or score a local change rather than
 # requiring changes to the evaluation loop and plotting code.
@@ -627,7 +629,7 @@ def run_refinement_ablation(
 		max_seq_len=args.max_seq_len,
 		min_train_size=args.min_train_size,
 		max_train_size=args.max_train_size,
-		prior_type=args.prior_type,
+		prior_type=ABLATION_PRIOR_TYPE,
 		device=args.prior_device,
 		n_jobs=1,
 		normalization=("std" if args.normalize_features and args.normalization == "none" else args.normalization),
@@ -763,7 +765,7 @@ def run_soft_knn_ablation(
 		max_seq_len=args.max_seq_len,
 		min_train_size=args.min_train_size,
 		max_train_size=args.max_train_size,
-		prior_type=args.prior_type,
+		prior_type=ABLATION_PRIOR_TYPE,
 		device=args.prior_device,
 		n_jobs=1,
 		normalization=("std" if args.normalize_features and args.normalization == "none" else args.normalization),
@@ -978,7 +980,7 @@ def run_graph_ablation(
 		max_seq_len=args.max_seq_len,
 		min_train_size=args.min_train_size,
 		max_train_size=args.max_train_size,
-		prior_type=args.prior_type,
+		prior_type=ABLATION_PRIOR_TYPE,
 		scm_fixed_hp=DEFAULT_FIXED_HP.copy(),
 		device=args.prior_device,
 		n_jobs=1,
@@ -1078,7 +1080,7 @@ def run_discrete_features_ablation(
 			max_seq_len=args.max_seq_len,
 			min_train_size=args.min_train_size,
 			max_train_size=args.max_train_size,
-			prior_type=args.prior_type,
+			prior_type=ABLATION_PRIOR_TYPE,
 			scm_fixed_hp=fixed_hp,
 			device=args.prior_device,
 			n_jobs=1,
@@ -1231,7 +1233,7 @@ def run_gat_layers_ablation(checkpoint: Path, args: argparse.Namespace, device: 
 		max_seq_len=args.max_seq_len,
 		min_train_size=args.min_train_size,
 		max_train_size=args.max_train_size,
-		prior_type=args.prior_type,
+		prior_type=ABLATION_PRIOR_TYPE,
 		device=args.prior_device,
 		graph_cross_label_fraction=0.0,
 		n_jobs=1,
