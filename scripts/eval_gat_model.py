@@ -270,6 +270,25 @@ def build_parser() -> argparse.ArgumentParser:
 		help="Discrete-feature fractions for --discrete-features-ablation.",
 	)
 	parser.add_argument(
+		"--imbalanced-dataset-ablation",
+		action="store_true",
+		help="Evaluate binary GAT performance across class-imbalance levels.",
+	)
+	parser.add_argument(
+		"--imbalanced-dataset-ablation-num-datasets",
+		type=int,
+		default=100,
+		help="Number of paired binary datasets for the imbalance ablation (default: 100).",
+	)
+	parser.add_argument(
+		"--imbalancedness-levels",
+		type=float,
+		nargs="+",
+		default=[0.5, 0.3, 0.1, 0.05, 0.01],
+		metavar="MINORITY_FRACTION",
+		help="Minority fractions for the imbalance ablation (default: 0.5 0.3 0.1 0.05).",
+	)
+	parser.add_argument(
 		"--gat-layers-ablation",
 		action="store_true",
 		help="Compare GAT-input and post-GAT representations with decoder, UMAP, and silhouette metrics.",
@@ -382,6 +401,52 @@ def _normalize_features(batch: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, 
 		std = (centered.square().sum(dim=0, keepdim=True) / count).sqrt().clamp_min(1e-6)
 		x[index, :seq_len, :feature_count] = (features - mean) / std
 	return x, y, d, seq_lens, train_sizes
+
+
+def _subsample_binary_dataset(
+	x: np.ndarray,
+	y: np.ndarray,
+	train_size: int,
+	minority_fraction: float,
+	rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray, int] | None:
+	"""Subsample a binary dataset to a target minority:majority ratio.
+
+	Sampling is performed within each original split so the fit and evaluation
+	data remain disjoint. The largest feasible sample at the requested ratio is
+	used; this allows the ablation to handle prior datasets that are already
+	moderately imbalanced. Return ``None`` when either split lacks both classes.
+	"""
+	if not 0.0 < minority_fraction <= 0.5:
+		raise ValueError("minority_fraction must be in (0, 0.5]")
+	classes, counts = np.unique(y, return_counts=True)
+	if classes.size != 2:
+		return None
+	minority_label = classes[np.argmin(counts)]
+	majority_label = classes[1 - np.argmin(counts)]
+
+	selected_splits: list[np.ndarray] = []
+	for split_indices in (np.arange(train_size), np.arange(train_size, y.shape[0])):
+		minority_indices = split_indices[y[split_indices] == minority_label]
+		majority_indices = split_indices[y[split_indices] == majority_label]
+		if minority_indices.size == 0 or majority_indices.size == 0:
+			return None
+		minority_count = min(
+			minority_indices.size,
+			int(np.floor(majority_indices.size * minority_fraction / (1.0 - minority_fraction))),
+		)
+		majority_count = int(round(minority_count * (1.0 - minority_fraction) / minority_fraction))
+		if minority_count < 1 or majority_count < 1 or majority_count > majority_indices.size:
+			return None
+		chosen = np.concatenate((
+			rng.choice(minority_indices, size=minority_count, replace=False),
+			rng.choice(majority_indices, size=majority_count, replace=False),
+		))
+		rng.shuffle(chosen)
+		selected_splits.append(chosen)
+
+	selected_indices = np.concatenate(selected_splits)
+	return x[selected_indices], y[selected_indices], selected_splits[0].size
 
 
 def _knn_predictions(sample, n_neighbors: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -586,6 +651,134 @@ def _soft_knn_ensemble_probabilities(
 		key: (classes[np.argmax(probabilities / view_count, axis=1)].astype(int), probabilities / view_count)
 		for key, probabilities in probability_sums.items()
 	}
+
+
+def run_imbalanced_dataset_ablation(
+	checkpoint: Path,
+	args: argparse.Namespace,
+	device: str,
+) -> list[dict]:
+	"""Evaluate binary GAT performance across paired imbalance levels."""
+	import matplotlib
+	matplotlib.use("Agg", force=True)
+	import matplotlib.pyplot as plt
+
+	num_datasets = args.imbalanced_dataset_ablation_num_datasets
+	levels = tuple(float(level) for level in args.imbalancedness_levels)
+	if num_datasets < 1:
+		raise ValueError("--imbalanced-dataset-ablation-num-datasets must be positive")
+	if not levels or any(level <= 0.0 or level > 0.5 for level in levels):
+		raise ValueError("--imbalancedness-levels must contain values in (0, 0.5]")
+	if len(set(levels)) != len(levels):
+		raise ValueError("--imbalancedness-levels must not contain duplicates")
+
+	prior = PriorDataset(
+		batch_size=args.batch_size,
+		batch_size_per_gp=args.batch_size_per_gp,
+		min_features=args.min_features,
+		max_features=args.max_features,
+		max_classes=2,
+		min_seq_len=args.min_seq_len,
+		max_seq_len=args.max_seq_len,
+		min_train_size=args.min_train_size,
+		max_train_size=args.max_train_size,
+		prior_type=ABLATION_PRIOR_TYPE,
+		device=args.prior_device,
+		n_jobs=1,
+		normalization=("std" if args.normalize_features and args.normalization == "none" else args.normalization),
+	)
+
+	rows: list[dict] = []
+	gat_n_estimators = args.gat_tabicl_n_estimators or args.pretrained_tabicl_n_estimators
+	accepted = 0
+	attempts = 0
+	max_attempts = max(num_datasets * 20, 20)
+	while accepted < num_datasets:
+		if attempts >= max_attempts:
+			raise RuntimeError(
+				f"Only found {accepted} binary datasets that support all requested imbalance levels "
+				f"after {attempts} prior samples"
+			)
+		batch = _as_regular_tensors(prior.get_batch())
+		current_batch_index = attempts
+		attempts += 1
+		for index in range(int(batch[0].shape[0])):
+			if accepted >= num_datasets:
+				break
+			seq_len = int(batch[3][index].item())
+			train_size = int(batch[4][index].item())
+			y = batch[1][index, :seq_len].numpy().astype(int)
+			x = batch[0][index, :seq_len, : int(batch[2][index].item())].numpy()
+			rng = np.random.default_rng(args.seed + accepted)
+			subsamples = {
+				level: _subsample_binary_dataset(x, y, train_size, level, rng)
+				for level in levels
+			}
+			if any(subsample is None for subsample in subsamples.values()):
+				continue
+
+			for level in levels:
+				sampled_x, sampled_y, sampled_train_size = subsamples[level]
+				y_train = sampled_y[:sampled_train_size]
+				y_test = sampled_y[sampled_train_size:]
+				classifier = _build_gat_tabicl(
+					checkpoint,
+					gat_n_estimators,
+					device,
+					args.seed + accepted,
+					args.num_refinement_iter,
+					args.entry_layer,
+				)
+				classifier.fit(sampled_x[:sampled_train_size], y_train)
+				probabilities = classifier.predict_proba(sampled_x[sampled_train_size:])
+				predictions = classifier.classes_[np.argmax(probabilities, axis=1)].astype(int)
+				rows.append({
+					"imbalance_level": f"{int(round(level * 100))}:{int(round((1.0 - level) * 100))}",
+					"minority_fraction": level,
+					"dataset": accepted,
+					"batch": current_batch_index,
+					"n_features": sampled_x.shape[1],
+					"score": "balanced_accuracy",
+					"value": _balanced_accuracy(y_test, predictions),
+				})
+			accepted += 1
+
+	output_dir = args.output_dir
+	output_dir.mkdir(parents=True, exist_ok=True)
+	results_output = args.results_output or output_dir / "imbalanced_dataset_ablation.json"
+	results_output.parent.mkdir(parents=True, exist_ok=True)
+	results_output.write_text(json.dumps(rows, indent=2))
+
+	means = np.asarray([
+		np.mean([row["value"] for row in rows if row["minority_fraction"] == level])
+		for level in levels
+	])
+	stds = np.asarray([
+		np.std([row["value"] for row in rows if row["minority_fraction"] == level])
+		for level in levels
+	])
+	fig, ax = plt.subplots(figsize=(8, 5), dpi=150)
+	ax.errorbar(
+		range(len(levels)), means, yerr=stds, marker="o", capsize=4, linewidth=1.5
+	)
+	ax.set(
+		title=f"GAT TabICL binary imbalance ablation (datasets={num_datasets})",
+		xlabel="Minority:majority class ratio",
+		ylabel="Balanced accuracy",
+		ylim=(0.0, 1.0),
+	)
+	ax.set_xticks(
+		range(len(levels)),
+		[f"{int(round(level * 100))}:{int(round((1.0 - level) * 100))}" for level in levels],
+	)
+	ax.grid(axis="y", alpha=0.25)
+	fig.tight_layout()
+	plot_output = output_dir / "imbalanced_dataset_ablation_balanced_accuracy.png"
+	fig.savefig(plot_output)
+	plt.close(fig)
+	print(f"Saved imbalanced-dataset ablation results to {results_output}")
+	print(f"Saved imbalanced-dataset ablation plot to {plot_output}")
+	return rows
 
 
 def run_refinement_ablation(
@@ -1369,6 +1562,8 @@ def run_gat_layers_ablation(checkpoint: Path, args: argparse.Namespace, device: 
 
 def run_requested_ablations(checkpoint: Path, args: argparse.Namespace, device: str) -> None:
 	"""Run each requested graph-only ablation independently."""
+	if args.imbalanced_dataset_ablation:
+		run_imbalanced_dataset_ablation(checkpoint, args, device)
 	if args.graph_mixture_ablation:
 		base = GRAPH_EVALUATION_CONFIG.copy()
 		run_graph_ablation(checkpoint, args, device, "graph_mixture", [
@@ -1859,6 +2054,135 @@ def _plot_results(rows: list[dict], output_dir: Path) -> None:
 
 		_plot_batch_statistics(class_rows, num_classes, output_dir)
 
+	_plot_winrate_matrices(rows, output_dir)
+
+
+def _plot_winrate_matrices(rows: list[dict], output_dir: Path) -> None:
+	"""Plot pairwise method win counts for every class count and score.
+
+	Each cell counts the datasets where the row method outperformed the column
+	method. Higher is better for accuracy; entropy and cross-entropy are losses
+	and therefore use the inverse comparison. Positive cells are green, while
+	negative cells are purple because the matrix is antisymmetric.
+	"""
+	import matplotlib
+	matplotlib.use("Agg", force=True)
+	import matplotlib.pyplot as plt
+
+	output_dir.mkdir(parents=True, exist_ok=True)
+	by_group: dict[tuple[int, str], list[dict]] = defaultdict(list)
+	for row in rows:
+		if {"num_classes", "score", "model", "dataset", "value"}.issubset(row):
+			by_group[(int(row["num_classes"]), str(row["score"]))].append(row)
+
+	for (num_classes, score_name), score_rows in sorted(by_group.items()):
+		methods = list(dict.fromkeys(str(row["model"]) for row in score_rows))
+		if len(methods) < 2:
+			continue
+		values = {
+			(str(row["model"]), row["dataset"]): float(row["value"])
+			for row in score_rows
+			if np.isfinite(float(row["value"]))
+		}
+		win_counts = np.zeros((len(methods), len(methods)), dtype=int)
+		for row_index, row_method in enumerate(methods):
+			for column_index, column_method in enumerate(methods):
+				if row_index == column_index:
+					continue
+				shared_datasets = {
+					dataset for method, dataset in values if method == row_method
+				} & {
+					dataset for method, dataset in values if method == column_method
+				}
+				for dataset in shared_datasets:
+					row_value = values[(row_method, dataset)]
+					column_value = values[(column_method, dataset)]
+					if score_name in {"entropy", "cross_entropy"}:
+						row_wins = row_value < column_value
+					else:
+						row_wins = row_value > column_value
+					if row_wins:
+						win_counts[row_index, column_index] += 1
+
+		fig_width = max(8.0, len(methods) * 1.15)
+		fig, axis = plt.subplots(figsize=(fig_width, fig_width * 0.85), dpi=150)
+		maximum = max(1, int(np.max(win_counts)))
+		colors = matplotlib.colors.LinearSegmentedColormap.from_list(
+			"winrate_purple_green", ["#6A3D9A", "#F4F0F8", "#238B45"]
+		)
+		image = axis.imshow(
+			win_counts - win_counts.T,
+			cmap=colors,
+			vmin=-maximum,
+			vmax=maximum,
+		)
+		axis.set(
+			title=f"Pairwise wins: K={num_classes}, {score_name}",
+			xlabel="Opponent",
+			ylabel="Winner",
+		)
+		axis.set_xticks(range(len(methods)), methods, rotation=45, ha="right")
+		axis.set_yticks(range(len(methods)), methods)
+		for row_index in range(len(methods)):
+			for column_index in range(len(methods)):
+				axis.text(
+					column_index,
+					row_index,
+					str(win_counts[row_index, column_index]),
+					ha="center",
+					va="center",
+					fontsize=8,
+				)
+		fig.colorbar(image, ax=axis, label="Wins minus losses")
+		fig.tight_layout()
+		fig.savefig(output_dir / f"winrate_matrix_{score_name}_k{num_classes}.png")
+		plt.close(fig)
+
+	balanced_rows = [row for row in rows if str(row.get("score")) == "balanced_accuracy"]
+	methods = list(dict.fromkeys(str(row["model"]) for row in balanced_rows if "model" in row))
+	values = {
+		(str(row["model"]), (int(row["num_classes"]), row["dataset"])): float(row["value"])
+		for row in balanced_rows
+		if {"model", "num_classes", "dataset", "value"}.issubset(row)
+		and np.isfinite(float(row["value"]))
+	}
+	win_counts = np.zeros((len(methods), len(methods)), dtype=int)
+	for row_index, row_method in enumerate(methods):
+		for column_index, column_method in enumerate(methods):
+			if row_index == column_index:
+				continue
+			shared_tasks = {
+				task for method, task in values if method == row_method
+			} & {
+				task for method, task in values if method == column_method
+			}
+			for task in shared_tasks:
+				if values[(row_method, task)] > values[(column_method, task)]:
+					win_counts[row_index, column_index] += 1
+
+	fig_width = max(8.0, len(methods) * 1.15)
+	fig, axis = plt.subplots(figsize=(fig_width, fig_width * 0.85), dpi=150)
+	if methods:
+		maximum = max(1, int(np.max(win_counts)))
+		colors = matplotlib.colors.LinearSegmentedColormap.from_list(
+			"winrate_purple_green", ["#6A3D9A", "#F4F0F8", "#238B45"]
+		)
+		image = axis.imshow(win_counts - win_counts.T, cmap=colors, vmin=-maximum, vmax=maximum)
+		axis.set_xticks(range(len(methods)), methods, rotation=45, ha="right")
+		axis.set_yticks(range(len(methods)), methods)
+		for row_index in range(len(methods)):
+			for column_index in range(len(methods)):
+				axis.text(column_index, row_index, str(win_counts[row_index, column_index]), ha="center", va="center", fontsize=8)
+		fig.colorbar(image, ax=axis, label="Wins minus losses")
+		axis.set(xlabel="Opponent", ylabel="Winner")
+	else:
+		axis.text(0.5, 0.5, "No balanced-accuracy comparison data", ha="center", va="center")
+		axis.set_axis_off()
+	axis.set_title("Pairwise wins across balanced-accuracy tasks")
+	fig.tight_layout()
+	fig.savefig(output_dir / "winrate_matrix.png")
+	plt.close(fig)
+
 
 def _plot_batch_statistics(class_rows: list[dict], num_classes: int, output_dir: Path) -> None:
 	"""Plot per-batch summary statistics for accuracy and cross-entropy."""
@@ -1973,6 +2297,12 @@ def main() -> None:
 		raise ValueError("--gat-layers-ablation-num-datasets must be positive")
 	if args.gat_layers_ablation_num_classes < 2:
 		raise ValueError("--gat-layers-ablation-num-classes must be at least 2")
+	if args.imbalanced_dataset_ablation_num_datasets < 1:
+		raise ValueError("--imbalanced-dataset-ablation-num-datasets must be positive")
+	if not args.imbalancedness_levels or any(
+		level <= 0.0 or level > 0.5 for level in args.imbalancedness_levels
+	):
+		raise ValueError("--imbalancedness-levels must contain values in (0, 0.5]")
 	if args.max_seq_len < 2:
 		raise ValueError("--max-seq-len must be at least 2")
 	if args.plot_results_only:
@@ -1985,7 +2315,7 @@ def main() -> None:
 		print(f"Saved plots to {args.output_dir}")
 		return
 	if args.checkpoint is None:
-		raise ValueError("checkpoint is required unless --plot-results-only is specified")
+		raise ValueError("checkpoint is required unless --plot-results-only")
 
 	np.random.seed(args.seed)
 	torch.manual_seed(args.seed)
@@ -2006,7 +2336,8 @@ def main() -> None:
 			"(graph, graph-1d, or graph-2d)."
 		)
 	if (
-		args.graph_mixture_ablation
+		args.imbalanced_dataset_ablation
+		or args.graph_mixture_ablation
 		or args.cross_label_fraction_ablation
 		or args.n_estimators_ablation
 		or args.discrete_features_ablation

@@ -176,9 +176,14 @@ class TabICLGraphModel(AbstractModelBase):
 		params["batch_size"] = 1
 		params["max_chunk_size"] = self.params.get("max_chunk_size")
 		params["decoder_chunk_size"] = self.params.get("decoder_chunk_size", 5000)
-		params["n_estimators"] = 8
+		params["n_estimators"] = 1
 		params["norm_methods"] = "none"
-		params["softmax_temperature"] = 0.05
+		params["softmax_temperature"] = 0.9
+		params["graph_config"] = {
+        	"graph_v1_prob": 1.0,
+        	"graph_v2_prob": 0.0,
+        	"graph_prob": 0.0,
+    	}
 		return params
 
 	def _fit(self, X: "pd.DataFrame", y: "pd.Series", **kwargs: Any) -> None:
