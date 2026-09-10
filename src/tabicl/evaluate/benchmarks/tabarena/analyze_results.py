@@ -11,6 +11,7 @@ from collections import Counter
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 
 
@@ -212,6 +213,186 @@ def plot_results_by_property(summary: pd.DataFrame, property_name: str, output: 
 	plt.close(fig)
 
 
+def _csv_paths(path: Path) -> list[Path]:
+	"""Return one CSV or all CSVs in a diagnostic directory."""
+	if path.is_file():
+		return [path]
+	if path.is_dir():
+		return sorted(path.glob("*.csv"))
+	raise FileNotFoundError(f"Diagnostic input not found: {path}")
+
+
+def _load_diagnostic_rows(path: Path, required: set[str]) -> pd.DataFrame:
+	frames = []
+	for input_path in _csv_paths(path):
+		frame = pd.read_csv(input_path, low_memory=False)
+		missing = required - set(frame.columns)
+		if missing:
+			raise ValueError(
+				f"{input_path} is missing required columns: {', '.join(sorted(missing))}"
+			)
+		frames.append(frame)
+	if not frames:
+		raise ValueError(f"No CSV files found in diagnostic input: {path}")
+	return pd.concat(frames, ignore_index=True)
+
+
+def load_diagnostic_summary(
+	candidate_path: Path | None = None,
+	attention_path: Path | None = None,
+	baseline_path: Path | None = None,
+) -> pd.DataFrame:
+	"""Aggregate focused ablations into one row per dataset.
+
+	Attention is averaged within layer before averaging across layers, so each
+	layer contributes equally even when the number of test rows differs.
+	"""
+	parts = []
+	if candidate_path is not None:
+		candidate = _load_diagnostic_rows(candidate_path, {"dataset"})
+		candidate_columns = [
+			"topk_dense_recall",
+			"mean_similarity",
+			"same_label_fraction",
+			"topk_same_label_recall",
+		]
+		available = [column for column in candidate_columns if column in candidate]
+		if not available:
+			raise ValueError("Candidate diagnostic CSV has no recognized quality columns")
+		candidate[available] = candidate[available].apply(pd.to_numeric, errors="coerce")
+		candidate_summary = candidate.groupby("dataset", as_index=False)[available].mean()
+		candidate_summary = candidate_summary.rename(
+			columns={column: f"candidate_{column}" for column in available}
+		)
+		if "candidate_topk_dense_recall" in candidate_summary:
+			candidate_summary["candidate_quality"] = candidate_summary[
+				"candidate_topk_dense_recall"
+			]
+		else:
+			candidate_summary["candidate_quality"] = candidate_summary.filter(
+				like="candidate_"
+			).mean(axis=1)
+		parts.append(candidate_summary)
+
+	if attention_path is not None:
+		attention = _load_diagnostic_rows(attention_path, {"dataset", "layer", "attention_entropy"})
+		if "is_test" in attention:
+			attention = attention[attention["is_test"].astype(bool)].copy()
+		attention["layer"] = pd.to_numeric(attention["layer"], errors="coerce")
+		attention["attention_entropy"] = pd.to_numeric(
+			attention["attention_entropy"], errors="coerce"
+		)
+		layer_summary = attention.groupby(["dataset", "layer"], as_index=False).agg(
+			attention_entropy=("attention_entropy", "mean")
+		)
+		attention_summary = layer_summary.groupby("dataset", as_index=False).mean(numeric_only=True)
+		attention_summary = attention_summary.rename(
+			columns={"attention_entropy": "attention_entropy_mean"}
+		).drop(columns="layer")
+		parts.append(attention_summary)
+
+	if baseline_path is not None:
+		baseline = _load_diagnostic_rows(baseline_path, {"dataset", "configuration"})
+		metric_columns = [column for column in ("roc_auc", "precision", "recall", "sensitivity") if column in baseline]
+		if not metric_columns:
+			raise ValueError("Baseline diagnostic CSV has no recognized performance columns")
+		baseline_summary = baseline.groupby(["dataset", "configuration"], as_index=False)[metric_columns].mean()
+		baseline_wide = baseline_summary.pivot(index="dataset", columns="configuration", values=metric_columns)
+		baseline_wide.columns = [f"{configuration}_{metric}" for metric, configuration in baseline_wide.columns]
+		parts.append(baseline_wide.reset_index())
+
+	if not parts:
+		raise ValueError("At least one diagnostic input is required")
+	merged = parts[0]
+	for part in parts[1:]:
+		merged = merged.merge(part, on="dataset", how="outer", validate="one_to_one")
+	return merged
+
+
+def add_performance_to_diagnostics(
+	diagnostics: pd.DataFrame,
+	summary: pd.DataFrame,
+) -> pd.DataFrame:
+	"""Attach standard TabArena ROC AUC and graph-vs-encoder differences."""
+	performance = summary.pivot(index="dataset", columns="method_label", values="roc_auc")
+	performance = performance.rename(
+		columns={
+			"TabICL graph-1d": "graph_roc_auc",
+			"TabICLv2": "encoder_roc_auc",
+		}
+	)
+	performance = performance.reset_index()
+	if {"graph_roc_auc", "encoder_roc_auc"}.issubset(performance.columns):
+		performance["gat_vs_encoder_roc_auc"] = performance["graph_roc_auc"] - performance["encoder_roc_auc"]
+	return diagnostics.merge(performance, on="dataset", how="left", validate="one_to_one")
+
+
+def plot_diagnostic_relationships(diagnostics: pd.DataFrame, output: Path) -> None:
+	"""Plot dataset diagnostics and their correlations with available metrics."""
+	quality_column = "candidate_quality"
+	entropy_column = "attention_entropy_mean"
+	performance_columns = [
+		column for column in diagnostics.columns
+		if column.endswith(("_roc_auc", "_precision", "_recall"))
+		and column not in {quality_column, entropy_column}
+	]
+	performance_columns = [column for column in performance_columns if diagnostics[column].notna().sum() >= 2]
+	if quality_column not in diagnostics or entropy_column not in diagnostics:
+		print("Warning: both candidate and attention diagnostics are needed for the diagnostic plot")
+		return
+
+	plot_data = diagnostics.sort_values(quality_column, na_position="last").copy()
+	figure, axes = plt.subplots(2, 2, figsize=(16, 11))
+	axis = axes[0, 0]
+	positions = np.arange(len(plot_data))
+	quality = pd.to_numeric(plot_data[quality_column], errors="coerce")
+	entropy = pd.to_numeric(plot_data[entropy_column], errors="coerce")
+	axis.bar(positions - 0.2, quality, width=0.4, label="Candidate quality")
+	axis.set_ylabel("Candidate quality")
+	axis.set_ylim(0.0, 1.0)
+	axis.set_xticks(positions, plot_data["dataset"], rotation=75, ha="right")
+	axis.grid(axis="y", alpha=0.25)
+	entropy_axis = axis.twinx()
+	entropy_axis.bar(positions + 0.2, entropy, width=0.4, color="tab:orange", label="Attention entropy")
+	entropy_axis.set_ylabel("Attention entropy")
+	axis.set_title("Diagnostics per dataset")
+
+	correlation_columns = [quality_column, entropy_column]
+	correlations = diagnostics[performance_columns + correlation_columns].corr(method="spearman").loc[
+		performance_columns, correlation_columns
+	]
+	axis = axes[0, 1]
+	image = axis.imshow(correlations, vmin=-1.0, vmax=1.0, cmap="coolwarm")
+	axis.set_xticks(range(len(correlation_columns)), ["Candidate quality", "Attention entropy"])
+	axis.set_yticks(range(len(performance_columns)), performance_columns)
+	for row_index in range(len(performance_columns)):
+		for column_index in range(len(correlation_columns)):
+			value = correlations.iloc[row_index, column_index]
+			axis.text(column_index, row_index, "n/a" if pd.isna(value) else f"{value:.2f}", ha="center", va="center")
+	axis.set_title("Spearman correlations")
+	figure.colorbar(image, ax=axis, fraction=0.046, pad=0.04)
+
+	for axis, diagnostic_column, title in (
+		(axes[1, 0], quality_column, "Performance vs candidate quality"),
+		(axes[1, 1], entropy_column, "Performance vs attention entropy"),
+	):
+		for performance_column in performance_columns:
+			valid = diagnostics[[diagnostic_column, performance_column]].dropna()
+			if len(valid) < 2:
+				continue
+			correlation = valid[diagnostic_column].corr(valid[performance_column], method="spearman")
+			axis.scatter(valid[diagnostic_column], valid[performance_column], label=f"{performance_column} (rho={correlation:.2f})")
+		axis.set_xlabel(diagnostic_column.replace("_", " ").title())
+		axis.set_ylabel("Score")
+		axis.set_title(title)
+		axis.grid(alpha=0.25)
+		axis.legend(fontsize=8)
+	figure.tight_layout()
+	output.parent.mkdir(parents=True, exist_ok=True)
+	figure.savefig(output, dpi=180)
+	plt.close(figure)
+
+
 def main() -> None:
 	parser = argparse.ArgumentParser(description=__doc__)
 	parser.add_argument(
@@ -243,6 +424,33 @@ def main() -> None:
 		default="TabArena-v0.1",
 		help="TabArena metadata preset used for dataset properties.",
 	)
+	parser.add_argument(
+		"--candidate-quality-input",
+		type=Path,
+		help="Candidate-quality CSV or directory of per-dataset CSVs from tabarena_ablations.py.",
+	)
+	parser.add_argument(
+		"--attention-input",
+		type=Path,
+		help="Attention-selectivity CSV or directory of per-dataset CSVs from tabarena_ablations.py.",
+	)
+	parser.add_argument(
+		"--baseline-input",
+		type=Path,
+		help="Matched-baselines CSV or directory; adds precision and recall correlations when supplied.",
+	)
+	parser.add_argument(
+		"--diagnostics-output",
+		type=Path,
+		default=Path("eval/tabicl_graph/dataset_diagnostics.csv"),
+		help="Output path for the merged dataset-level diagnostic table.",
+	)
+	parser.add_argument(
+		"--diagnostics-plot",
+		type=Path,
+		default=Path("eval/tabicl_graph/dataset_diagnostics.png"),
+		help="Output path for the dataset diagnostic and correlation plot.",
+	)
 	args = parser.parse_args()
 
 	summary = summarize_results(load_results(args.input))
@@ -260,6 +468,18 @@ def main() -> None:
 	for property_name in PROPERTY_COLUMNS:
 		property_output = args.output.with_name(f"{args.output.stem}_by_{property_name}{args.output.suffix}")
 		plot_results_by_property(summary, property_name, property_output)
+	if args.candidate_quality_input is not None or args.attention_input is not None or args.baseline_input is not None:
+		diagnostics = load_diagnostic_summary(
+			args.candidate_quality_input,
+			args.attention_input,
+			args.baseline_input,
+		)
+		diagnostics = add_performance_to_diagnostics(diagnostics, summary)
+		args.diagnostics_output.parent.mkdir(parents=True, exist_ok=True)
+		diagnostics.to_csv(args.diagnostics_output, index=False)
+		plot_diagnostic_relationships(diagnostics, args.diagnostics_plot)
+		print(f"Dataset diagnostics written to {args.diagnostics_output}")
+		print(f"Diagnostic plot written to {args.diagnostics_plot}")
 
 	print(comparison.to_string(index=False))
 	print(f"Plot written to {args.output}")
